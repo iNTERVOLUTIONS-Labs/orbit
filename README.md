@@ -49,7 +49,7 @@ Orbit automatiza exactamente eso, y nada más.
 En un Ubuntu 24.04 recién creado:
 
 ```bash
-git clone https://github.com/intervolutions/orbit.git
+git clone https://github.com/iNTERVOLUTIONS-Labs/orbit.git
 cd orbit
 sudo bash install.sh
 ```
