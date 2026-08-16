@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Orbit">
+  <defs>
+    <linearGradient id="og" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5EE7E7"/>
+      <stop offset="100%" stop-color="#7C6CF0"/>
+    </linearGradient>
+    <radialGradient id="core" cx="35%" cy="30%">
+      <stop offset="0%" stop-color="#B9FBFB"/>
+      <stop offset="100%" stop-color="#3AC7D8"/>
+    </radialGradient>
+  </defs>
+  <circle cx="128" cy="128" r="124" fill="#0B1020"/>
+  <g fill="none" stroke="url(#og)" stroke-linecap="round">
+    <g transform="rotate(34 128 128)">
+      <ellipse cx="128" cy="128" rx="86" ry="34" stroke-width="3" opacity="0.38"/>
+    </g>
+    <g transform="rotate(-28 128 128)">
+      <ellipse cx="128" cy="128" rx="98" ry="44" stroke-width="6" opacity="0.95"/>
+      <circle cx="26" cy="128" r="11" fill="url(#og)" stroke="none"/>
+    </g>
+  </g>
+  <circle cx="128" cy="128" r="34" fill="url(#core)"/>
+  <circle cx="128" cy="128" r="34" fill="none" stroke="#0B1020" stroke-width="5"/>
+</svg>

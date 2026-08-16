@@ -1,0 +1,161 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Las herramientas que necesitan las pruebas para no saltarse solas.
+      #
+      # No es una comodidad: varias suites se saltan enteras si les falta una
+      # herramienta y lo anuncian en una línea que se pierde entre mil. Sin
+      # ellas la tanda sale en verde habiendo comprobado dos tercios —1.662
+      # comprobaciones contra 2.447— y un CI verde por ese motivo es peor que
+      # no tener CI, porque afirma algo que no ha probado. La cifra está medida
+      # apartando esas herramientas del PATH, no estimada: la que había aquí se
+      # había quedado atrás, como las otras cuatro que decían lo mismo en otros
+      # ficheros. Un número dentro de un comentario no lo comprueba nadie.
+      #
+      #   rsync           el ciclo de despliegue entero (deploy_test)
+      #   jq              el contrato --json, incluido 'deploy --json'
+      #   nginx           validación real de los vhosts generados
+      #   php8.3-fpm      trae snippets/fastcgi-php.conf, que los vhosts con
+      #                   PHP incluyen; sin él 'nginx -t' falla por un fichero
+      #                   que no existe y no por la configuración de Orbit
+      #   python3         'i18n_test' saca del código los mensajes que pasan
+      #                   por el catálogo, y para eso hay que leer bash de
+      #                   verdad: comillas anidadas, "$(…)" dentro de la
+      #                   cadena, continuaciones de línea. Con grep saldría
+      #                   una lista aproximada, y una comprobación de
+      #                   cobertura aproximada no comprueba nada
+      #
+      # PostgreSQL no hace falta: las pruebas de copias lo simulan a propósito,
+      # porque lo que comprueban es qué entra en el fichero y qué sale al
+      # restaurar, no PostgreSQL.
+      #
+      # Y hace falta 'sudo' sin contraseña, que el runner ya trae: php-fpm sólo
+      # baja de privilegios si lo arranca root, y la prueba del aislamiento
+      # entre apps PHP necesita dos pools con usuarios DISTINTOS. Sin eso los
+      # dos serían 'runner' y la comprobación no demostraría nada. La suite
+      # sigue siendo rootless: es la única sección que lo pide, y si no lo
+      # encuentra se salta en voz alta.
+      - name: Instalar dependencias de las pruebas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck rsync jq nginx php8.3-fpm python3
+
+      # Una sola orden, y la misma que se pide antes de commitear. En vez de
+      # repetir aquí la lista de suites —que se separaría de la del Makefile la
+      # primera vez que alguien añada una— se llama al Makefile, que es donde
+      # vive. 'test-strict' añade lo único que CI necesita de más: falla si
+      # alguna suite se ha saltado, en lugar de dar por buena una tanda a
+      # medias.
+      - name: Sintaxis, shellcheck y las 32 suites
+        run: make test-strict
+
+  # Lo mismo, en Debian 12, que es lo único de este soporte que se puede
+  # comprobar sin un VPS.
+  #
+  # La v1.3.0 añadió Debian y lo dejó en 🚧 a propósito: lo probado eran las
+  # decisiones —contra los ficheros Release del archivo de Debian—, no la
+  # instalación. Un contenedor no cierra eso del todo, porque no hay systemd y
+  # no se puede levantar nada, pero sí cierra cuatro cosas que desde una máquina
+  # Ubuntu son literalmente incomprobables:
+  #
+  #   · que la suite entera pase en Debian,
+  #   · que 'apt' de verdad conteste 8.2 a la pregunta de qué PHP sirve,
+  #   · que el aviso de pockets NO salte en un Debian bien configurado —la
+  #     medición en reposo, que es la que faltaba: la versión anterior de esa
+  #     comprobación era inerte en Debian y por eso nadie la vio fallar—,
+  #   · y que los paquetes del instalador resuelvan, en seco.
+  #
+  # Y ya ha pagado su coste: encontró que el autodespliegue no funcionaba en
+  # Debian (el awk sin intervalos, v1.3.2) y dos puntos ciegos de la propia
+  # suite. Ninguno de los tres era un fallo de Debian.
+  #
+  # Y el paquete de PHP se pide con el nombre de Debian (php8.2-fpm, no 8.3),
+  # que era justo el motivo por el que el instalador no valía aquí.
+  debian:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    # El shell se declara, y es otra de las que en Ubuntu venían de rebote: en
+    # el runner los 'run' salen con '/usr/bin/bash -e {0}' y **dentro del
+    # contenedor con 'sh -e {0}'**, o sea dash. El primer paso que escribió
+    # 'set -Eeuo pipefail' murió con «Illegal option -o pipefail», que al menos
+    # es un error ruidoso; lo que da miedo es el caso silencioso — un script
+    # que use bashismos y que dash interprete de otra manera sin quejarse.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Las dependencias van ANTES del checkout: sin git, la acción se baja un
+      # tarball por la API en vez de clonar, y entonces lo que se prueba no es
+      # el repositorio sino una copia sin historia.
+      #
+      # 'procps', 'iproute2' y 'curl' no hacen falta en el runner de Ubuntu y sí
+      # en un contenedor pelado — ps, ss y curl los usan las pruebas de nginx y
+      # de puertos. Es la misma clase de diferencia que el 'sudo' que install.sh
+      # tuvo que añadir: cosas que en Ubuntu venían de rebote.
+      - name: Dependencias, con los nombres de Debian
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq \
+            make git ca-certificates curl shellcheck rsync jq nginx \
+            php8.2-fpm python3 python3-venv procps iproute2 sudo openssl dnsutils
+
+      - uses: actions/checkout@v4
+
+      # El contenedor corre como root, y eso no es un accidente que haya que
+      # tolerar: es el único camino en el que php-fpm baja de privilegios de
+      # verdad, que es lo que necesita la sección del aislamiento entre apps
+      # PHP. Comprobado también en local antes de escribir esto, para que un
+      # rojo aquí signifique «Debian» y no «root».
+      - name: Sintaxis, shellcheck y las 32 suites
+        run: make test-strict
+
+      # Lo que sólo se puede afirmar estando en Debian. Estas preguntas
+      # las contesta el sistema, no un doble de prueba: es la diferencia entre
+      # «la lógica es correcta» y «aquí dice lo que tiene que decir».
+      - name: Lo que sólo se puede comprobar en Debian
+        run: |
+          set -Eeuo pipefail
+          eval "$(sed -n '/^_apt_pocket_hay() {/,/^}/p;/^_apt_pockets_faltan() {/,/^}/p;/^_php_ver_del_sistema() {/,/^}/p' install.sh)"
+          . /etc/os-release
+          echo "distribución: ${ID} ${VERSION_ID} (${VERSION_CODENAME})"
+          [ "${ID}" = "debian" ] || { echo "ERROR: esto no es Debian"; exit 1; }
+
+          # 1. El PHP que sirve Debian 12, preguntado a apt y no a una tabla.
+          php_ver="$(_php_ver_del_sistema)"
+          echo "apt dice que el PHP de este sistema es: '${php_ver}'"
+          [ "${php_ver}" = "8.2" ] || { echo "ERROR: esperaba 8.2"; exit 1; }
+
+          # 2. La medición en reposo del aviso de pockets. Una imagen oficial de
+          #    Debian trae los tres, así que lo correcto aquí es el SILENCIO. Si
+          #    esto habla, o la imagen ha cambiado o la comprobación se ha roto
+          #    — y las dos cosas hay que mirarlas.
+          falta="$(_apt_pockets_faltan)"
+          echo "pockets que faltan: '${falta}'"
+          [ -z "${falta}" ] || { echo "ERROR: aviso falso en un Debian bien configurado"; exit 1; }
+
+          # 3. Y que los paquetes del instalador EXISTAN y resuelvan aquí, que
+          #    es lo que se rompía: doce 'php8.3-*' inexistentes. En seco, sin
+          #    instalar nada: lo que se comprueba es la resolución, no apt.
+          apt-get install -y -qq --dry-run \
+            ca-certificates curl wget gnupg lsb-release apt-transport-https software-properties-common \
+            git rsync unzip zip jq fzf tree htop ncdu bc dnsutils net-tools \
+            build-essential pkg-config libssl-dev ufw fail2ban unattended-upgrades \
+            logrotate cron acl sudo python3-systemd \
+            postgresql postgresql-contrib \
+            python3 python3-venv python3-pip python3-dev pipx \
+            certbot python3-certbot-dns-cloudflare composer \
+            "php${php_ver}-fpm" "php${php_ver}-cli" "php${php_ver}-common" "php${php_ver}-opcache" \
+            "php${php_ver}-pgsql" "php${php_ver}-mysql" "php${php_ver}-mbstring" "php${php_ver}-xml" \
+            "php${php_ver}-curl" "php${php_ver}-zip" "php${php_ver}-gd" "php${php_ver}-intl" "php${php_ver}-bcmath" \
+            > /dev/null
+          echo "los paquetes del instalador resuelven en Debian 12"

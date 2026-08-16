@@ -1,0 +1,11 @@
+*.log
+*.tmp
+*.swp
+.DS_Store
+/tmp/
+/test-output/
+# El fichero de trabajo de 'make test-strict'. Lo borra al terminar, pero una
+# tanda interrumpida a mitad —un Ctrl-C, una suite que se cuelga— lo deja ahí,
+# y entonces aparece como fichero sin seguir en un repositorio limpio.
+.test-output
+*.local
