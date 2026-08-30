@@ -1166,6 +1166,18 @@ Tres decisiones dentro del contrato merecen explicación:
 
 **Los campos se añaden, nunca se renombran.** Es una promesa explícita, escrita también en `USAGE.md`, y es lo único que hace que alguien pueda depender de esta salida. Si algún día hubiera que romperla, sube `schema`, que viaja en todas las respuestas precisamente para eso.
 
+**Y qué se garantiza cuando `schema` sube.** Subir `schema` es la salida de emergencia, y conviene decir hasta dónde llega. Un cliente que sólo lea «si hay que romper, sube `schema`» sólo puede concluir que un `schema` mayor puede ser cualquier cosa, y de ahí sale la única política defensiva posible: negarse a hablar. Que es la peor forma de romper algo que todavía funcionaba.
+
+Tres cosas se garantizan **para siempre**, en cualquier `schema`:
+
+1. **`orbit version --json` no cambia de forma.** Sigue siendo un objeto con `schema`, `version` y `contract`, y los tres siguen significando lo mismo. Es el saludo, y un saludo que cambia no sirve para negociar nada.
+2. **Por stdout va un solo objeto JSON, y todo lo dirigido a una persona sale por stderr.** La regla de §13.6b es del contrato, no de un comando. La única excepción es `orbit logs --json`, que emite NDJSON porque su salida es un flujo sin final, y lo anuncia en su primera línea (§13.9).
+3. **Lo que no existe sigue siendo `null`.** Ningún `schema` futuro sustituirá un `null` por un 0, por una cadena vacía o por un valor centinela. Es la regla que separa «no aplica» de «está caído», y romperla haría que un cliente antiguo pintara alarmas falsas en vez de fallar — que es exactamente lo que §13.1 quiere evitar cuando dice que el puerto de una web estática es `null`.
+
+Y una que se garantiza **dentro de un mismo `schema`**: un campo, una vez publicado, no cambia de tipo ni de significado. Puede quedarse sin usar; no puede querer decir otra cosa.
+
+Lo que **no** se garantiza al subir `schema`: que un campo siga existiendo, que se llame igual, que una colección conserve su nombre, o que un enumerado no gane valores nuevos. Un cliente que se encuentre un `schema` mayor del que conoce puede fiarse de las cuatro reglas de arriba y de nada más — que es suficiente para saludar, avisar a quien lo usa y no inventarse datos.
+
 **Lo que no existe es `null`, no cero ni cadena vacía.** El puerto interno de una web estática es `null`; el 0 sería un puerto. Su `service` también es `null` y no `stopped`, porque no hay ningún proceso que arrancar: confundir «no aplica» con «está caída» pinta una alarma roja donde no pasa nada, y eso enseña a la gente a ignorar las alarmas.
 
 **`config` es el fichero, `state` es lo observado.** `config` reproduce `/etc/orbit/apps/<app>.conf` clave a clave, y por eso **todos sus valores son cadenas**: en el fichero lo son. Los datos con tipo —puerto como número, banderas como booleano— están en `state`, que es lo que Orbit deduce preguntándole a systemd, al disco y a los certificados. Mezclarlos habría obligado a decidir, campo a campo, cuál de las dos cosas es cada uno.
@@ -1358,6 +1370,35 @@ Lo que queda fuera, dicho para que nadie lo descubra mirando: lo que sirvió una
 El **panel HTML estático** —una página de solo lectura que regenerase el temporizador de `orbit watch`, servida por nginx como un site más y protegida con Cloudflare Access— sigue siendo la respuesta correcta para mirar el estado desde el móvil, y no rompe ningún principio: es un fichero, no un proceso. Está aplazado, no descartado.
 
 La **web UI activada por socket** al estilo de Cockpit (systemd escucha, el proceso arranca bajo demanda y se muere solo a los diez minutos) es el plan B honesto si algún día `top` y el cliente de escritorio no bastan. Se documenta aquí para que quien lo proponga dentro de dos años sepa que ya se pensó, y en qué orden.
+
+---
+
+### 13.9 `orbit logs --json`: la única excepción del contrato, y por qué se declara
+
+`logs` es el único comando de Orbit cuya salida es **inherentemente un flujo sin final**: con `--follow` no termina nunca. La regla de §13.6b —por stdout un solo objeto— no se puede cumplir aquí sin romper el caso principal, así que había dos salidas y ninguna es cómoda.
+
+**La que se descartó: un objeto con todas las líneas dentro.** Sería coherente con el resto del contrato y funciona perfectamente para `orbit logs mi-web --lines 80`. Falla en los dos casos que importan: no se puede emitir hasta que termina, así que `--follow` queda fuera; y con `--since 7d` sobre una web con tráfico, ese objeto son cientos de megas acumulados en memoria de bash antes de imprimir el primer byte. **Un contrato que sólo funciona para el caso pequeño es un contrato con una excepción, y §13.6b ya dice que un contrato con una excepción son dos contratos.**
+
+**La que se eligió: NDJSON, y decirlo en voz alta.** Una línea de JSON por línea de log. La excepción existe, así que se declara en vez de esconderla — y se declara **en la propia salida**: la primera línea es siempre un `{"event":"meta",…}` que lleva el `schema` y dice qué viene detrás. Un cliente no tiene que adivinar si este comando le va a dar un objeto o un flujo; se lo dice el flujo.
+
+```
+{"schema":1,"event":"meta","app":"mi-web","source":"nginx","unit":null,"since":null,"follow":false,"lines":80}
+{"event":"line","ts":"2026-08-29T14:02:11+02:00","stream":"access","text":"…"}
+{"event":"line","ts":null,"stream":"access","text":"…"}
+{"event":"end","lines":2,"truncated":false}
+```
+
+Cuatro decisiones dentro, y las cuatro son la misma regla de siempre aplicada a un sitio nuevo:
+
+**La marca de tiempo se toma del log, no se inventa.** El log de acceso de nginx la lleva con huso y sale con él. El de error la lleva **sin** huso, y sale sin él: es ISO-8601 válido y quiere decir «hora local del servidor». Ponerle el huso de hoy sería mentir en cuanto la línea sea anterior a un cambio de horario. Y un log del formato antiguo, que no lleva marca, da `"ts": null` — el mismo `null` de siempre, y de paso el cliente puede ofrecer `orbit nginx-rebuild` sin parsear un aviso traducido.
+
+**`stream` dice de qué log viene cada línea**, y eso es algo que la salida en prosa **pierde**: `tail` mezcla el de acceso y el de error sin decir cuál es cuál. Distinguirlos es la primera pregunta de cualquiera que mira un log de nginx.
+
+**`truncated` es por fuente, no por total.** Es la misma honestidad que `requests_capped` en `top` y `complete` en `traffic`. Y es por fuente porque el tope de `--lines` lo es: igual que `tail -n N f1 f2` da N de cada fichero. Con el log de acceso y el de error, un total de 3 con `--lines 2` no dice por sí solo si se llenó algo.
+
+**No se estructura el contenido de la línea.** `text` es la línea tal cual. Sacarle el nivel, el módulo o el código HTTP sería inventar un formato que la aplicación del usuario no ha prometido, y es el primer paso hacia un parser de logs dentro de Orbit.
+
+**Y `--follow` deja de ser el defecto con `--json`**, que es la misma regla que `orbit top`: en modo máquina, una foto. Quien quiera el flujo lo pide. Esto invierte un valor por defecto, así que conviene decirlo — y no rompe a nadie, porque hasta ahora `orbit logs --json` era un error. Cuando se sigue en vivo **no hay `end`**, y es correcto: un flujo que no termina no tiene final que anunciar. El cliente ya lo sabe, porque el `meta` se lo dijo con `"follow":true`.
 
 ---
 

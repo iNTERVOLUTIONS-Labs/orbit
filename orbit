@@ -1113,6 +1113,8 @@ _json_capable() {
     metrics|metricas|métricas) return 0 ;;
     traffic|trafico|tráfico) return 0 ;;
     redirect|redir|db|database|watch) return 0 ;;
+    backup|copia) return 0 ;;
+    logs|log) return 0 ;;
     queue|cola|colas) return 0 ;;
     version|-v|--version) return 0 ;;
     *) return 1 ;;
@@ -7987,10 +7989,112 @@ _backup_prune() {
   return 0
 }
 
+# ── el contrato de 'backup', para que un cliente no parsee columnas ────────
+#
+# 'orbit backup list' imprime una tabla con anchuras fijas y el tamaño en
+# 'du -h'. Cualquiera que quiera esos datos acaba cortando por columnas, y a
+# partir de ahí alinear una columna es un cambio incompatible (§13.1). Además
+# 'du -h' escribe «1,2G» con el separador decimal de la configuración regional
+# del servidor, o sea que el cliente tendría que deshacer una decisión de
+# presentación tomada al otro lado.
+#
+# Tres decisiones, todas heredadas de lo que el contrato ya hace:
+#   · 'app' es null en la copia de la configuración global, que no es de
+#     ninguna app. 'kind' lo dice sin obligar a mirar el nombre del fichero,
+#     que es la clase de dependencia que convierte un renombrado en una avería.
+#   · 'size_bytes' en bruto. 'du -h' es presentación.
+#   · 'created' en ISO-8601 con huso, como A_CREATED. El '%Y-%m-%d %H:%M' de la
+#     tabla pierde el huso y no se puede comparar entre servidores.
+#   · 'verified' es null: «no lo he comprobado en esta llamada», que no es lo
+#     mismo que «está mal». Es el mismo null que 'cert_days' en 'list'.
+#     Quien quiera la respuesta tiene 'orbit backup verify --json', que cuesta
+#     abrir cada fichero y por eso no se hace de gratis en 'list'.
+# Devuelve por dos globales y no por stdout, y no es estilo: quien lo llama
+# necesita **dos** valores, y capturar con "$( )" abriría un subshell donde el
+# segundo se perdería. Es la misma razón por la que '_top_measure' deja su
+# resultado en TM_*, y el mismo fork que §13.6d quitó de los ayudantes JSON.
+BK_KIND=""; BK_APP=""
+_backup_kind_of() { # _backup_kind_of <ruta>  -> BK_KIND, BK_APP
+  local b; b="${1##*/}"
+  BK_APP=""
+  if [[ "$b" == _orbit-conf-* ]]; then BK_KIND="config"; return 0; fi
+  BK_KIND="app"
+  # El nombre es '<app>-AAAAMMDD-HHMMSS.tar.gz'. Se recorta el sufijo, que es de
+  # anchura fija, en vez de cortar por el primer guion: los nombres de app
+  # llevan guiones —'_app_name_ok' los admite— y cortar por el primero partiría
+  # 'mi-web' en 'mi'.
+  [[ "$b" =~ ^(.+)-[0-9]{8}-[0-9]{6}\.tar\.gz$ ]] && BK_APP="${BASH_REMATCH[1]}"
+  return 0
+}
+
+_backup_list_json() {
+  local f sep="" total=0 bytes=0 sz
+  printf '{"schema":%s,"dir":' "$JSON_SCHEMA"; _j_str "$BACKUP_DIR"
+  printf ',"backups":['
+  while read -r f; do
+    [[ -n "$f" ]] || continue
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    _backup_kind_of "$f"
+    printf '%s{"file":' "$sep"; _j_str "$f"
+    printf ',"app":'
+    if [[ -n "$BK_APP" ]]; then _j_str "$BK_APP"; else printf 'null'; fi
+    printf ',"kind":';       _j_str "$BK_KIND"
+    printf ',"created":';    _j_str "$(date -r "$f" -Iseconds 2>/dev/null)"
+    printf ',"size_bytes":'; _j_num "$sz"
+    printf ',"verified":null}'
+    sep=","
+    total=$(( total + 1 )); bytes=$(( bytes + sz ))
+  done < <(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | sort -r)
+  printf '],"total":%s,"bytes":%s,"keep_days":%s}\n' "$total" "$bytes" "$(_j_num "$BACKUP_KEEP")"
+  # Cero copias salen como una colección vacía con total 0, no como silencio:
+  # con stdout en blanco un cliente no puede distinguir «no había nada» de
+  # «algo se rompió» (§13.6bb).
+  return 0
+}
+
+# 'ok' de arriba es booleano y es **la misma regla que el código de salida**,
+# no un recuento. Es la regla de 'deploy --all --json': un cliente que mire el
+# objeto y otro que mire el código de salida no pueden discrepar nunca. Los
+# recuentos van aparte, en 'good' y 'bad'.
+_backup_verify_json() { # _backup_verify_json <fichero…>
+  local f sep="" good=0 bad=0
+  printf '{"schema":%s,"backups":[' "$JSON_SCHEMA"
+  for f in "$@"; do
+    [[ -n "$f" ]] || continue
+    _backup_kind_of "$f"
+    local ok="true" msg=""
+    if [[ "$BK_KIND" == "config" ]]; then
+      # La configuración global no lleva app ni manifiesto: se comprueba que se
+      # abre y ya. Medirla con la misma vara diría que está rota.
+      if tar tzf "$f" >/dev/null 2>&1; then msg="$(t "configuración global")"
+      else ok="false"; msg="$(t "corrupta")"; fi
+    else
+      if _verify_one "$f"; then msg="$VERIFY_MSG"; else ok="false"; msg="$VERIFY_MSG"; fi
+    fi
+    [[ "$ok" == "true" ]] && good=$(( good + 1 )) || bad=$(( bad + 1 ))
+    printf '%s{"file":' "$sep"; _j_str "$f"
+    printf ',"kind":';    _j_str "$BK_KIND"
+    printf ',"app":'
+    if [[ -n "$BK_APP" ]]; then _j_str "$BK_APP"; else printf 'null'; fi
+    printf ',"ok":%s' "$ok"
+    # 'message' es prosa traducida, para enseñársela a una persona; 'ok' es
+    # para decidir. La misma separación que 'error' y 'failed_step' en deploy.
+    printf ',"message":'; _j_str "$msg"
+    printf '}'
+    sep=","
+  done
+  printf '],"total":%s,"good":%s,"bad":%s,"ok":%s}\n' \
+    "$(( good + bad ))" "$good" "$bad" \
+    "$([[ $bad -eq 0 ]] && printf 'true' || printf 'false')"
+  (( bad == 0 ))
+}
+
 cmd_backup() {
   need_root backup
   _subcmd backup create app "create all|--all|--todas list|ls verify|check help|-h|--help" "$@"
   local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  [[ "$JSON" == "yes" && "$sub" != "list" && "$sub" != "verify" ]] \
+    && die "--json sólo está en 'orbit backup list' y 'orbit backup verify'"
 
   case "$sub" in
     verify)
@@ -8002,8 +8106,12 @@ cmd_backup() {
         [[ -f "$1" ]] || die "No encuentro «%s»." "$1"
       else
         mapfile -t files < <(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | sort -r)
+        # Con --json, cero copias son una colección vacía y no un mensaje: es
+        # una respuesta, y callarse no lo es.
+        if [[ "$JSON" == "yes" ]] && (( ${#files[@]} == 0 )); then _backup_verify_json; return 0; fi
         (( ${#files[@]} )) || { info "Todavía no hay ninguna copia en %s." "$BACKUP_DIR"; return 0; }
       fi
+      [[ "$JSON" == "yes" ]] && { _backup_verify_json "${files[@]}"; return $?; }
       title "Verificando copias"
       local f malas=0
       for f in "${files[@]}"; do
@@ -8031,6 +8139,7 @@ cmd_backup() {
       logline "backup verify ok=${#files[@]}"
       return 0 ;;
     list)
+      [[ "$JSON" == "yes" ]] && { _backup_list_json; return 0; }
       title "Copias de seguridad"
       local f n=0
       while read -r f; do
@@ -8851,6 +8960,107 @@ _log_has_time() { # _log_has_time <fichero>
   [[ "$(tail -n 1 "$1")" == \[* ]]
 }
 
+# ── el contrato de 'logs', y la única excepción del contrato entero ────────
+#
+# 'logs' es el único comando cuya salida es **inherentemente un flujo sin
+# final**: con --follow no termina nunca. Un objeto no se puede emitir hasta
+# que se acaba, así que la regla de §13.6b —por stdout un solo objeto— no se
+# puede cumplir aquí sin romper el caso principal. Y con '--since 7d' sobre una
+# web con tráfico, ese objeto serían cientos de megas acumulados en memoria de
+# bash antes de imprimir el primer byte.
+#
+# Así que aquí va NDJSON: una línea de JSON por línea de log. La excepción se
+# declara en vez de fingir que no existe, y para que un cliente no tenga que
+# adivinar, **la primera línea es un 'meta' que lleva el schema** y dice qué
+# viene detrás. Si el contrato de 'logs' cambiara, se vería ahí.
+#
+# Lo que NO se hace: sacarle a la línea el nivel, el módulo o el código HTTP.
+# Sería inventar un formato que la aplicación del usuario no ha prometido, y es
+# el primer paso hacia un parser de logs dentro de Orbit.
+#
+# La marca de tiempo se toma del propio log y no se inventa:
+#   · journal    'journalctl -o short-iso' ya la da con huso.
+#   · access     el log de nginx la lleva con huso: [29/Aug/2026:14:02:11 +0200]
+#   · error      la lleva SIN huso: 2026/08/29 14:02:11. Sale sin huso, que es
+#                ISO-8601 válido y quiere decir «hora local del servidor».
+#                Ponerle el huso de hoy sería mentir en cuanto la línea sea de
+#                antes de un cambio de horario.
+#   · formato viejo de nginx, sin marca: 'ts' es null. Es el mismo null de
+#     siempre —no se sabe— y el cliente puede ofrecer 'orbit nginx-rebuild' sin
+#     parsear un aviso traducido.
+# Sin marca de tiempo se emite un guion y NO un campo vacío. Motivo: "read" con
+# IFS de tabulador trata el tabulador como espacio en blanco y se come el primer
+# campo cuando está vacío, así que una línea sin fecha llegaba corrida — el
+# texto acababa en "ts" y "text" salía en blanco. Con un centinela no hay campo
+# vacío que colapsar.
+#
+# (Y este comentario va aquí y no dentro del programa de awk porque ahí lo
+# rodean comillas simples de bash: un apóstrofo dentro cerraría la cadena. Lo
+# cazó shellcheck con SC1078 después de que "bash -n" lo diera por bueno.)
+_LOG_JSON_AWK='
+BEGIN { meses = "JanFebMarAprMayJunJulAugSepOctNovDec"; OFS = "\t" }
+{
+  iso = ""
+  if (substr($0,1,1) == "[") {
+    mes = index(meses, substr($0,5,3))
+    if (mes > 0) {
+      iso = substr($0,9,4) "-" sprintf("%02d", (mes+2)/3) "-" substr($0,2,2) \
+            "T" substr($0,14,2) ":" substr($0,17,2) ":" substr($0,20,2)
+      hus = substr($0,23,5)
+      if (hus ~ /^[+-][0-9][0-9][0-9][0-9]$/)
+        iso = iso substr(hus,1,3) ":" substr(hus,4,2)
+    }
+  } else if (substr($0,5,1) == "/" && substr($0,8,1) == "/") {
+    iso = substr($0,1,4) "-" substr($0,6,2) "-" substr($0,9,2) \
+          "T" substr($0,12,2) ":" substr($0,15,2) ":" substr($0,18,2)
+  }
+  # El guion de aquí es un centinela, no un adorno: ver el comentario de arriba.
+  print (iso == "" ? "-" : iso), $0
+}'
+
+# Convierte un flujo de «ISO<tab>texto» en líneas de JSON. Cuenta lo emitido en
+# LOGJ_N para que 'end' pueda decir si se llegó al tope: un número corto sin
+# avisar se lee como «hay poco log», que suele ser lo contrario de lo que pasa.
+# Se le pasa la entrada por sustitución de proceso y NUNCA por una tubería:
+# al final de una tubería el bucle corre en un subshell y LOGJ_N se pierde, o
+# sea que 'end' anunciaría siempre cero líneas. Es la misma trampa que obliga a
+# '_top_measure' a dejar su resultado en globales.
+LOGJ_N=0        # líneas emitidas en total
+LOGJ_TRUNC="no"  # ¿algún flujo llegó a su tope?
+_log_json_stream() { # _log_json_stream <stream> <tope>   (entrada por stdin)
+  local stream="$1" tope="${2:-0}" n=0 iso rest
+  while IFS=$'\t' read -r iso rest || [[ -n "${iso:-}" ]]; do
+    printf '{"event":"line","ts":'
+    if [[ -n "$iso" && "$iso" != "-" ]]; then _j_str "$iso"; else printf 'null'; fi
+    printf ',"stream":';  _j_str "$stream"
+    printf ',"text":';    _j_str "$rest"
+    printf '}\n'
+    LOGJ_N=$(( LOGJ_N + 1 )); n=$(( n + 1 ))
+  done
+  # El tope de --lines es **por fuente**, igual que 'tail -n N f1 f2' da N de
+  # cada fichero. Así que 'truncated' es «alguna fuente llegó a su tope», y no
+  # se deduce del total: con el log de acceso y el de error, un total de 3 con
+  # --lines 2 no dice nada por sí solo.
+  (( tope > 0 && n >= tope )) && LOGJ_TRUNC="yes"
+  return 0
+}
+
+_log_json_meta() { # _log_json_meta <app> <source> <unit|""> <since|""> <follow> <lines>
+  printf '{"schema":%s,"event":"meta","app":' "$JSON_SCHEMA"; _j_str "$1"
+  printf ',"source":'; _j_str "$2"
+  printf ',"unit":';   if [[ -n "$3" ]]; then _j_str "$3"; else printf 'null'; fi
+  printf ',"since":';  if [[ -n "$4" ]]; then _j_str "$4"; else printf 'null'; fi
+  printf ',"follow":%s,"lines":%s}\n' "$(_j_bool "$5")" "$(_j_num "$6")"
+}
+
+# No hay 'end' cuando se sigue en vivo, y es lo correcto: un flujo que no
+# termina no tiene final que anunciar. El cliente lo sabe porque el 'meta' de
+# arriba se lo dijo con "follow":true.
+_log_json_end() {
+  printf '{"event":"end","lines":%s,"truncated":%s}\n' \
+    "$LOGJ_N" "$([[ "$LOGJ_TRUNC" == "yes" ]] && printf 'true' || printf 'false')"
+}
+
 cmd_logs() {
   local name="" since="" lines="80" follow="" only_nginx="no"
   local -a pos=()
@@ -8882,10 +9092,20 @@ cmd_logs() {
   fi
   # Por defecto se sigue en vivo. Con --since se ha pedido una ventana
   # concreta: se enseña y se sale, salvo que además se pida -f.
+  #
+  # Y con --json tampoco se sigue por defecto, que es la misma regla que
+  # 'orbit top': en modo máquina, una foto. Quien quiera el flujo lo pide con
+  # --follow. Esto invierte un defecto, y por eso conviene decirlo en voz alta:
+  # no rompe a nadie, porque hasta ahora 'orbit logs --json' era un error.
   if [[ -z "$follow" ]]; then
-    if [[ -n "$since" ]]; then follow="no"; else follow="yes"; fi
+    if [[ -n "$since" || "$JSON" == "yes" ]]; then follow="no"; else follow="yes"; fi
   fi
 
+  # Un cliente no puede contestar a un selector, y 'pick_app' escribe por
+  # stdout, que es donde va el NDJSON. Misma regla que 'info --json'.
+  if [[ -z "$name" && "$JSON" == "yes" ]]; then
+    die "uso: orbit logs <app> --json"
+  fi
   [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
   load_app "$name"
 
@@ -8893,7 +9113,21 @@ cmd_logs() {
     local -a jargs=(-u "$(svc_name "$name")" -n "$lines")
     [[ -n "$cut" ]] && jargs+=(--since "$(date -d "$(_since_expr "$since")" '+%Y-%m-%d %H:%M:%S')")
     if [[ "$follow" == "yes" ]]; then
-      jargs+=(-f); printf "  ${D}%s${R}\n" "$(t "Ctrl-C para salir")"
+      # Por $UI_FD y no por stdout a secas: con --json ahí va el NDJSON, y una
+      # línea de cortesía traducida en medio lo convertiría en basura. Es la
+      # regla de §13.6b, que hasta ahora este comando cumplía por no tener
+      # contrato.
+      jargs+=(-f); printf "  ${D}%s${R}\n" "$(t "Ctrl-C para salir")" >&"$UI_FD"
+    fi
+    if [[ "$JSON" == "yes" ]]; then
+      _log_json_meta "$A_NAME" "journal" "$(svc_name "$name")" "$since" "$follow" "$lines"
+      # -o short-iso da la marca con huso al principio de la línea; el resto se
+      # deja tal cual. El 'sed' separa la primera palabra del resto con un
+      # tabulador, que es lo que espera _log_json_stream.
+      _log_json_stream "journal" "$lines" \
+        < <(journalctl "${jargs[@]}" -o short-iso 2>/dev/null | sed 's/ /\t/')
+      [[ "$follow" == "yes" ]] || _log_json_end
+      return 0
     fi
     journalctl "${jargs[@]}"
     return 0
@@ -8909,7 +9143,37 @@ cmd_logs() {
   local -a files=(); local f
   for f in "$acc" "$err"; do [[ -f "$f" ]] && files+=("$f"); done
   if (( ${#files[@]} == 0 )); then
+    # Con --json esto no es un error: es una ventana vacía, y se dice con la
+    # forma completa (meta + end) para que el cliente no tenga que distinguir
+    # «no hay nada» de «se rompió» mirando un stdout en blanco (§13.6bb).
+    if [[ "$JSON" == "yes" ]]; then
+      _log_json_meta "$A_NAME" "nginx" "" "$since" "$follow" "$lines"
+      _log_json_end
+      return 0
+    fi
     info "«%s» todavía no tiene logs de nginx. Aparecerán con la primera visita." "$A_NAME"
+    return 0
+  fi
+
+  if [[ "$JSON" == "yes" ]]; then
+    _log_json_meta "$A_NAME" "nginx" "" "$since" "$follow" "$lines"
+    # Fichero a fichero y no 'tail' de los dos a la vez, que es lo que hace la
+    # salida en prosa. Así cada línea sale con su 'stream', y distinguir el log
+    # de acceso del de error es la primera pregunta de cualquiera que mira un
+    # log de nginx — hoy se pierde, porque 'tail' los mezcla.
+    local jf jstream
+    for jf in "${files[@]}"; do
+      [[ "$jf" == "$err" ]] && jstream="error" || jstream="access"
+      if [[ -n "$cut" ]]; then
+        _log_json_stream "$jstream" "$lines" \
+          < <(awk -v CUT="$cut" "$_LOG_SINCE_AWK" "$jf" | tail -n "$lines" | awk "$_LOG_JSON_AWK")
+      elif [[ "$follow" == "yes" ]]; then
+        _log_json_stream "$jstream" "$lines" < <(tail -n "$lines" -f "$jf" | awk "$_LOG_JSON_AWK")
+      else
+        _log_json_stream "$jstream" "$lines" < <(tail -n "$lines" "$jf" | awk "$_LOG_JSON_AWK")
+      fi
+    done
+    [[ "$follow" == "yes" ]] || _log_json_end
     return 0
   fi
 
@@ -8920,7 +9184,7 @@ cmd_logs() {
     _log_since "$cut" "${files[@]}" | tail -n "$lines"
     return 0
   fi
-  [[ "$follow" == "yes" ]] && printf "  ${D}%s${R}\n" "$(t "Ctrl-C para salir")"
+  [[ "$follow" == "yes" ]] && printf "  ${D}%s${R}\n" "$(t "Ctrl-C para salir")" >&"$UI_FD"
   local -a targs=(-n "$lines")
   [[ "$follow" == "yes" ]] && targs+=(-f)
   tail "${targs[@]}" "${files[@]}"
@@ -12085,7 +12349,21 @@ cmd_doctor() {
   for a in "$@"; do
     case "$a" in
       --fix) fix="yes" ;;
-      *) die "orbit doctor: no sé qué es «%s». Sólo acepta --fix y --json." "$a" ;;
+      # '--yes' se reconoce aquí y en ningún sitio más, a propósito. La guarda
+      # de más abajo lo exige para 'doctor --fix --json' —sin terminal no se
+      # puede preguntar— y hasta ahora no había forma de dárselo: no es una
+      # bandera global (el bucle de 'main' sólo conoce --json, --eva y --lang) y
+      # 'ASSUME_YES' sólo se asignaba dentro de 'cmd_new', sobre una copia local.
+      # O sea que el camino estaba documentado en USAGE y muerto por las dos
+      # ramas.
+      #
+      # Hacerla global habría sido más corto y es lo que no se hace: hoy hay
+      # cuatro comandos que la reconocen cada uno por su cuenta con su propio
+      # significado —'new', 'remove', 'restore', 'migrate'— y uno de ellos borra
+      # cosas. Cambiarles el comportamiento a los cuatro para arreglar 'doctor'
+      # es pagar un riesgo que no hace falta.
+      -y|--yes|--si) ASSUME_YES="yes" ;;
+      *) die "orbit doctor: no sé qué es «%s». Sólo acepta --fix, --yes y --json." "$a" ;;
     esac
   done
 
@@ -13023,6 +13301,10 @@ _i18n_en() {
     ["Base de datos '%s' creada · DATABASE_URL guardada en el .env de la app"]="Database '%s' created · DATABASE_URL saved in the app's .env"
     ["Base de datos '%s' creada · DATABASE_URL, DB_CONNECTION y DB_URL en el .env"]="Database '%s' created · DATABASE_URL, DB_CONNECTION and DB_URL in the .env"
     ["--json sólo está en 'orbit db list'"]="--json is only in 'orbit db list'"
+    ["--json sólo está en 'orbit backup list' y 'orbit backup verify'"]="--json is only in 'orbit backup list' and 'orbit backup verify'"
+    ["uso: orbit logs <app> --json"]="usage: orbit logs <app> --json"
+    ["configuración global"]="global configuration"
+    ["corrupta"]="corrupt"
     ["No he podido preguntarle a PostgreSQL: %s"]="I could not ask PostgreSQL: %s"
     ["Bases de datos"]="Databases"
     ["Copia guardada en %s"]="Backup saved in %s"
@@ -13577,7 +13859,7 @@ _i18n_en() {
     ["Arreglado: %s"]="Fixed: %s"
     ["No he podido arreglar: %s"]="I could not fix: %s"
     ["  Hazlo a mano: %s"]="  Do it by hand: %s"
-    ["orbit doctor: no sé qué es «%s». Sólo acepta --fix y --json."]="orbit doctor: I don't know what «%s» is. It only takes --fix and --json."
+    ["orbit doctor: no sé qué es «%s». Sólo acepta --fix, --yes y --json."]="orbit doctor: I don't know what «%s» is. It only takes --fix, --yes and --json."
     ["Diagnóstico"]="Diagnosis"
     ["'doctor --fix --json' necesita también --yes: sin terminal no puedo preguntar."]="'doctor --fix --json' also needs --yes: with no terminal I cannot ask."
     ["No hay nada que pueda arreglar yo solo."]="There is nothing I can fix on my own."
