@@ -44,6 +44,7 @@ test: check lint
 	bash tests/unit_test.sh
 	bash tests/subcmd_test.sh
 	bash tests/json_test.sh
+	bash tests/cli_test.sh
 	bash tests/top_test.sh
 	bash tests/metrics_test.sh
 	bash tests/traffic_test.sh

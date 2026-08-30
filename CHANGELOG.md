@@ -3,6 +3,39 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/).
 Este proyecto sigue [versionado semántico](https://semver.org/lang/es/).
 
+## [No publicado]
+
+### El contrato, terminado por donde le faltaba: un cliente ya no necesita parsear texto
+
+Sale de auditar el contrato desde fuera, escribiendo el cliente de escritorio de §13.4 contra él. El método importa más que los cambios: **no se leyó el script, se ejecutó**, con un banco de 40 apps y llamando a `main()`. Y eso destapó lo primero de la lista, que llevaba versiones documentado y muerto.
+
+**`orbit doctor --fix --json --yes` no existía.** Está en `USAGE.md` y razonado en §19.5, y moría con «no sé qué es «--yes»». `--yes` no es una bandera global —el bucle de `main` sólo conoce `--json`, `--eva` y `--lang`— y `ASSUME_YES` sólo se asignaba dentro de `cmd_new`, sobre una copia local. La guarda de `doctor` la exige y no había forma de dársela: **el camino estaba muerto por las dos ramas**. Ahora `cmd_doctor` la reconoce, y sólo él. Hacerla global habría sido más corto y es justo lo que no se hace: hoy la reconocen `new`, `remove`, `restore` y `migrate`, cada uno con su significado local, y uno de ellos borra datos.
+
+**`orbit backup list --json` y `orbit backup verify --json`.** `list` imprimía una tabla de anchura fija con el tamaño en `du -h`, o sea que quien quisiera esos datos acababa cortando por columnas —y a partir de ahí alinear una columna es un cambio incompatible— y reinterpretando un «1,2G» escrito con el separador decimal de este servidor. Ahora el tamaño va en bytes y la fecha en ISO-8601 con huso. La copia de la configuración global sale con `"app": null` y `"kind": "config"`, porque no es de ninguna app. Y `verified` es `null` en `list`: «no lo he comprobado en esta llamada» no es «está mal», y abrir cada fichero cuesta. En `verify`, el `ok` de arriba es booleano y sigue **la misma regla que el código de salida**, para que quien mire el objeto y quien mire el `exit` no puedan discrepar nunca.
+
+**`orbit logs --json`, y la única excepción del contrato.** `logs` es el único comando cuya salida es un flujo sin final, así que un objeto no se puede cerrar nunca con `--follow` y una ventana de siete días serían cientos de megas en memoria antes del primer byte. Se emite NDJSON, y la excepción **se declara en la propia salida**: la primera línea es un `meta` con el `schema`. De paso gana algo que la salida en prosa pierde, porque `tail` mezcla los dos ficheros de nginx sin decir cuál es cuál: **`stream` distingue el log de acceso del de error**, que es la primera pregunta de cualquiera que mira un log. La marca de tiempo sale del propio log y no se inventa —el de acceso lleva huso, el de error no, y el formato viejo da `ts: null`—, y con `--json` no se sigue en vivo por defecto, que es la misma regla que `orbit top`: en modo máquina, una foto. Ver §13.9.
+
+**Y la promesa del contrato gana su otra mitad.** §13.1 decía «si hay que romper, sube `schema`», y le faltaba decir qué pasa después. Un cliente que sólo lea eso sólo puede concluir que un `schema` mayor puede ser cualquier cosa, y negarse a hablar — que es la peor forma de romper algo que todavía funcionaba. Ahora hay tres garantías permanentes escritas: la forma de `version --json`, la separación de stdout y stderr, y que **lo que no existe siga siendo `null`** y nunca un cero.
+
+### Y la prueba que faltaba, que es la que habría cazado lo primero
+
+`tests/cli_test.sh`, 41 comprobaciones. Las otras 33 suites cargan las funciones **sin `main`** —`tests/lib.sh` corta la última línea a propósito, y hace bien— así que las 110 líneas del bucle de banderas, `_json_strip`, `_lang_strip`, la criba de `_json_capable` y el árbol de despacho **no las ejecutaba nadie**. `doctorfix_test.sh` llama a `cmd_doctor --fix` como función, saltándose justo donde vive `ASSUME_YES`: la prueba pasaba y el comando no funcionaba. Es la lección de §13.6c otra vez — *la prueba tiene que ejercer el camino*.
+
+La suite invoca el script **como binario**, y la lista de comandos con JSON la saca del propio `_json_capable` en vez de escribirla a mano: si una gana una entrada y la otra no, la que se queda corta miente.
+
+Dos cosas quedan **fijadas y no arregladas**, a propósito, porque cambiarlas afecta a más de veinte comandos y merece su propia discusión:
+
+- **Sin terminal, un comando sin app no aborta: elige la primera por orden alfabético y sale con 0.** Con `orbit restart` eso es reiniciar la app equivocada sin que nada lo diga. Sólo se protegen `info --json`, `deploy --json`, `rollback` y ahora `logs --json`.
+- **`--json` detrás de un comando que no lo habla se ignora en silencio** —`orbit restart web --json` sale con 0— porque `main` sólo lo saca de los argumentos cuando el comando dice hablarlo, y no todos filtran lo que no conocen. Delante sí muere. Para un cliente la regla práctica es **`--json` siempre delante**.
+
+Escribirlo con una prueba es lo que hace que el día que cambie sea porque alguien quiso.
+
+### Lo que salió por el camino
+
+- **`_j_str` no escapa `<`, `>`, `&` ni `'`, y hace bien**: su trabajo es producir JSON válido, no HTML seguro. No se toca. Queda escrito porque es una frontera que el servidor no tiene por qué cruzar y un cliente gráfico sí — y el escapado de HTML se hace donde se genera el HTML.
+- **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
+- **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
+
 ## [1.3.6] - 2026-08-16
 
 ### La guía de desarrollo deja de vivir en la raíz

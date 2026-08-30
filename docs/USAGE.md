@@ -934,6 +934,52 @@ orbit logs mi-web --nginx           # los de nginx aunque la app tenga proceso
 
 `--nginx` es el que quieres cuando la web da **502**: ese error lo escribe nginx, y en el journal de la aplicación no aparece.
 
+### Para un programa: `--json`
+
+```bash
+orbit logs mi-web --json --since 1h
+orbit logs mi-web --json --follow          # el flujo, si lo quieres en vivo
+```
+
+Aquí `--json` **no** da un objeto: da **NDJSON**, una línea de JSON por línea de
+log. Es la única excepción del contrato y está así a propósito — un log con
+`--follow` no termina nunca, así que no hay un momento en el que se pueda cerrar
+un objeto, y una ventana de siete días serían cientos de megas en memoria antes
+de imprimir el primer byte.
+
+Para que no haya que adivinarlo, **la primera línea siempre es un `meta`** que
+lleva el `schema` y dice qué viene detrás:
+
+```
+{"schema":1,"event":"meta","app":"mi-web","source":"nginx","unit":null,"since":null,"follow":false,"lines":80}
+{"event":"line","ts":"2026-08-29T14:02:11+02:00","stream":"access","text":"…"}
+{"event":"line","ts":"2026-08-29T14:03:01","stream":"error","text":"…"}
+{"event":"end","lines":2,"truncated":false}
+```
+
+Cuatro cosas que conviene saber:
+
+- **`stream` dice de qué log viene cada línea** — `journal`, `access` o `error`.
+  La salida normal no lo distingue, porque `tail` mezcla los dos ficheros de
+  nginx sin decir cuál es cuál.
+- **`ts` sale del propio log y no se inventa.** El de acceso lleva huso y sale
+  con él; el de error no lo lleva y sale sin él, que quiere decir «hora local
+  del servidor». Un log del formato viejo, sin marca, da `"ts": null` — y ése es
+  el momento de pasarle `orbit nginx-rebuild`.
+- **`truncated` avisa de que se llegó al tope de `--lines`**, y el tope es por
+  fuente, igual que `tail -n N fichero1 fichero2` da N de cada uno.
+- **Con `--json` no se sigue en vivo por defecto**, como en `orbit top`: en modo
+  máquina, una foto. Con `--follow` sí, y entonces **no hay `end`**: un flujo que
+  no termina no tiene final que anunciar.
+
+```bash
+# Sólo los errores de nginx de la última hora
+orbit logs mi-web --json --since 1h | jq -r 'select(.stream=="error") | .text'
+
+# ¿Me he dejado líneas fuera?
+orbit logs mi-web --json | jq -r 'select(.event=="end") | .truncated'
+```
+
 ### Si `--since` te dice que el log no lleva fecha
 
 Los servidores instalados antes de agosto de 2026 tienen un formato de log sin marca de tiempo, y sin ella no hay nada que filtrar. Se arregla una vez:
@@ -1436,7 +1482,36 @@ Los vhosts de `/etc/nginx/sites-available/orbit-*.conf` **se regeneran en cada d
 orbit backup mi-web        # una app
 orbit backup --all         # todas, más la configuración global
 orbit backup list          # qué copias hay
+orbit backup verify        # comprueba que de ellas se puede volver
 orbit restore <fichero>    # devolver una copia a su sitio
+```
+
+`list` y `verify` hablan JSON, para quien no sea una persona:
+
+```bash
+orbit backup list --json
+orbit backup verify --json
+```
+
+El tamaño va en **bytes** y la fecha en ISO-8601 con huso, no en `1,2G` ni en
+`2026-08-29 03:15`: eso es presentación, y reinterpretarla al otro lado obliga a
+saber la configuración regional de este servidor. La copia de la configuración
+global sale con `"app": null` y `"kind": "config"`, porque no es de ninguna app.
+
+En `list`, `verified` es **`null`**: quiere decir «no lo he comprobado en esta
+llamada», que no es lo mismo que «está mal» — abrir cada fichero cuesta, y no se
+hace de gratis. Quien quiera la respuesta usa `verify`.
+
+En `verify`, el `ok` de arriba es un booleano y sigue **la misma regla que el
+código de salida**: falso si alguna copia está rota, igual que el `exit 1`. Los
+recuentos van aparte, en `good` y `bad`.
+
+```bash
+# ¿Puedo dormir tranquilo?
+orbit backup verify --json | jq -e '.ok' >/dev/null && echo "todas se pueden restaurar"
+
+# Cuánto ocupan las copias, en bytes
+orbit backup list --json | jq '.bytes'
 ```
 
 Cada copia es un `.tar.gz` que se lee con `tar tzf` sin necesitar Orbit:
@@ -1551,11 +1626,16 @@ orbit env list mi-web --json
 orbit db list --json
 orbit redirect list [app] --json
 orbit watch status --json
+orbit backup list --json
+orbit backup verify [fichero] --json
+orbit logs <app> --json        # NDJSON: una línea por línea de log, ver abajo
 ```
 
 La bandera vale delante o detrás del comando: `orbit --json list` y `orbit list --json` son lo mismo. En un comando que no tiene salida JSON, aborta diciéndolo —ignorarla en silencio te haría creer que lo que vas a leer es JSON cuando no lo es.
 
 **La promesa del formato:** los campos **se añaden, nunca se renombran ni cambian de tipo**. Puedes depender de ellos. Si algún día hubiera que romperlo, subiría el número de `schema`, que va en todas las respuestas.
+
+**Y si algún día `schema` sube**, cambiará el nombre o el significado de algún campo. Lo que **no cambia nunca, ni entre versiones de `schema`**, son tres cosas: la forma de `orbit version --json`, que por stdout vaya un solo objeto y lo demás por stderr, y que **lo que no existe sea `null`** y no un cero. Un script que sólo dependa de esas tres sigue funcionando pase lo que pase.
 
 ```bash
 # Las apps que están paradas y deberían estar arriba
