@@ -7600,8 +7600,10 @@ _gh_campos() { # _gh_campos [tope]
   as_deploy "gh repo list --limit $tope --json nameWithOwner,isPrivate,defaultBranchRef,description,updatedAt -q '$q'" 2>/dev/null
 }
 
-# Sólo los nombres, que es lo que necesita el selector de 'orbit new'.
-_gh_repos() { _gh_campos "${1:-200}" | cut -d"$GH_SEP" -f1; }
+# Sólo los nombres, que es lo que necesita el selector de 'orbit new'. Sin tope
+# propio: el selector siempre quiere el de por defecto, y un parámetro que nadie
+# pasa es un parámetro que se queda sin probar.
+_gh_repos() { _gh_campos | cut -d"$GH_SEP" -f1; }
 
 _github_status() {
   local conectado="no" cuenta=""

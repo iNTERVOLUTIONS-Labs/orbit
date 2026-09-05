@@ -56,7 +56,7 @@ jobs:
       # vive. 'test-strict' añade lo único que CI necesita de más: falla si
       # alguna suite se ha saltado, en lugar de dar por buena una tanda a
       # medias.
-      - name: Sintaxis, shellcheck y las 32 suites
+      - name: Sintaxis, shellcheck y todas las suites
         run: make test-strict
 
   # Lo mismo, en Debian 12, que es lo único de este soporte que se puede
@@ -116,7 +116,7 @@ jobs:
       # verdad, que es lo que necesita la sección del aislamiento entre apps
       # PHP. Comprobado también en local antes de escribir esto, para que un
       # rojo aquí signifique «Debian» y no «root».
-      - name: Sintaxis, shellcheck y las 32 suites
+      - name: Sintaxis, shellcheck y todas las suites
         run: make test-strict
 
       # Lo que sólo se puede afirmar estando en Debian. Estas preguntas
