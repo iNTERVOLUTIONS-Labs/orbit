@@ -89,6 +89,10 @@ while read -r c; do
     # 'info' exige el nombre de la app con --json, y hace bien: un cliente no
     # puede contestar a un selector. Se prueba abajo, en su sección.
     info) continue ;;
+    # 'github' necesita subcomando —'status', 'repos' o 'branches'— y los tres
+    # necesitan root, porque preguntan con el gh del usuario de despliegue. Su
+    # suite es 'github_test.sh', que los llama por función con dobles.
+    github|gh) continue ;;
   esac
   out="$("$O" --json "$c" 2>/dev/null)"
   check "orbit --json $c" "{" "${out:0:1}"
