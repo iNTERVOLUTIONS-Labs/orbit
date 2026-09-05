@@ -1102,7 +1102,7 @@ _j_list() { # _j_list <elemento…> -> ["a","b"]
 # Es una función y no una variable porque se traduce —la 'y' del final es una
 # palabra— y esta línea corre antes de que main haya cargado el catálogo: una
 # variable se quedaría con la traducción vacía de ese momento.
-_json_cmds_help() { t "list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status' y 'queue status'"; }
+_json_cmds_help() { t "list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"; }
 
 # Qué comandos hablan JSON. Está aquí y no repartido por el router porque main
 # necesita la misma respuesta dos veces: para sacar --json de los argumentos y
@@ -1117,6 +1117,7 @@ _json_capable() {
     logs|log) return 0 ;;
     queue|cola|colas) return 0 ;;
     version|-v|--version) return 0 ;;
+    github|gh) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -6947,14 +6948,18 @@ cmd_new() {
 
   # --- origen del código
   local default_branch="${branch:-main}"
-  if [[ -z "$repo" ]] && sudo -u "$DEPLOY_USER" -H gh auth status >/dev/null 2>&1; then
+  if [[ -z "$repo" ]] && _gh_ok; then
     local op_gh op_url src
     op_gh="$(t "Elegir un repo de mi GitHub")"; op_url="$(t "Escribir la URL a mano")"
     src="$(choose "Origen del código" "$op_gh" "$op_url")"
     if [[ "$src" == "$op_gh" ]]; then
       printf "  ${D}%s${R}\n" "$(t "Cargando tus repositorios…")"
       local -a repos
-      mapfile -t repos < <(sudo -u "$DEPLOY_USER" -H gh repo list --limit 200 --json nameWithOwner -q '.[].nameWithOwner' 2>/dev/null)
+      # La misma lista que devuelve 'orbit github repos'. Una sola función para
+      # las dos: cuando se separan, el selector y el contrato acaban contando
+      # cosas distintas y nadie lo nota hasta que un cliente enseña un
+      # repositorio que este servidor no tiene.
+      mapfile -t repos < <(_gh_repos)
       if (( ${#repos[@]} )); then
         local sel; sel="$(choose 'Repositorio' "${repos[@]}")"
         [[ -n "$sel" ]] && repo="https://github.com/$sel.git"
@@ -7531,17 +7536,193 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════ github ══════════
-cmd_github() {
-  need_root github
+#
+# Tres preguntas que este servidor sabe contestar sobre GitHub —quién está
+# conectado, qué repositorios tiene y qué ramas tiene uno— y que hasta ahora
+# sólo existían **dentro** del selector interactivo de 'orbit new'.
+#
+# Salen de ahí porque un cliente no puede usar un selector. 'choose' necesita un
+# terminal —fzf, o una lista numerada que alguien lee— y con '--yes' ni se llega
+# a él, que es justo como invoca 'new' cualquier cliente. La capacidad estaba
+# desde el principio; lo que faltaba era el contrato.
+#
+# Son de SÓLO LECTURA. Conectar sigue siendo 'orbit github' a secas, sigue
+# necesitando un navegador y sigue sin poder hacerse desde una ventana: el token
+# es de quien lo emite y no tiene por qué pasar por ningún sitio más.
+
+# ¿Hay sesión de gh para el usuario de despliegue?
+#
+# **La sesión que importa es la del servidor**, no la de quien mira. Es la que
+# clona, así que es la única que contesta si un repositorio privado se va a
+# poder traer. Un cliente que enseñe la lista de OTRA cuenta está enseñando
+# repositorios que este servidor puede no alcanzar.
+_gh_ok() { as_deploy "gh auth status" >/dev/null 2>&1; }
+
+# La cuenta conectada, o vacío.
+#
+# gh cambió la frase en la 2.40 —«account davabe» donde antes decía «as davabe»—
+# así que se aceptan las dos. Si algún día dice una tercera, esto devuelve vacío
+# en vez de inventarse un nombre: un hueco se ve, un nombre inventado no.
+#
+# Y sólo la cuenta. Esa misma salida lleva el token enmascarado y las rutas de
+# los ficheros de configuración, y nada de eso tiene por qué salir de aquí.
+_gh_account() {
+  as_deploy "gh auth status" 2>&1 \
+    | sed -n 's/.*Logged in to [^ ]* \(account\|as\) \([A-Za-z0-9_-]\{1,39\}\).*/\2/p' \
+    | head -1
+}
+
+# El separador de los campos de un repositorio: US (0x1f), el que existe para
+# esto desde ASCII.
+#
+# Y no un tabulador, que es lo primero que se prueba. Con `IFS=$'\t'`, bash
+# **colapsa los separadores seguidos** porque el tabulador es espacio en blanco:
+# un repositorio sin descripción llega con dos tabuladores juntos, se leen como
+# uno, y la fecha acaba en el campo de la descripción. Pasó, y la prueba lo
+# cuenta. US no es espacio en blanco, así que un campo vacío sigue siendo un
+# campo.
+GH_SEP=$'\x1f'
+
+# Los repositorios, un campo por columna: nombre, privado, rama, descripción y
+# fecha.
+#
+# En texto y no en JSON aunque gh sepa dar JSON: así lo consume igual el selector
+# de 'new' —que sólo quiere la primera columna— y el emisor de abajo, sin que
+# haya dos llamadas distintas que puedan quedarse contando cosas distintas.
+#
+# Los caracteres de control de la descripción se quitan **en el propio jq**. La
+# escribe cualquiera, puede traer saltos de línea, y un salto ahí partiría un
+# repositorio en dos registros. `[[:cntrl:]]` y no `\u0000-\u001f`: el jq que
+# lleva gh dentro es Go, y su motor de expresiones no entiende `\u`.
+_gh_campos() { # _gh_campos [tope]
+  local tope="${1:-200}"
+  local q='.[] | [.nameWithOwner, (.isPrivate|tostring), (.defaultBranchRef.name // ""), ((.description // "") | gsub("[[:cntrl:]]";" ")), .updatedAt] | join("\u001f")'
+  as_deploy "gh repo list --limit $tope --json nameWithOwner,isPrivate,defaultBranchRef,description,updatedAt -q '$q'" 2>/dev/null
+}
+
+# Sólo los nombres, que es lo que necesita el selector de 'orbit new'.
+_gh_repos() { _gh_campos "${1:-200}" | cut -d"$GH_SEP" -f1; }
+
+_github_status() {
+  local conectado="no" cuenta=""
+  _gh_ok && { conectado="yes"; cuenta="$(_gh_account)"; }
+  if [[ "$JSON" == "yes" ]]; then
+    printf '{"schema":%s,"connected":%s,"account":%s,"deploy_user":%s}\n' \
+      "$JSON_SCHEMA" "$(_j_bool "$conectado")" \
+      "$([[ -n "$cuenta" ]] && _j_str "$cuenta" || printf 'null')" \
+      "$(_j_str "$DEPLOY_USER")"
+    return 0
+  fi
+  title "GitHub"
+  if [[ "$conectado" == "yes" ]]; then
+    ok "Conectado como {b}%s{r} {d}(usuario %s){r}" "${cuenta:-?}" "$DEPLOY_USER"
+    # Sin nombre reconocido se dice, en vez de callarlo: hay sesión y no sabemos
+    # de quién, que no es lo mismo que no haberla.
+    [[ -z "$cuenta" ]] && warn "Hay sesión, pero no he sabido leer de quién. Mira 'gh auth status'."
+  else
+    warn "GitHub no está conectado. Ejecuta 'orbit github' para los repos privados."
+  fi
+}
+
+_github_repos() {
+  local tope="${1:-200}"
+  [[ "$tope" =~ ^[0-9]+$ ]] || die "orbit github repos: el tope es un número, no «%s»." "$tope"
+  if ! _gh_ok; then
+    [[ "$JSON" == "yes" ]] && {
+      printf '{"schema":%s,"connected":false,"account":null,"limit":%s,"truncated":false,"repos":[]}\n' \
+        "$JSON_SCHEMA" "$tope"
+      return 0
+    }
+    warn "GitHub no está conectado. Ejecuta 'orbit github'."
+    return 0
+  fi
+
+  local -a lineas=(); mapfile -t lineas < <(_gh_campos "$tope")
+  local n="${#lineas[@]}" truncado="no"
+  # Han llegado justo los que caben: puede haber más, y eso NO es lo mismo que
+  # saber que los hay. Se dice lo que se sabe.
+  (( n >= tope )) && truncado="yes"
+
+  if [[ "$JSON" == "yes" ]]; then
+    local sep="" l nombre privado rama desc fecha
+    printf '{"schema":%s,"connected":true,"account":%s,"limit":%s,"truncated":%s,"repos":[' \
+      "$JSON_SCHEMA" "$(_j_str "$(_gh_account)")" "$tope" "$(_j_bool "$truncado")"
+    for l in "${lineas[@]}"; do
+      IFS="$GH_SEP" read -r nombre privado rama desc fecha <<<"$l"
+      [[ -n "$nombre" ]] || continue
+      printf '%s{"name_with_owner":%s,"private":%s,"default_branch":%s,"description":%s,"updated_at":%s}' \
+        "$sep" "$(_j_str "$nombre")" "$(_j_bool "$privado")" \
+        "$([[ -n "$rama" ]] && _j_str "$rama" || printf 'null')" \
+        "$([[ -n "$desc" ]] && _j_str "$desc" || printf 'null')" \
+        "$([[ -n "$fecha" ]] && _j_str "$fecha" || printf 'null')"
+      sep=","
+    done
+    printf ']}\n'
+    return 0
+  fi
+
+  title "Repositorios de %s" "$(_gh_account)"
+  local l nombre privado rama desc fecha
+  for l in "${lineas[@]}"; do
+    IFS="$GH_SEP" read -r nombre privado rama desc fecha <<<"$l"
+    [[ -n "$nombre" ]] || continue
+    printf "  %s%s%s %s%s%s %s\n" "$B" "$nombre" "$R" \
+      "$D" "${rama:-sin rama}$([[ "$privado" == "true" ]] && echo " · privado")" "$R" \
+      "${desc:0:60}"
+  done
+  (( n == 0 )) && warn "No he podido listar ninguno."
+  [[ "$truncado" == "yes" ]] && info "Son los %s más recientes; puede haber más." "$tope"
+}
+
+_github_branches() {
+  local url="${1:-}"
+  [[ -n "$url" ]] || die "orbit github branches: dime de qué repositorio.  orbit github branches <url>"
+  local -a ramas=(); mapfile -t ramas < <(_remote_branches "$url")
+  if [[ "$JSON" == "yes" ]]; then
+    # La lista puede estar vacía y eso es una respuesta: un repositorio recién
+    # creado no tiene ninguna rama, y **no se rellena con «main»** — un cliente
+    # que clonara --branch main de un repo vacío fallaría por culpa nuestra.
+    printf '{"schema":%s,"repo":%s,"branches":%s}\n' \
+      "$JSON_SCHEMA" "$(_j_str "$url")" "$(_j_list "${ramas[@]+"${ramas[@]}"}")"
+    return 0
+  fi
+  title "Ramas de %s" "$url"
+  if (( ${#ramas[@]} == 0 )); then
+    warn "Ninguna. O el repositorio está vacío, o no se llega a él desde aquí."
+    return 0
+  fi
+  printf '  %s\n' "${ramas[@]}"
+}
+
+_github_connect() {
   title "Conectar GitHub"
-  if sudo -u "$DEPLOY_USER" -H gh auth status 2>&1 | grep -q "Logged in"; then
-    sudo -u "$DEPLOY_USER" -H gh auth status 2>&1 | sed 's/^/  /'
+  if as_deploy "gh auth status" 2>&1 | grep -q "Logged in"; then
+    as_deploy "gh auth status" 2>&1 | sed 's/^/  /'
     confirm "¿Volver a autenticar?" n || return 0
   fi
   info "Se abrirá el flujo de GitHub: copia el código y ábrelo en tu navegador."
-  sudo -u "$DEPLOY_USER" -H gh auth login --hostname github.com --git-protocol https --web
-  sudo -u "$DEPLOY_USER" -H gh auth setup-git
+  as_deploy "gh auth login --hostname github.com --git-protocol https --web"
+  as_deploy "gh auth setup-git"
   ok "GitHub conectado para el usuario '%s'" "$DEPLOY_USER"
+}
+
+cmd_github() {
+  # Root para todos, también los de leer: las tres preguntas se hacen con el gh
+  # del usuario de despliegue, y para ser otro usuario hace falta serlo.
+  need_root github
+  _subcmd github connect noapp "connect|conectar status repos branches|ramas help|-h|--help|ayuda" "$@"
+  local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  # Conectar abre un navegador y hace preguntas: no hay objeto que devolver, y
+  # fingir que lo hay dejaría a un cliente esperando algo que no llega.
+  [[ "$JSON" == "yes" && "$sub" == "connect" ]] \
+    && die "--json está en 'orbit github status', 'repos' y 'branches'. Conectar necesita un navegador."
+  case "$sub" in
+    status)   _github_status ;;
+    repos)    _github_repos "${1:-200}" ;;
+    branches) _github_branches "${1:-}" ;;
+    help)     printf "%s\n" "$(t "  uso: orbit github [connect|status|repos|branches <url>]")" ;;
+    *)        _github_connect ;;
+  esac
 }
 
 # ════════════════════════════════════════════════════════ base datos ══════
@@ -12929,7 +13110,7 @@ _i18n_en() {
     ["Pulsa ENTER para continuar…"]="Press ENTER to continue…"
     ["Este comando necesita root. Usa:  sudo orbit %s"]="This command needs root. Use:  sudo orbit %s"
     ["Comprobando salud en 127.0.0.1:%s"]="Checking health on 127.0.0.1:%s"
-    ["list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status' y 'queue status'"]="list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status' and 'queue status'"
+    ["list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"]="list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' and 'github branches'"
     ["«%s» es además el nombre de una app; para esa escribe:  orbit %s %s %s"]="«%s» is also an app name; for that one type:  orbit %s %s %s"
     ["  uso: orbit %s <%s>%s"]="  usage: orbit %s <%s>%s"
     ["orbit %s: no sé qué es «%s»."]="orbit %s: I don't know what «%s» is."
@@ -13293,6 +13474,20 @@ _i18n_en() {
     ["Pega el token"]="Paste the token"
     ["Cancelado"]="Cancelled"
     ["Token guardado en %s/cloudflare.ini (sólo root puede leerlo)"]="Token saved in %s/cloudflare.ini (only root can read it)"
+    ["GitHub"]="GitHub"
+    ["Conectado como {b}%s{r} {d}(usuario %s){r}"]="Connected as {b}%s{r} {d}(user %s){r}"
+    ["Hay sesión, pero no he sabido leer de quién. Mira 'gh auth status'."]="There is a session, but I could not tell whose. Check 'gh auth status'."
+    ["GitHub no está conectado. Ejecuta 'orbit github' para los repos privados."]="GitHub is not connected. Run 'orbit github' for private repos."
+    ["orbit github repos: el tope es un número, no «%s»."]="orbit github repos: the limit is a number, not «%s»."
+    ["GitHub no está conectado. Ejecuta 'orbit github'."]="GitHub is not connected. Run 'orbit github'."
+    ["No he podido listar ninguno."]="I could not list any."
+    ["Son los %s más recientes; puede haber más."]="These are the %s most recent; there may be more."
+    ["orbit github branches: dime de qué repositorio.  orbit github branches <url>"]="orbit github branches: tell me which repository.  orbit github branches <url>"
+    ["Ninguna. O el repositorio está vacío, o no se llega a él desde aquí."]="None. Either the repository is empty, or it cannot be reached from here."
+    ["--json está en 'orbit github status', 'repos' y 'branches'. Conectar necesita un navegador."]="--json is in 'orbit github status', 'repos' and 'branches'. Connecting needs a browser."
+    ["  uso: orbit github [connect|status|repos|branches <url>]"]="  usage: orbit github [connect|status|repos|branches <url>]"
+    ["Repositorios de %s"]="Repositories of %s"
+    ["Ramas de %s"]="Branches of %s"
     ["Conectar GitHub"]="Connect GitHub"
     ["¿Volver a autenticar?"]="Authenticate again?"
     ["Se abrirá el flujo de GitHub: copia el código y ábrelo en tu navegador."]="GitHub's flow will open: copy the code and open it in your browser."

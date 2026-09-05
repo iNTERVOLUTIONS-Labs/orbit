@@ -1629,6 +1629,9 @@ orbit watch status --json
 orbit backup list --json
 orbit backup verify [fichero] --json
 orbit logs <app> --json        # NDJSON: una línea por línea de log, ver abajo
+orbit github status --json     # si este servidor tiene GitHub conectado
+orbit github repos --json      # y qué repositorios ve
+orbit github branches <url> --json
 ```
 
 La bandera vale delante o detrás del comando: `orbit --json list` y `orbit list --json` son lo mismo. En un comando que no tiene salida JSON, aborta diciéndolo —ignorarla en silencio te haría creer que lo que vas a leer es JSON cuando no lo es.
@@ -1681,6 +1684,52 @@ Dos detalles con intención:
 
 - **`--yes` no es «que sí a todo», es «acepta lo que está por defecto».** Por eso `orbit new --yes` no crea la base de datos y `orbit remove --yes` no borra tus ficheros: esas dos preguntas tienen «no» por defecto. Para lo segundo está `--purge`, que es una segunda decisión porque es un segundo daño: quitar la app de nginx se deshace volviéndola a crear, pero borrar `/srv/apps/mi-web` se lleva las releases, el `.env` y las subidas de tus usuarios.
 - **`orbit rollback` sin release y sin terminal aborta** en vez de elegir por ti. La primera de la lista es la que ya está activa, así que «elegir la primera» habría sido no hacer nada mientras se reinicia el servicio.
+
+### Elegir repositorio y rama desde un cliente
+
+`orbit new` sin `--repo` te ofrece tus repositorios y, después, las ramas del
+que elijas. Está bien para una persona y **no le sirve a un programa**: el
+selector necesita un terminal —`fzf`, o una lista numerada que alguien lee— y
+con `--yes`, que es como invoca `new` cualquier cliente, ni se llega a él.
+
+Las tres preguntas que hay detrás de ese selector salen ahora por su cuenta:
+
+```bash
+orbit github status --json
+# {"schema":1,"connected":true,"account":"davabe","deploy_user":"deploy"}
+
+orbit github repos --json
+# {"schema":1,"connected":true,"account":"davabe","limit":200,"truncated":false,
+#  "repos":[{"name_with_owner":"davabe/tienda","private":true,
+#            "default_branch":"main","description":"La tienda",
+#            "updated_at":"2026-09-04T22:25:55Z"}]}
+
+orbit github branches https://github.com/davabe/tienda.git --json
+# {"schema":1,"repo":"https://github.com/davabe/tienda.git",
+#  "branches":["main","develop"]}
+```
+
+Son de **sólo lectura**. Conectar sigue siendo `orbit github` a secas y sigue
+necesitando un navegador: el flujo de GitHub da un código de un solo uso, y eso
+no se puede automatizar sin que el token pase por sitios donde no tiene que
+estar.
+
+Cuatro cosas que conviene saber, y las cuatro por el mismo motivo:
+
+- **La cuenta es la del servidor, no la tuya.** Estos repositorios los ve el
+  usuario de despliegue con su propio `gh`, que es **el que va a clonar**. Un
+  cliente que enseñe la lista de otra cuenta está ofreciendo repositorios que
+  este servidor puede no alcanzar, y eso no se descubre hasta el clon.
+- **Sin conectar, la lista es vacía y `connected` es `false`.** No es lo mismo
+  que una cuenta sin repositorios, y confundirlas te haría enseñar «no tienes
+  repos» a quien sólo tiene el servidor sin conectar.
+- **`truncated` es «puede haber más», no «hay más».** Llegan los que caben en
+  `--limit` (200 por defecto, `orbit github repos 50 --json` para cambiarlo); si
+  llegan justo esos, desde aquí no se puede saber si hay otro sin pedir otra
+  página.
+- **Un repositorio vacío da `default_branch: null`**, y `branches` una lista
+  vacía. No se rellena con `main`: un cliente que clonara `--branch main` de un
+  repositorio sin ramas fallaría, y la culpa sería del que se inventó el dato.
 
 ### Orbit Desktop
 

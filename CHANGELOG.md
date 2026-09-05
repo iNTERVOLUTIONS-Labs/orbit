@@ -5,6 +5,57 @@ Este proyecto sigue [versionado semántico](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+### `orbit github status|repos|branches`: la lista de repositorios, ya con contrato
+
+Escribiendo el cliente de escritorio contra el contrato apareció un hueco que no
+era de capacidad sino de forma: **`orbit new` ya ofrece tus repositorios y las
+ramas del que elijas**, con el `gh` del usuario de despliegue, y nada de eso se
+podía leer desde fuera. `choose` necesita un terminal —`fzf`, o una lista
+numerada que alguien lee— y con `--yes`, que es como invoca `new` cualquier
+cliente, ni se llega a él. El cliente acabó preguntándole al `gh` del portátil
+de quien miraba, y **ésa es la cuenta equivocada**: la que importa es la del
+servidor, que es la que clona.
+
+Las tres preguntas salen ahora del selector y tienen su comando:
+
+```
+orbit github status   --json   {"connected":true,"account":"davabe","deploy_user":"deploy"}
+orbit github repos    --json   {"repos":[{"name_with_owner","private","default_branch",…}],"truncated":false}
+orbit github branches <url> --json   {"branches":["main","develop"]}
+```
+
+De sólo lectura. **Conectar sigue siendo `orbit github` a secas** y sigue
+necesitando un navegador: el flujo da un código de un solo uso, y automatizarlo
+obligaría a que un token pasara por sitios donde no tiene que estar.
+
+Lo que se ha cuidado, por orden de lo que costaría equivocarse:
+
+- **El selector de `new` y el comando comparten función.** Cuando se separan, el
+  selector y el contrato acaban contando cosas distintas y no lo nota nadie
+  hasta que un cliente ofrece un repositorio que este servidor no tiene.
+- **Un repositorio vacío da `default_branch: null`**, y `branches` una lista
+  vacía. Rellenarlo con `main` haría que un cliente clonara `--branch main` de un
+  repositorio sin ramas y fallara por culpa nuestra, con un mensaje de git que no
+  habla de eso.
+- **Sin conectar, `connected: false` y lista vacía** — que no es lo mismo que una
+  cuenta sin repositorios.
+- **`truncated` es «puede haber más», no «hay más».** Desde aquí no se sabe sin
+  pedir otra página, así que se dice lo que se sabe.
+- **Del `gh auth status` sólo sale la cuenta.** Esa salida lleva el token
+  enmascarado y las rutas de la configuración; el resto se descarta, y hay una
+  prueba que se pone roja si algún día devuelve algo más. Se aceptan las dos
+  frases que ha usado `gh` —«account X» desde la 2.40 y «as X» antes— y si
+  aparece una tercera se devuelve vacío en vez de inventarse un nombre.
+- **Los campos van separados por US (0x1f) y no por tabuladores.** Con
+  `IFS=$'\t'`, bash colapsa dos separadores seguidos porque el tabulador es
+  espacio en blanco: un repositorio sin descripción llegaba con la fecha metida
+  en el campo de la descripción. Los caracteres de control de la descripción se
+  quitan en el propio `jq`, porque un salto de línea ahí partiría un repositorio
+  en dos registros.
+
+`tests/github_test.sh`, 49 comprobaciones.
+
+
 ### El contrato, terminado por donde le faltaba: un cliente ya no necesita parsear texto
 
 Sale de auditar el contrato desde fuera, escribiendo el cliente de escritorio de §13.4 contra él. El método importa más que los cambios: **no se leyó el script, se ejecutó**, con un banco de 40 apps y llamando a `main()`. Y eso destapó lo primero de la lista, que llevaba versiones documentado y muerto.
