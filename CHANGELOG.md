@@ -87,6 +87,18 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.3.9] - 2026-11-03
+
+### Corregido — `orbit env` escribía en un fichero y el despliegue miraba otro
+
+Con un `orbit.json` que declara su propio fichero de entorno (`"env": {"file": "api/.env"}`), `orbit env set` escribía en `shared/.env` y la provisión del despliegue buscaba en `shared/api/.env`. Las variables quedaban puestas —una app PHP que lee los dos ficheros funcionaba—, pero cada despliegue avisaba de «Faltan por definir» con ellas ya definidas, y `orbit env list` enseñaba un fichero distinto del que manda.
+
+La causa: el despliegue leía `env.file` de la release, pero `render_nginx` recarga la app desde disco (`nginx_vhost` → `load_app`) antes del `save_app` final, y el valor se perdía. La configuración se quedaba con `A_ENV_FILE=''` para siempre. Lo encontró un servidor de verdad, no una prueba.
+
+- **El despliegue apunta el fichero de la release activa** justo antes de guardar la configuración
+- **`deploy_test` lo fija de punta a punta**: despliega un repo con bloque `env`, recarga la app y comprueba que `orbit env set` escribe en el fichero declarado y no en `shared/.env`. Sin el arreglo, tres fallos
+- Las apps existentes se corrigen con su primer despliegue tras actualizar. Lo que ya se hubiera escrito en `shared/.env` se queda ahí: no se mueve solo, porque decidir qué fichero manda es de quien lo puso
+
 ## [1.3.6] - 2026-08-16
 
 ### La guía de desarrollo deja de vivir en la raíz
