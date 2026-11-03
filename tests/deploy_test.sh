@@ -1133,4 +1133,44 @@ check "y lo dice" "1" "$(grep -c 'sólo tiene sentido con --json' "$TMP/j6err")"
 fi
 JSON="no"; _ui_route
 
+section "El fichero de entorno que declara el repo queda apuntado tras desplegar"
+# Se leía del orbit.json de la release, pero render_nginx recarga la app desde
+# disco antes del save_app final y el valor se perdía: la configuración quedaba
+# con A_ENV_FILE vacío y `orbit env set` escribía en shared/.env mientras la
+# provisión buscaba en shared/api/.env. Sin jq no hay bloque env que leer, así
+# que no hay nada que afirmar: se salta diciéndolo.
+if ! command -v jq >/dev/null; then
+  echo "  jq no está instalado: me salto el fichero de entorno declarado."
+else
+  EORIGIN="$TMP/envorigin"
+  git init -q -b main "$EORIGIN"
+  git -C "$EORIGIN" config user.email orbit@test
+  git -C "$EORIGIN" config user.name Orbit
+  printf 'hola\n' > "$EORIGIN/index.html"
+  cat > "$EORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "env": { "file": "api/.env", "vars": { "TOKEN": { "generate": "hex:8" } } } }
+JSON
+  git -C "$EORIGIN" add -A; git -C "$EORIGIN" commit -qm "con env"
+  {
+    A_NAME="conenv"; A_REPO="$EORIGIN"; A_BRANCH="main"; A_DOMAIN="conenv.test"
+    A_ALIASES=""; A_TYPE="static"; A_PKG="pnpm"; A_BUILD=""; A_START=""
+    A_OUTDIR="."; A_SPA="no"; A_PORT=""; A_DOCROOT=""; A_PHP=""; A_SHARED=""
+    A_ENV_FILE=""; A_ENV_SPEC=""
+    A_CREATED="2026-01-01T00:00:00+00:00"; A_LASTDEPLOY=""
+  }
+  save_app
+  run cmd_deploy conenv >"$TMP/env1" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/env1"
+  check "despliega" "0" "$r"
+  A_ENV_FILE=""; load_app conenv
+  check "la configuración guarda el fichero declarado" "api/.env" "$A_ENV_FILE"
+  run cmd_env set conenv CLAVE valor >/dev/null 2>&1; r=$?
+  check "orbit env set funciona" "0" "$r"
+  check "y escribe en el fichero declarado" "1" \
+    "$(grep -c '^CLAVE=' "$TMP/apps/conenv/shared/api/.env" 2>/dev/null || true)"
+  check "no en shared/.env" "0" \
+    "$(grep -c '^CLAVE=' "$TMP/apps/conenv/shared/.env" 2>/dev/null || true)"
+fi
+
 report
