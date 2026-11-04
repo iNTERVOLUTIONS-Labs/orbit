@@ -239,7 +239,7 @@ systemctl() { case "${1:-}" in restart) printf '%s\n' "${2:-}" >> "$REINICIOS_T"
 load_app una; A_AUTODEPLOY="yes"; save_app
 run cmd_autodeploy every 5 >"$TMP/ev1" 2>&1; r=$?
 check "acepta el cambio"     "0" "$r"
-check "lo guarda en la conf" "1" "$(grep -c '^AUTODEPLOY_EVERY="5"' "$CONF_FILE")"
+check "lo guarda en la conf" "1" "$(grep -c "^AUTODEPLOY_EVERY='5'" "$CONF_FILE")"
 check "reescribe la unidad"  "1" "$(grep -c 'OnUnitActiveSec=5min' "$UNITDIR/orbit-autodeploy.timer")"
 check "y reinicia el timer"  "1" "$(grep -cx 'orbit-autodeploy.timer' "$REINICIOS_T")"
 
@@ -247,7 +247,7 @@ check "y reinicia el timer"  "1" "$(grep -cx 'orbit-autodeploy.timer' "$REINICIO
 # añadirla, no fallar en silencio.
 grep -v AUTODEPLOY_EVERY "$CONF_FILE" > "$CONF_FILE.tmp" && mv "$CONF_FILE.tmp" "$CONF_FILE"
 run cmd_autodeploy every 7 >/dev/null 2>&1
-check "la añade si faltaba"  "1" "$(grep -c '^AUTODEPLOY_EVERY="7"' "$CONF_FILE")"
+check "la añade si faltaba"  "1" "$(grep -c "^AUTODEPLOY_EVERY='7'" "$CONF_FILE")"
 
 run cmd_autodeploy every 0 >/dev/null 2>&1; r=$?
 check "rechaza el cero"      "1" "$r"
@@ -260,7 +260,7 @@ check "rechaza lo absurdo"   "1" "$r"
 load_app una; A_AUTODEPLOY="no"; save_app
 : > "$REINICIOS_T"
 run cmd_autodeploy every 9 >"$TMP/ev2" 2>&1
-check "guarda sin apps"      "1" "$(grep -c '^AUTODEPLOY_EVERY="9"' "$CONF_FILE")"
+check "guarda sin apps"      "1" "$(grep -c "^AUTODEPLOY_EVERY='9'" "$CONF_FILE")"
 check "y no toca el timer"   "0" "$(grep -c . "$REINICIOS_T")"
 load_app una; A_AUTODEPLOY="yes"; save_app
 

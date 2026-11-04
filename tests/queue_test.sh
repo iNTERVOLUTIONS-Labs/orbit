@@ -229,7 +229,7 @@ systemctl() { printf '%s\n' "$*" >> "$SYSCTL_LOG"
               case "${1:-}" in restart) printf '%s\n' "${2:-}" >> "$REINICIOS" ;; esac; return 0; }
 run cmd_queue every 3 >/dev/null 2>&1; r=$?
 check "acepta el cambio"     "0" "$r"
-check "lo guarda en la conf" "1" "$(grep -c '^QUEUE_EVERY="3"' "$CONF_FILE")"
+check "lo guarda en la conf" "1" "$(grep -c "^QUEUE_EVERY='3'" "$CONF_FILE")"
 check "reescribe la unidad"  "1" "$(grep -c 'OnUnitActiveSec=3min' "$U")"
 # Y con él el corte de systemd, que también se deriva del intervalo: si sólo se
 # reescribiera el temporizador, un ciclo de 3 min moriría contra el

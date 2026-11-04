@@ -98,15 +98,40 @@ check "NoNewPrivileges"     "1" "$(grep -c '^NoNewPrivileges=true$' "$U")"
 check "sin BindPaths"       "0" "$(grep -c '^Bind.*Paths=' "$U")"
 
 section "Precedencia de variables"
-# systemd aplica las directivas en orden: EnvironmentFile primero, Environment
-# después. Un COREPACK_HOME escrito en el .env tiene que perder, igual que
-# NODE_ENV. Se comprueba por posición dentro del fichero.
-check "el .env va antes" "1" \
-  "$(awk '/^EnvironmentFile=/{e=NR} /^Environment=COREPACK_HOME=/{c=NR}
-          END{print (e && c && e < c) ? 1 : 0}' "$U")"
-check "y NODE_ENV también" "1" \
-  "$(awk '/^EnvironmentFile=/{e=NR} /^Environment=NODE_ENV=/{n=NR}
-          END{print (e && n && e < n) ? 1 : 0}' "$U")"
+# systemd aplica EnvironmentFile **por encima** de Environment=, se escriban en
+# el orden que se escriban: la prueba de antes comprobaba que el .env iba
+# primero en el fichero, como si eso decidiera algo, y no decide nada. Medido
+# con systemd-run: un PORT=8080 en el .env ganaba al Environment=PORT=3005 de la
+# unidad. Muchos .env traen PORT=3000 de la máquina de quien los escribió, y
+# con eso la app escuchaba donde el health check no miraba: rollback en cada
+# despliegue. Un HOST=0.0.0.0 la dejaba abierta a internet sin nginx.
+#
+# Lo que manda de verdad es la orden de arranque, así que se fijan ahí.
+EXEC="$(sed -n 's/^ExecStart=//p' "$U")"
+check "PORT en la orden"     "1" "$(grep -c '^/usr/bin/env PORT=3001 ' <<<"$EXEC")"
+check "HOST en la orden"     "1" "$(grep -c ' HOST=127.0.0.1 ' <<<"$EXEC")"
+check "NODE_ENV en la orden" "1" "$(grep -c ' NODE_ENV=production ' <<<"$EXEC")"
+check "y la app detrás"      "1" "$(grep -c "/bin/bash -c 'node server.js'$" <<<"$EXEC")"
+
+# Y los '$' de la orden de la app, doblados: systemd expande él mismo los
+# '${PORT}' de ExecStart —también entre comillas— con su entorno, el del .env,
+# antes de ejecutar nada. Es justo como arrancan Python y Deno.
+mkapp py python 3006 py.test
+A_START='./.venv/bin/gunicorn -b 127.0.0.1:${PORT} app:app'; save_app
+render_systemd py
+UP="$(svc_unit py)"
+check "los \$ se doblan" "1" \
+  "$(grep -c "^ExecStart=.*-b 127.0.0.1:\$\${PORT} app:app'$" "$UP")"
+
+# La comprobación que importa, sin systemd: se ejecuta la orden tal como la
+# recibe el proceso —con el '$$' ya convertido en '$', que es lo que hace
+# systemd— y con el entorno que deja el .env, que llega antes y por encima.
+mkapp eco node 3007 eco.test
+A_START='echo "$PORT ${PORT} $HOST $NODE_ENV"'; save_app
+render_systemd eco
+ORDEN="$(sed -n 's/^ExecStart=//p' "$(svc_unit eco)")"; ORDEN="${ORDEN//\$\$/\$}"
+check "un .env con PORT y HOST no gana" "3007 3007 127.0.0.1 production" \
+  "$(PORT=8080 HOST=0.0.0.0 NODE_ENV=development bash -c "exec $ORDEN")"
 
 section "Regenerar es idempotente"
 before="$(md5sum < "$U")"
@@ -151,7 +176,7 @@ A_APPDIR="backend"; A_START="cd backend && ./bin/app"; save_app
 render_systemd srv
 US="$(svc_unit srv)"
 check "el cd llega al ExecStart" "1" \
-  "$(grep -c "^ExecStart=/bin/bash -c 'cd backend && ./bin/app'$" "$US")"
+  "$(grep -c "^ExecStart=/usr/bin/env .* /bin/bash -c 'cd backend && ./bin/app'$" "$US")"
 # WorkingDirectory sigue siendo la raíz de la release: es de donde parten todas
 # las rutas que Orbit guarda, y cambiarlo aquí las partiría en dos convenciones.
 check "WorkingDirectory no cambia" "1" \
