@@ -77,6 +77,7 @@ test: check lint
 	bash tests/clone_test.sh
 	bash tests/i18n_test.sh
 	bash tests/github_test.sh
+	bash tests/ssl_test.sh
 
 # Como 'test', pero un verde tiene que significar que se ha probado todo.
 #

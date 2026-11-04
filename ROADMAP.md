@@ -16,7 +16,7 @@ La versión que existe hoy.
 - ✅ Detección automática de Next, Astro, Vite, CRA, Nuxt, Express, PHP y Python
 - ✅ Despliegues atómicos con releases y symlink
 - ✅ Rollback automático si falla el health check
-- ✅ HTTPS por DNS-01 con Cloudflare
+- ✅ HTTPS por DNS-01 con Cloudflare — **validado contra un token y una cuenta de verdad** (v1.4.7): emisión y renovación en el staging de Let's Encrypt, con la invocación exacta de Orbit. Salió un comodín que desaparecía de la petición por `nullglob`, una espera muda de hasta ocho minutos en `certbot renew` y un cartel de python-cloudflare. Ver ARCHITECTURE §6
 - ✅ Menú interactivo y CLI
 - ✅ Bases de datos PostgreSQL con copia diaria
 - ✅ UFW, fail2ban, systemd endurecido
@@ -154,7 +154,9 @@ Sin planificar, abiertas a debate.
 
 Y desde la **v1.3.3 está ✅**: instalado de principio a fin en una Debian 12 con systemd de verdad, partiendo de una máquina sin `make`, sin `nginx` y sin `node`. Los trece pasos terminan, systemd levanta una app con proceso —unidad activa, su propio usuario, `NRestarts=0`, respondiendo por nginx— y unattended-upgrades **instala** de verdad, comprobado degradando un paquete a propósito porque con el sistema al día el instrumento marca cero aunque esté roto. Lo caro fue lo que salió por el camino: el paso 12 murió en `ufw allow OpenSSH`, y al mirar por qué apareció que ese perfil abre el 22 a pelo —o sea que **un servidor con sshd en otro puerto se quedaba fuera del suyo, en Ubuntu también, y sin un solo error**. Ver ARCHITECTURE §23. Rocky y Alma requieren reescribir la parte de paquetes.
 
-**Certificados de origen de Cloudflare.** Válidos 15 años y sin renovación. Más simples que Let's Encrypt para quien ya está detrás de Cloudflare y no piensa salir.
+**Certificados de origen de Cloudflare.** ✅ Desde la v1.4.7: `orbit ssl <app> --origin` pide a la API de Cloudflare un certificado de 15 años para Full (strict), con la clave generada en el servidor —a Cloudflare sólo va el CSR—, y `--origin-cert/--origin-key` instala uno hecho en el panel. No sigue si algún nombre de la app no pasa por el proxy, porque ese visitante vería un error de certificado; si el token no tiene el permiso `SSL and Certificates → Edit`, dice cuál falta y dónde. Retira el Let's Encrypt de antes para que el temporizador no renueve algo que no se sirve, entra en las copias con su clave y doctor avisa sin llamar a la API si un dominio con certificado de origen resuelve fuera de Cloudflare. Lo que queda: **pedir uno de verdad** con un token que tenga el permiso —se validó todo lo demás contra la API real, pero sólo con llamadas de lectura—. Ver ARCHITECTURE §6.5
+
+**Probar la renovación hoy.** ✅ `orbit ssl <app> --dry-run` (v1.4.7): `certbot renew --dry-run` con la configuración guardada, contra el staging, sin tocar nada. doctor hace la parte barata sin salir de la máquina. Ver ARCHITECTURE §6.4
 
 - ✅ **Reinicio sin corte** — levantar el proceso nuevo, esperar a que responda y solo entonces retirar el viejo. La release nueva arranca como unidad puente (`orbit-<app>-next`) en un puerto libre; si no pasa el health check, el proceso viejo ni se ha enterado — el fallo ocurre antes de tocar producción, no después. El estado en reposo no cambia: una unidad, un puerto, un vhost. `DEPLOY_OVERLAP="no"` devuelve el camino clásico para apps que no leen `$PORT`. **Ejercitado ya en un VPS real bajo tráfico**, y de ahí salió que no era del todo sin corte: daba 1-2 respuestas 502 por despliegue, porque `systemctl reload nginx` vuelve cuando entrega la señal y el proceso viejo se paraba 10 ms después, con peticiones aún en vuelo hacia él. Con el drenaje, 0 en 5 despliegues. Ver ARCHITECTURE §5.2
 

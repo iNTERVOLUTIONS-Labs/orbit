@@ -32,7 +32,7 @@ import re, sys
 # 'step' sólo existe en install.sh y los selectores sólo en orbit: la misma
 # tabla vale para los dos porque un nombre que no aparece no encuentra nada.
 FUNCS = {'die':0,'ok':0,'info':0,'warn':0,'err':0,'title':0,'hint':0,'t':0,'_t':0,
-         'step':0,'confirm':0,'choose':0,'spin':0,'pick_app':0,'ask':1,'_pick_script':1}
+         'step':0,'confirm':0,'choose':0,'spin':0,'pick_app':0,'ask':1,'_pick_script':1,'_origin_abort':0}
 CALL = re.compile(r'(?<![\w./-])(' + '|'.join(sorted(FUNCS, key=len, reverse=True)) + r')(?=[ \t])')
 POS  = re.compile(r'(^|[;&|{(!)]|\bthen\b|\belse\b|\bdo\b|\bif\b|\belif\b|\bwhile\b|\buntil\b|\$\()[ \t]*$')
 DEF  = re.compile(r'^\s*(die|ok|info|warn|err|title|hint|step|t|_t)\(\)')

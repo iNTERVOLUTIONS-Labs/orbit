@@ -379,7 +379,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.6"
+ORBIT_VERSION="1.4.7"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -1403,11 +1403,16 @@ _domain_list() { # _domain_list <variable> <lista> [uno]
 # sustitución de comandos —owner="$(domain_owner …)"— que es un subshell.
 domain_owner() { # domain_owner <dominio> [app_a_excluir]
   local d="${1,,}" skip="${2:-}" n a
+  local -a als
   for n in $(app_names); do
     [[ -n "$skip" && "$n" == "$skip" ]] && continue
     load_app "$n"
     [[ "${A_DOMAIN,,}" == "$d" ]] && { printf '%s' "$n"; return 0; }
-    for a in $A_ALIASES; do
+    # read -ra y no $A_ALIASES a pelo: con nullglob, un alias comodín sin
+    # ficheros que se le parezcan desaparecía, y '*.x.com' quedaba libre para
+    # que otra app lo reclamara (ver _ssl_names).
+    read -ra als <<<"$A_ALIASES"
+    for a in "${als[@]}"; do
       [[ "${a,,}" == "$d" ]] && { printf '%s' "$n"; return 0; }
     done
   done
@@ -1779,7 +1784,9 @@ svc_state() { # svc_state <app> <tipo>
 _app_state_json() { # _app_state_json [--cert-days]
   local svc ssl="false" maint="false" served="true"
   svc="$(svc_state "$A_NAME" "$A_TYPE")"
-  has_cert "$A_DOMAIN" && ssl="true"
+  local ctype=""
+  if has_origin "$A_NAME"; then ctype="origin"; ssl="true"
+  elif has_cert "$A_DOMAIN"; then ctype="letsencrypt"; ssl="true"; fi
   [[ -f "$(maint_flag "$A_NAME")" ]] && maint="true"
   # 'served' es lo primero que hay que saber y lo último que se añadió: sin
   # vhost nginx no atiende el dominio en absoluto —ni siquiera la página de
@@ -1797,7 +1804,12 @@ _app_state_json() { # _app_state_json [--cert-days]
   printf ',"port":';        _j_num "$A_PORT"
   printf ',"ssl":%s'        "$ssl"
   printf ',"cert_days":'
-  if [[ "${1:-}" == "--cert-days" ]]; then _j_num "$(cert_days_left "$A_DOMAIN")"; else printf 'null'; fi
+  if [[ "${1:-}" == "--cert-days" ]]; then _j_num "$(app_cert_days)"; else printf 'null'; fi
+  # Añadido en la 1.4.7: de quién es el certificado. Importa porque uno de
+  # origen de Cloudflare sólo lo acepta Cloudflare (§6.5), y eso no se deduce
+  # de 'ssl'.
+  printf ',"cert_type":'
+  if [[ -n "$ctype" ]]; then _j_str "$ctype"; else printf 'null'; fi
   printf ',"maintenance":%s' "$maint"
   printf ',"served":%s'      "$served"
   printf ',"autodeploy":';  _j_bool "$A_AUTODEPLOY"
@@ -3498,26 +3510,63 @@ nginx_link() { echo "$NGINX_ENABLED/orbit-$1.conf"; }
 cert_file() { echo "/etc/letsencrypt/live/$1/fullchain.pem"; }
 cert_key()  { echo "/etc/letsencrypt/live/$1/privkey.pem"; }
 has_cert()  { [[ -f "$(cert_file "$1")" ]]; }
+# Lo que certbot va a usar para renovar cada certificado. Es la mitad del
+# certificado que no se ve: el de hoy está bien, y lo que falla dentro de 60
+# días es lo que dice este fichero (§6.4).
+LE_RENEWAL_DIR="${LE_RENEWAL_DIR:-/etc/letsencrypt/renewal}"
 
-# Días que le quedan al certificado de un dominio. Vacío —y no cero— si no hay
-# certificado o si openssl no sabe leerlo: cero días es una emergencia y «no
-# hay» no lo es, así que no pueden compartir valor.
-cert_days_left() { # cert_days_left <dominio>
-  [[ -n "${1:-}" ]] || return 0
-  _cert_end_load "$1" fresh
-  local end="${CERT_END[$1]}"
-  [[ -n "$end" ]] || return 0
-  printf '%s' "$(( (end - $(date +%s)) / 86400 ))"
+# El certificado de origen de Cloudflare (§6.5) va por **app** y no por dominio
+# como el de Let's Encrypt, porque no se renueva: es de esta app y se va con
+# ella. Vive en /etc/ssl —el sitio de siempre para un certificado que no es de
+# certbot— y no en /etc/orbit, porque el vhost lo lee directamente: si Orbit
+# desaparece con su carpeta, nginx no puede quedarse sin la clave (principio 3).
+# La carpeta de cada app es 0700 y la clave 0600, de root.
+ORIGIN_CERT_DIR="${ORIGIN_CERT_DIR:-/etc/ssl/orbit}"
+origin_dir()  { echo "$ORIGIN_CERT_DIR/$1"; }
+origin_cert() { echo "$ORIGIN_CERT_DIR/$1/cert.pem"; }
+origin_key()  { echo "$ORIGIN_CERT_DIR/$1/key.pem"; }
+# Sin $(…) a propósito: 'list --json' pasa por aquí una vez por app (§13.6d).
+has_origin()  { [[ -f "$ORIGIN_CERT_DIR/$1/cert.pem" && -f "$ORIGIN_CERT_DIR/$1/key.pem" ]]; }
+
+# Con la app cargada: el certificado que sirve su vhost. Si tiene uno de origen
+# manda ése, aunque quede un Let's Encrypt de antes —se pidió el de origen
+# después, y es lo que se quiere servir—.
+app_has_cert()  { has_origin "$A_NAME" || has_cert "$A_DOMAIN"; }
+app_cert_file() { if has_origin "$A_NAME"; then origin_cert "$A_NAME"; else cert_file "$A_DOMAIN"; fi; }
+app_cert_key()  { if has_origin "$A_NAME"; then origin_key  "$A_NAME"; else cert_key  "$A_DOMAIN"; fi; }
+app_cert_type() { # -> origin | letsencrypt | vacío
+  if has_origin "$A_NAME"; then printf 'origin'
+  elif has_cert "$A_DOMAIN"; then printf 'letsencrypt'; fi
 }
 
-# Cuándo caduca, en segundos desde 1970, guardado en CERT_END[<dominio>] y
-# vacío si no hay certificado o no se puede leer. Se apunta en el shell que
-# llama —por eso no devuelve nada por stdout— para que la pasada del vigilante
-# lo pregunte una vez y las métricas de Prometheus lo reutilicen: son dos
-# procesos por certificado y cada minuto, y la segunda vez no aportaría nada.
-# Con 'fresh' se vuelve a leer: cert_days_left no se fía de lo guardado, porque
-# en un mismo proceso puede haber un 'orbit ssl' entre medias, y un «no hay
-# certificado» de antes de emitirlo seguiría diciéndolo después.
+# Días que le quedan a un certificado. Vacío —y no cero— si no hay certificado
+# o si openssl no sabe leerlo: cero días es una emergencia y «no hay» no lo es,
+# así que no pueden compartir valor.
+_cert_days_file() { # _cert_days_file <fichero.pem>
+  [[ -f "$1" ]] || return 0
+  local exp end
+  exp="$(openssl x509 -enddate -noout -in "$1" 2>/dev/null | cut -d= -f2 || true)"
+  [[ -n "$exp" ]] || return 0
+  end="$(date -d "$exp" +%s 2>/dev/null || echo 0)"
+  (( end > 0 )) || return 0
+  printf '%s' "$(( (end - $(date +%s)) / 86400 ))"
+}
+cert_days_left() { # cert_days_left <dominio>
+  has_cert "$1" || return 0
+  _cert_days_file "$(cert_file "$1")"
+}
+app_cert_days() { app_has_cert || return 0; _cert_days_file "$(app_cert_file)"; }
+
+# Cuándo caduca el certificado que sirve el dominio principal de una app, en
+# segundos desde 1970, guardado en CERT_END[<dominio>] y vacío si no hay
+# certificado o no se puede leer. Se apunta en el shell que llama —por eso no
+# devuelve nada por stdout— para que la pasada del vigilante lo pregunte una
+# vez y las métricas de Prometheus lo reutilicen: son dos procesos por
+# certificado y cada minuto, y la segunda vez no aportaría nada. Con 'fresh' se
+# vuelve a leer, porque en un mismo proceso puede haber un 'orbit ssl' entre
+# medias. Con la app cargada y un certificado de origen, se lee ése: es el que
+# sirve el vhost, y el de Let's Encrypt que pudiera quedar ya no caduca para
+# nadie.
 declare -A CERT_END=()
 _cert_end_load() { # _cert_end_load <dominio> [fresh]
   # Sin dominio no hay clave: un subíndice vacío en un array asociativo es un
@@ -3525,9 +3574,12 @@ _cert_end_load() { # _cert_end_load <dominio> [fresh]
   [[ -n "${1:-}" ]] || return 0
   [[ "${2:-}" != fresh && -n "${CERT_END[$1]+x}" ]] && return 0
   CERT_END[$1]=""
-  has_cert "$1" || return 0
-  local exp end
-  exp="$(openssl x509 -enddate -noout -in "$(cert_file "$1")" 2>/dev/null | cut -d= -f2 || true)"
+  local f exp end
+  if [[ "${A_DOMAIN:-}" == "$1" && -n "${A_NAME:-}" ]] && has_origin "$A_NAME"; then
+    f="$ORIGIN_CERT_DIR/$A_NAME/cert.pem"
+  elif has_cert "$1"; then f="$(cert_file "$1")"
+  else return 0; fi
+  exp="$(openssl x509 -enddate -noout -in "$f" 2>/dev/null | cut -d= -f2 || true)"
   [[ -n "$exp" ]] || return 0
   end="$(date -d "$exp" +%s 2>/dev/null || echo 0)"
   (( end > 0 )) || return 0
@@ -4725,7 +4777,7 @@ $body"
     echo "# ── Orbit · $A_NAME ($A_TYPE) · generado $(date -Iseconds) ──"
     echo "# NO EDITAR A MANO: se regenera con 'orbit deploy $A_NAME'"
     echo
-    if has_cert "$A_DOMAIN"; then
+    if app_has_cert; then
       cat <<EOF
 server {
     $listen80
@@ -4769,8 +4821,8 @@ $http2line
     server_name $names;
 $absredir
 
-    ssl_certificate     $(cert_file "$A_DOMAIN");
-    ssl_certificate_key $(cert_key "$A_DOMAIN");
+    ssl_certificate     $(app_cert_file);
+    ssl_certificate_key $(app_cert_key);
     include /etc/nginx/snippets/orbit-ssl.conf;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     # El mismo valor, para las location que repiten las cabeceras: ver _sec_headers.
@@ -7343,7 +7395,7 @@ cmd_deploy() {
   DEP_OK="yes"; DEP_STEP=""
   _dprog nginx ok
 
-  local scheme="http"; has_cert "$A_DOMAIN" && scheme="https"
+  local scheme="http"; app_has_cert && scheme="https"
   # El resumen humano por el canal que toque; el objeto, sólo por stdout.
   printf "\n  ${GRN}${B}%s %s desplegada${R}  %s  ${B}%s://%s${R}\n\n" \
     "$G_OK" "$A_NAME" "$G_ARROW" "$scheme" "$A_DOMAIN" >&$UI_FD
@@ -9909,12 +9961,138 @@ cmd_clone() {
 }
 
 # ═══════════════════════════════════════════════════════════ ssl ══════════
+#
+# Tres cosas distintas, y las tres terminan en dos ficheros que nginx lee:
+#
+#   orbit ssl <app>             Let's Encrypt, por DNS si hay token y si no por HTTP
+#   orbit ssl <app> --dry-run   la renovación de mañana, probada hoy (§6.4)
+#   orbit ssl <app> --origin    un certificado de origen de Cloudflare (§6.5)
 cmd_ssl() {
   need_root ssl
-  local name="${1:-}"
+  local name="" mode="le" dry="no" force="no" ktype="ecc" ocert="" okey="" a
+  local ASSUME_YES="$ASSUME_YES"
+  while (( $# )); do
+    a="$1"
+    case "$a" in
+      --dry-run|--prueba)  dry="yes" ;;
+      --origin|--origen)   mode="origin" ;;
+      --rsa)               ktype="rsa" ;;
+      --force|--forzar)    force="yes" ;;
+      -y|--yes|--si)       ASSUME_YES="yes" ;;
+      --origin-cert|--origin-key)
+        (( $# >= 2 )) || die "«%s» necesita un fichero detrás." "$a"
+        if [[ "$a" == --origin-cert ]]; then ocert="$2"; else okey="$2"; fi
+        mode="origin"; shift ;;
+      -h|--help|help|ayuda)
+        printf '%b' "$(t "  uso: orbit ssl <app> [--dry-run]\n\
+       orbit ssl <app> --origin [--rsa] [--force]\n\
+       orbit ssl <app> --origin-cert <fichero> --origin-key <fichero>\n\
+       Sin opciones, Let's Encrypt: por DNS si hay token de Cloudflare, y si no por HTTP.\n\
+       --dry-run   prueba la renovación contra el entorno de pruebas; no cambia nada\n\
+       --origin    certificado de origen de Cloudflare (15 años, sólo vale detrás del proxy)\n")"
+        return 0 ;;
+      -*) die "orbit ssl: no entiendo «%s». Mira 'orbit ssl --help'." "$a" ;;
+      *)  [[ -n "$name" ]] && die "orbit ssl: sobra «%s»." "$a"; name="$a" ;;
+    esac
+    shift
+  done
+  if [[ "$mode" != "origin" ]]; then
+    [[ "$ktype" == "rsa" || "$force" == "yes" ]] \
+      && die "--rsa y --force son de los certificados de origen: van con --origin."
+  fi
+  [[ "$dry" == "yes" && "$mode" == "origin" ]] \
+    && die "--dry-run prueba una renovación de Let's Encrypt; un certificado de origen no se renueva."
+  [[ -n "$ocert" && -z "$okey" || -z "$ocert" && -n "$okey" ]] \
+    && die "Hacen falta los dos: --origin-cert <fichero> y --origin-key <fichero>."
   [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
   load_app "$name"
+
+  if   [[ "$dry" == "yes" ]];     then _ssl_dry_run "$name"
+  elif [[ "$mode" == "origin" ]]; then _ssl_origin "$name" "$ktype" "$force" "$ocert" "$okey"
+  else                                 _ssl_letsencrypt "$name"
+  fi
+}
+
+# Los dominios del certificado, uno por elemento. Con 'read -ra' y no con un
+# 'for a in $A_ALIASES': Orbit corre con nullglob, y un alias comodín
+# ('*.midominio.com') sin ficheros que se le parezcan **desaparecía** de la
+# lista. La petición salía sin él, certbot emitía sin protestar —le habían
+# pedido menos nombres, no uno malo— y los subdominios recibían un certificado
+# que no los cubre. Es la trampa que ya documentaba _apps_json, en el único
+# sitio donde costaba un certificado.
+_ssl_names() { # _ssl_names <variable-array>
+  local -n __out="$1"
+  read -ra __out <<<"$A_DOMAIN $A_ALIASES"
+}
+
+# Por qué método se valida, en un solo sitio.
+_ssl_method() { if [[ -f "$ETC_DIR/cloudflare.ini" ]]; then echo dns; else echo webroot; fi; }
+
+# Los argumentos de certbot para emitir el de esta app, uno por línea. En un
+# solo sitio porque el dry-run tiene que probar **exactamente** lo que hará la
+# emisión: con dos copias, la prueba saldría bien sobre una que ya no existe.
+_ssl_le_args() { # _ssl_le_args <dns|webroot> <email|vacío>
+  local -a names; _ssl_names names
+  local d
+  if [[ "$1" == dns ]]; then
+    printf '%s\n' --dns-cloudflare \
+      --dns-cloudflare-credentials "$ETC_DIR/cloudflare.ini" \
+      --dns-cloudflare-propagation-seconds 30
+  else
+    printf '%s\n' --webroot -w "$ACME_DIR"
+  fi
+  for d in "${names[@]}"; do printf '%s\n' -d "$d"; done
+  printf '%s\n' --non-interactive --agree-tos
+  # Sin correo sólo se llega aquí desde el dry-run, que no debe escribir en
+  # orbit.conf para preguntarlo: la cuenta de staging puede ir sin él.
+  if [[ -n "$2" ]]; then printf '%s\n' -m "$2"
+  else                   printf '%s\n' --register-unsafely-without-email; fi
+  printf '%s\n' --key-type ecdsa --cert-name "$A_DOMAIN"
+}
+
+# Un comodín no se puede validar por HTTP: Let's Encrypt sólo lo acepta por DNS.
+# certbot lo dice, pero después de registrar la cuenta y con un mensaje sobre
+# «combinaciones de retos» que no dice qué hacer.
+_ssl_wild_needs_dns() { # _ssl_wild_needs_dns <método>
+  [[ "$1" == webroot ]] || return 0
+  local -a names; _ssl_names names
+  local d
+  for d in "${names[@]}"; do
+    [[ "$d" == '*.'* ]] || continue
+    err "«%s» es un comodín, y Let's Encrypt sólo emite comodines validando por DNS." "$d"
+    die "Guarda el token de Cloudflare con 'orbit cf-token' y repite."
+  done
+}
+
+# certbot, sin el cartel de python-cloudflare. Ubuntu 24.04 trae la 2.20, que en
+# cada uso imprime catorce líneas de exclamaciones sobre una versión 3 que no
+# está instalada —y lo fuerza: se salta PYTHONWARNINGS, comprobado—. En la
+# primera emisión de verdad por DNS salió dos veces, y era lo más alarmante de
+# una ejecución que había ido bien. Se quitan exactamente esas líneas, una a
+# una y sin estado: cualquier otro mensaje de certbot sigue saliendo, también
+# si un día cambia el cartel.
+_certbot_quiet() {
+  awk '/[Cc]loud[Ff]lare.*PendingDeprecationWarning/ { next }
+       /^[[:space:]]*!!/ { next }
+       /^[[:space:]]*self\.cf = CloudFlare\.CloudFlare\(/ { next }
+       { print; fflush() }'
+}
+_certbot() {
+  local rc=0
+  certbot "$@" 2> >(_certbot_quiet >&2) || rc=$?
+  # Que lo que quede del filtro salga antes que el mensaje de quien llama.
+  wait "$!" 2>/dev/null || true
+  return "$rc"
+}
+
+_ssl_letsencrypt() { # _ssl_letsencrypt <app> — con la app cargada
+  local name="$1"
   title "Certificado HTTPS para %s" "$A_DOMAIN"
+
+  if has_origin "$name"; then
+    warn "«%s» usa un certificado de origen de Cloudflare, válido %s días más." "$name" "$(app_cert_days)"
+    confirm "¿Cambiarlo por uno de Let's Encrypt?" y || return 0
+  fi
 
   if [[ -z "${LETSENCRYPT_EMAIL:-}" ]]; then
     local mail; ask mail "Email para avisos de Let's Encrypt" ""
@@ -9924,43 +10102,401 @@ cmd_ssl() {
     _conf_set LETSENCRYPT_EMAIL "$mail"
   fi
 
-  local domains=(-d "$A_DOMAIN"); local a
-  for a in $A_ALIASES; do domains+=(-d "$a"); done
-
-  local method
-  if [[ -f "$ETC_DIR/cloudflare.ini" ]]; then
-    method="dns"
+  local method; method="$(_ssl_method)"
+  if [[ "$method" == "dns" ]]; then
     info "Usando la API de Cloudflare (funciona con el proxy naranja activado)"
   else
-    method="webroot"
+    _ssl_wild_needs_dns webroot
     warn "Sin token de Cloudflare. Usaré validación HTTP."
     warn "En Cloudflare pon el registro en 'DNS only' (nube gris) mientras se emite,"
     warn "o ejecuta 'orbit cf-token' para el método por DNS (recomendado)."
     confirm "¿Continuar con validación HTTP?" y || return 0
   fi
 
+  local -a args; mapfile -t args < <(_ssl_le_args "$method" "$LETSENCRYPT_EMAIL")
   local rc=0
-  if [[ "$method" == "dns" ]]; then
-    certbot certonly --dns-cloudflare \
-      --dns-cloudflare-credentials "$ETC_DIR/cloudflare.ini" \
-      --dns-cloudflare-propagation-seconds 30 \
-      "${domains[@]}" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" \
-      --key-type ecdsa --cert-name "$A_DOMAIN" || rc=$?
-  else
-    certbot certonly --webroot -w "$ACME_DIR" \
-      "${domains[@]}" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" \
-      --key-type ecdsa --cert-name "$A_DOMAIN" || rc=$?
-  fi
-
+  _certbot certonly "${args[@]}" || rc=$?
   if (( rc != 0 )); then
     err "Certbot ha fallado. Revisa que el DNS apunte a este servidor."
     return 1
   fi
 
-  render_nginx "$name" || die "nginx rechazó la nueva configuración"
+  # Si venía de un certificado de origen, se aparta —no se borra— hasta que
+  # nginx haya aceptado el vhost nuevo: si lo rechaza, render_nginx deja el
+  # vhost de antes, que apunta a esos ficheros, y tienen que seguir ahí.
+  local aside=""
+  if has_origin "$name"; then
+    aside="$(_origin_aside "$name" retirado)"
+    mv "$(origin_dir "$name")" "$aside" || die "No he podido apartar el certificado de origen. No he cambiado nada."
+  fi
+  if ! render_nginx "$name"; then
+    [[ -n "$aside" ]] && mv "$aside" "$(origin_dir "$name")"
+    die "nginx rechazó la nueva configuración"
+  fi
+  if [[ -n "$aside" ]]; then
+    rm -rf "$aside"
+    ok "Certificado de origen de Cloudflare retirado"
+  fi
   ok "HTTPS activo en https://%s" "$A_DOMAIN"
   info "En Cloudflare deja el modo SSL/TLS en 'Full (strict)'"
   logline "ssl $name $A_DOMAIN"
+}
+
+# La renovación, probada hoy. La emisión casi nunca es lo que falla: falla la
+# renovación, sesenta días después y sin nadie mirando, porque entre medias se
+# ha borrado el token, ha cambiado el DNS o una redirección se come el reto
+# (§6, «El reto de ACME no se puede redirigir»). Esto ejecuta lo mismo que
+# hará el temporizador de certbot contra el entorno de pruebas de Let's
+# Encrypt, que no emite nada válido ni guarda nada.
+#
+# Dos detalles, los dos salidos de probarlo contra Cloudflare de verdad:
+#
+#   · 'certbot renew' sin terminal espera **un rato al azar de hasta ocho
+#     minutos** antes de empezar —lo hace para repartir la carga del
+#     temporizador—. La primera prueba se quedó 338 segundos quieta sin decir
+#     nada. Para una orden que alguien está mirando, --no-random-sleep-on-renew.
+#   · No es gratis: el staging tiene límite de frecuencia (unas 60 pruebas por
+#     hora y cuenta), y por eso esto se pide a mano y doctor no lo lanza solo.
+_ssl_dry_run() { # _ssl_dry_run <app> — con la app cargada
+  local name="$1" rc=0 conf="$LE_RENEWAL_DIR/$A_DOMAIN.conf" p auth
+  title "Prueba de renovación para %s" "$A_DOMAIN"
+  if has_origin "$name"; then
+    info "«%s» usa un certificado de origen de Cloudflare: no lo renueva certbot, y le quedan %s días." "$name" "$(app_cert_days)"
+    return 0
+  fi
+  info "Contra el entorno de pruebas de Let's Encrypt: no se guarda ningún certificado ni se toca nginx."
+
+  if has_cert "$A_DOMAIN" && [[ ! -f "$conf" ]]; then
+    # Hay certificado y certbot no sabe renovarlo: probar una emisión nueva
+    # saldría bien y diría lo contrario de lo que va a pasar.
+    err "La renovación no puede funcionar: %s" "$(_le_renewal_problem "$A_DOMAIN")"
+    info "Vuelve a emitirlo con 'orbit ssl %s': certbot guardará cómo renovarlo." "$name"
+    logline "ssl-dry-run $name fail"
+    return 1
+  fi
+  if has_cert "$A_DOMAIN"; then
+    auth="$(sed -n '/^authenticator[[:space:]]*=/{s/^[^=]*=[[:space:]]*//p;q}' "$conf")"
+    info "certbot renovará por: %s" "${auth:-?}"
+    p="$(_le_renewal_problem "$A_DOMAIN")"
+    [[ -z "$p" ]] || warn "%s" "$p"
+    # Los nombres que se añadieron después de emitir no los renueva nadie:
+    # certbot renueva lo que tiene guardado, no lo que dice la app.
+    local -a names; _ssl_names names
+    local d falta=""
+    for d in "${names[@]}"; do
+      _cert_covers "$(cert_file "$A_DOMAIN")" "$d" || falta="${falta:+$falta }$d"
+    done
+    [[ -z "$falta" ]] || warn "El certificado no cubre %s: emítelo otra vez con 'orbit ssl %s'." "$falta" "$name"
+    _certbot renew --cert-name "$A_DOMAIN" --dry-run --no-random-sleep-on-renew --non-interactive || rc=$?
+  else
+    # Sin certificado todavía, se prueba la emisión tal cual se haría.
+    local method; method="$(_ssl_method)"
+    _ssl_wild_needs_dns "$method"
+    info "Todavía no hay certificado: pruebo la emisión, por %s." "$method"
+    local -a args; mapfile -t args < <(_ssl_le_args "$method" "${LETSENCRYPT_EMAIL:-}")
+    _certbot certonly "${args[@]}" --dry-run || rc=$?
+  fi
+
+  if (( rc == 0 )); then
+    ok "La prueba ha salido bien: Let's Encrypt validaría %s hoy." "$A_DOMAIN"
+    logline "ssl-dry-run $name ok"
+    return 0
+  fi
+  err "La prueba ha fallado: así fallará también la renovación de verdad."
+  hint "El detalle está en /var/log/letsencrypt/letsencrypt.log"
+  logline "ssl-dry-run $name fail"
+  return 1
+}
+
+# ── certificados de origen de Cloudflare (§6.5) ─────────────────────────────
+
+CF_API="${CF_API:-https://api.cloudflare.com/client/v4}"
+CF_INI="${CF_INI:-}"   # otro fichero de token: sólo para probarlo antes de guardarlo
+
+# El token, leído del fichero que ya usa certbot. Vacío si no hay. Nunca sale
+# de esta máquina más que hacia la API, y nunca por la línea de órdenes.
+_cf_token() {
+  local f="${CF_INI:-$ETC_DIR/cloudflare.ini}"
+  [[ -r "$f" ]] || return 0
+  sed -n '/^[[:space:]]*dns_cloudflare_api_token[[:space:]]*=/{s/^[^=]*=[[:space:]]*//;s/[[:space:]]*$//;p;q}' "$f"
+}
+
+# Una llamada a la API. Imprime el código HTTP —000 si no hubo respuesta— y deja
+# el cuerpo en <salida>. El token va por el fichero de configuración de curl
+# (_curl_cfg), por stdin: en la línea de órdenes lo vería cualquiera con 'ps'.
+_cf_api() { # _cf_api <GET|POST> <ruta> <salida> [cuerpo.json]
+  local tok code; tok="$(_cf_token)"
+  [[ -n "$tok" ]] || { printf '000'; return 0; }
+  local -a extra=()
+  [[ -n "${4:-}" ]] && extra=(-H 'Content-Type: application/json' --data-binary "@$4")
+  code="$( { _curl_cfg url "$CF_API$2"; _curl_cfg header "Authorization: Bearer $tok"; } \
+           | curl -K - -sS -m 30 -X "$1" -o "$3" -w '%{http_code}' "${extra[@]}" 2>/dev/null || true)"
+  printf '%s' "${code:-000}"
+}
+
+# La zona de Cloudflare de un nombre: se prueba de la etiqueta más larga a la
+# más corta, porque 'tienda.midominio.co.uk' puede ser zona propia o no, y la
+# API no sabe contestar «¿de qué zona es esto?».
+_cf_zone_id() { # _cf_zone_id <nombre> -> id, o nada
+  local c="${1#\*.}" out code id
+  out="$(mktemp)"
+  while [[ "$c" == *.* ]]; do
+    code="$(_cf_api GET "/zones?name=$c" "$out")"
+    id=""
+    [[ "$code" == 200 ]] && id="$(jq -r '.result[0].id // empty' "$out" 2>/dev/null || true)"
+    [[ -n "$id" ]] && { rm -f "$out"; printf '%s' "$id"; return 0; }
+    c="${c#*.}"
+  done
+  rm -f "$out"
+  return 0
+}
+
+# ¿Pasa este nombre por el proxy de Cloudflare? yes | no | none (sin registro) |
+# error (no se ha podido preguntar). Es de sólo lectura, y lo que pregunta es lo
+# que de verdad importa: no a dónde resuelve hoy, sino qué dice el registro.
+_cf_proxied() { # _cf_proxied <nombre>
+  local zid out code r
+  zid="$(_cf_zone_id "$1")"
+  [[ -n "$zid" ]] || { printf 'error'; return 0; }
+  out="$(mktemp)"
+  code="$(_cf_api GET "/zones/$zid/dns_records?name=$1&per_page=100" "$out")"
+  r=""
+  [[ "$code" == 200 ]] && r="$(jq -r '[.result[]? | select(.type == "A" or .type == "AAAA" or .type == "CNAME") | .proxied]
+      | if length == 0 then "none" elif all then "yes" else "no" end' "$out" 2>/dev/null || true)"
+  rm -f "$out"
+  printf '%s' "${r:-error}"
+}
+
+# Los nombres de un certificado, uno por línea.
+_cert_names() { # _cert_names <cert.pem>
+  openssl x509 -noout -ext subjectAltName -in "$1" 2>/dev/null \
+    | grep -o 'DNS:[^,[:space:]]*' | sed 's/^DNS://' || true
+}
+
+# ¿Cubre el certificado este nombre? Un comodín cubre una etiqueta y sólo una:
+# '*.x.com' vale para 'a.x.com' y no para 'x.com' ni para 'a.b.x.com'.
+_cert_covers() { # _cert_covers <cert.pem> <nombre>
+  local n h="${2,,}"
+  while IFS= read -r n <&3; do
+    n="${n,,}"
+    [[ "$n" == "$h" ]] && return 0
+    if [[ "$n" == '*.'* && "$h" != '*.'* && "$h" == *.* ]]; then
+      [[ "${h#*.}" == "${n#\*.}" ]] && return 0
+    fi
+  done 3< <(_cert_names "$1")
+  return 1
+}
+
+# ¿Son pareja este certificado y esta clave? Se compara la clave pública de los
+# dos. nginx -t también lo detectaría, pero después de haber escrito el vhost;
+# aquí se sabe antes de tocar nada.
+_cert_key_match() { # _cert_key_match <cert.pem> <key.pem>
+  local a b
+  a="$(openssl x509 -noout -pubkey -in "$1" 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum || true)"
+  b="$(openssl pkey -pubout -outform DER -passin pass: -in "$2" </dev/null 2>/dev/null | sha256sum || true)"
+  # El sha256 de nada también es un hash: hay que descartar el de la cadena vacía.
+  local vacio; vacio="$(printf '' | sha256sum)"
+  [[ -n "$a" && "$a" != "$vacio" && "$a" == "$b" ]]
+}
+
+# Los nombres de las carpetas apartadas empiezan por un punto, y ningún nombre
+# de app puede: con 'foo.anterior' a secas, una app llamada así —los puntos
+# valen en un nombre— perdía su certificado cuando 'foo' pedía otro.
+_origin_aside() { # _origin_aside <app> <motivo> -> ruta nueva y vacía que no existe
+  local d; d="$(mktemp -d "$ORIGIN_CERT_DIR/.$1.$2.XXXXXX")"
+  rmdir "$d"; printf '%s' "$d"
+}
+
+ORIGIN_TMP=""
+_origin_abort() { # _origin_abort <mensaje> [args] — borra lo que haya a medias y muere
+  [[ -n "$ORIGIN_TMP" ]] && rm -rf "$ORIGIN_TMP"
+  ORIGIN_TMP=""
+  die "$@"
+}
+
+_ssl_origin() { # _ssl_origin <app> <ecc|rsa> <force> <cert subido> <clave subida>
+  local name="$1" ktype="$2" force="$3" ucert="$4" ukey="$5"
+  local -a names; _ssl_names names
+  local d st tok
+  title "Certificado de origen de Cloudflare para %s" "$A_DOMAIN"
+  tok="$(_cf_token)"
+  if [[ -z "$ucert" && -z "$tok" ]]; then
+    err "Para pedirlo hace falta el token de Cloudflare, con el permiso de certificados."
+    die "Guárdalo con 'orbit cf-token', o sube uno hecho en el panel con --origin-cert y --origin-key."
+  fi
+  if [[ -n "$ucert" ]]; then
+    # -f y no -r: un directorio también se puede «leer», y 'install' moría
+    # después con la clave a medio copiar.
+    [[ -f "$ucert" && -r "$ucert" ]] || die "No puedo leer «%s»." "$ucert"
+    [[ -f "$ukey" && -r "$ukey" ]]   || die "No puedo leer «%s»." "$ukey"
+  fi
+  # Sin jq no se puede leer lo que contesta Cloudflare. Se dice ahora, antes de
+  # generar ninguna clave, y no con un código de salida a pelo a mitad.
+  if [[ -n "$tok" ]] && ! command -v jq >/dev/null 2>&1; then
+    die "Para hablar con la API de Cloudflare hace falta jq:  sudo apt-get install -y jq"
+  fi
+
+  # 1 · ¿pasan todos los nombres por el proxy? Este certificado sólo lo acepta
+  # Cloudflare: un nombre en nube gris, o sin registro, deja a cada visitante
+  # que llegue directo con un error de certificado en pantalla completa. Es lo
+  # contrario del principio 4, así que no se sigue sin --force.
+  local malos="" dudas=""
+  if [[ -n "$tok" ]]; then
+    for d in "${names[@]}"; do
+      st="$(_cf_proxied "$d")"
+      case "$st" in
+        yes)   ok "%s pasa por el proxy de Cloudflare" "$d" ;;
+        no)    err "%s NO pasa por el proxy (nube gris)" "$d"; malos="${malos:+$malos }$d" ;;
+        none)  err "%s no tiene registro en Cloudflare" "$d"; malos="${malos:+$malos }$d" ;;
+        *)     warn "No he podido comprobar si %s pasa por el proxy (¿está su zona en el alcance del token?)" "$d"
+               dudas="${dudas:+$dudas }$d" ;;
+      esac
+    done
+  else
+    warn "Sin token de Cloudflare no puedo comprobar que %s pase por el proxy." "${names[*]}"
+    dudas="${names[*]}"
+  fi
+  if [[ -n "$malos" && "$force" != "yes" ]]; then
+    err "Con un certificado de origen, quien entre a %s sin pasar por Cloudflare vería un error de certificado." "$malos"
+    info "Activa el proxy (nube naranja) en el panel de DNS de Cloudflare y repite."
+    die "No he cambiado nada. Si lo quieres así de todos modos, repite con --force."
+  fi
+  [[ -z "$dudas" ]] || warn "Si %s no pasa por el proxy, los visitantes verán un error de certificado." "$dudas"
+
+  install -d -m 0755 "$ORIGIN_CERT_DIR" || die "No puedo crear %s." "$ORIGIN_CERT_DIR"
+  # Lo que dejara un intento anterior cortado de golpe (Ctrl-C, un kill): es
+  # 0700 de root y no se lee, pero es una clave sin dueño.
+  rm -rf "$ORIGIN_CERT_DIR/.$name.nuevo."*
+  ORIGIN_TMP="$(mktemp -d "$ORIGIN_CERT_DIR/.$name.nuevo.XXXXXX")" || die "No puedo crear una carpeta en %s." "$ORIGIN_CERT_DIR"
+  chmod 0700 "$ORIGIN_TMP"
+  local c="$ORIGIN_TMP/cert.pem" k="$ORIGIN_TMP/key.pem" src id="" rtype=""
+
+  # 2 · el certificado: subido, o pedido a la API con una clave hecha aquí.
+  if [[ -n "$ucert" ]]; then
+    src="upload"
+    install -m 0644 "$ucert" "$c" || _origin_abort "No he podido copiar «%s»." "$ucert"
+    ( umask 077; cp "$ukey" "$k" ) && chmod 0600 "$k" || _origin_abort "No he podido copiar «%s»." "$ukey"
+    openssl x509 -noout -in "$c" >/dev/null 2>&1 || _origin_abort "«%s» no es un certificado PEM." "$ucert"
+    # -passin vacío: una clave con contraseña se quedaba esperando a un teclado
+    # con el aviso tirado a /dev/null. nginx tampoco sabría abrirla.
+    openssl pkey -noout -passin pass: -in "$k" </dev/null >/dev/null 2>&1 \
+      || _origin_abort "«%s» no es una clave privada PEM (¿lleva contraseña?)." "$ukey"
+    local issuer; issuer="$(openssl x509 -noout -issuer -in "$c" 2>/dev/null || true)"
+    [[ "${issuer,,}" == *cloudflare* ]] \
+      || warn "No lo ha firmado Cloudflare: sirve igual, pero entonces no es un certificado de origen."
+  else
+    src="cloudflare-api"
+    # La clave se hace aquí y no sale nunca: a Cloudflare sólo va la petición
+    # firmada (CSR). Con umask 077 no existe ni un instante legible por otros.
+    rtype="origin-ecc"
+    if [[ "$ktype" == rsa ]]; then
+      rtype="origin-rsa"
+      ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$k" ) >/dev/null 2>&1 \
+        || _origin_abort "openssl no ha podido generar la clave."
+    else
+      ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$k" ) >/dev/null 2>&1 \
+        || _origin_abort "openssl no ha podido generar la clave."
+    fi
+    # El CN no lo mira Cloudflare —manda 'hostnames'— y tiene un máximo de 64
+    # caracteres que un dominio válido puede pasar.
+    local cn="$A_DOMAIN"; (( ${#cn} <= 64 )) || cn="orbit-origin"
+    openssl req -new -key "$k" -subj "/CN=$cn" -out "$ORIGIN_TMP/req.csr" >/dev/null 2>&1 \
+      || _origin_abort "openssl no ha podido generar la petición (CSR)."
+    jq -n --rawfile csr "$ORIGIN_TMP/req.csr" --arg t "$rtype" \
+       --args '{csr: $csr, hostnames: $ARGS.positional, request_type: $t, requested_validity: 5475}' \
+       "${names[@]}" > "$ORIGIN_TMP/req.json" || _origin_abort "No he podido preparar la petición."
+    info "Pidiendo el certificado a Cloudflare (15 años)…"
+    local code; code="$(_cf_api POST /certificates "$ORIGIN_TMP/resp.json" "$ORIGIN_TMP/req.json")"
+    if [[ "$code" == 200 ]] && jq -e '.success == true and (.result.certificate | type == "string")' \
+         "$ORIGIN_TMP/resp.json" >/dev/null 2>&1; then
+      jq -r '.result.certificate' "$ORIGIN_TMP/resp.json" > "$c"
+      chmod 0644 "$c"
+      id="$(jq -r '.result.id // empty' "$ORIGIN_TMP/resp.json" 2>/dev/null || true)"
+    else
+      _ssl_origin_api_error "$code" "$ORIGIN_TMP/resp.json"
+      _origin_abort "No he cambiado nada."
+    fi
+    rm -f "$ORIGIN_TMP/req.csr" "$ORIGIN_TMP/req.json" "$ORIGIN_TMP/resp.json"
+  fi
+
+  # 3 · antes de tocar nginx: que sean pareja, que estén vigentes y que cubran
+  # todos los nombres. Un nombre sin cubrir es un 526 de Cloudflare.
+  _cert_key_match "$c" "$k" || _origin_abort "El certificado y la clave no son pareja."
+  openssl x509 -checkend 0 -noout -in "$c" >/dev/null 2>&1 || _origin_abort "El certificado ya ha caducado."
+  for d in "${names[@]}"; do
+    _cert_covers "$c" "$d" || _origin_abort "El certificado no cubre %s." "$d"
+  done
+  {
+    echo "# Certificado de origen de Cloudflare · lo instaló Orbit"
+    echo "# Sólo lo acepta Cloudflare: los nombres tienen que pasar por su proxy."
+    echo "source=$src"
+    [[ -n "$id" ]]    && echo "cloudflare_id=$id"
+    [[ -n "$rtype" ]] && echo "request_type=$rtype"
+    echo "hostnames=${names[*]}"
+    echo "expires=$(openssl x509 -enddate -noout -in "$c" 2>/dev/null | cut -d= -f2)"
+    echo "installed=$(date -Iseconds)"
+  } > "$ORIGIN_TMP/origin.info"
+
+  # 4 · en su sitio, con el anterior apartado hasta que nginx diga que sí.
+  local dir prev=""; dir="$(origin_dir "$name")"
+  if [[ -d "$dir" ]]; then
+    prev="$(_origin_aside "$name" anterior)"
+    mv "$dir" "$prev" || _origin_abort "No he podido apartar el certificado anterior. No he cambiado nada."
+  fi
+  if ! mv "$ORIGIN_TMP" "$dir"; then
+    [[ -n "$prev" ]] && mv "$prev" "$dir"
+    _origin_abort "No he podido poner el certificado en %s. No he cambiado nada." "$dir"
+  fi
+  ORIGIN_TMP=""
+  if ! render_nginx "$name"; then
+    rm -rf "$dir"
+    [[ -n "$prev" ]] && mv "$prev" "$dir"
+    die "nginx ha rechazado el certificado. He dejado todo como estaba."
+  fi
+  [[ -n "$prev" ]] && rm -rf "$prev"
+  ok "HTTPS con certificado de origen de Cloudflare en %s" "${names[*]}"
+  info "Caduca el %s. Clave en %s, sólo para root." \
+    "$(openssl x509 -enddate -noout -in "$(origin_cert "$name")" 2>/dev/null | cut -d= -f2)" "$(origin_key "$name")"
+
+  # 5 · el Let's Encrypt de antes ya no lo sirve nadie. Si se quedara, certbot
+  # lo seguiría renovando cada dos meses para nada —y el día que la validación
+  # deje de funcionar, el temporizador fallaría por un certificado que no se
+  # usa—. Se borra con certbot, que es quien sabe borrarlo entero.
+  # Y sólo si el vhost que acaba de aceptar nginx lee de verdad la clave de
+  # origen: borrar el Let's Encrypt con el vhost apuntándole todavía dejaría a
+  # nginx sin arrancar en la próxima recarga, el servidor entero.
+  if [[ -f "$LE_RENEWAL_DIR/$A_DOMAIN.conf" ]] && has_origin "$name" \
+     && [[ "$(grep -cF "ssl_certificate_key $(origin_key "$name");" "$(nginx_file "$name")" 2>/dev/null)" != 0 ]]; then
+    if _certbot delete --cert-name "$A_DOMAIN" --non-interactive >/dev/null; then
+      ok "Certificado de Let's Encrypt de %s retirado: certbot ya no lo renovará" "$A_DOMAIN"
+    else
+      warn "No he podido retirar el certificado de Let's Encrypt de %s; bórralo con:  certbot delete --cert-name %s" "$A_DOMAIN" "$A_DOMAIN"
+    fi
+  fi
+  info "En Cloudflare deja el modo SSL/TLS en 'Full (strict)'"
+  logline "ssl-origin $name $src ${names[*]}"
+}
+
+# Lo que dijo Cloudflare cuando no dio el certificado, traducido a qué hacer.
+# El caso que importa es el del permiso: el token que pide 'orbit cf-token' es
+# el de la plantilla «Edit zone DNS», que no puede pedir certificados.
+_ssl_origin_api_error() { # _ssl_origin_api_error <código HTTP> <respuesta.json>
+  local code="$1" f="$2" msgs=""
+  [[ -s "$f" ]] && msgs="$(jq -r '[.errors[]? | "\(.code): \(.message)"] | join("; ")' "$f" 2>/dev/null || true)"
+  case "$code" in
+    401|403)
+      err "El token de Cloudflare no tiene permiso para pedir certificados de origen."
+      [[ -z "$msgs" ]] || info "Cloudflare dice: %s" "$msgs"
+      info "Añádeselo en https://dash.cloudflare.com/profile/api-tokens → «Edit» en el token:"
+      info "  Zone → SSL and Certificates → Edit   (en las mismas zonas que ya tiene)"
+      info "El token no cambia al editarlo: no hay que volver a guardarlo." ;;
+    000)
+      err "No he podido hablar con la API de Cloudflare." ;;
+    *)
+      err "Cloudflare no ha dado el certificado (HTTP %s)." "$code"
+      [[ -z "$msgs" ]] || info "Cloudflare dice: %s" "$msgs" ;;
+  esac
+  return 0
 }
 
 cmd_cf_token() {
@@ -9971,6 +10507,7 @@ cmd_cf_token() {
   Create the token at:  ${B}https://dash.cloudflare.com/profile/api-tokens${R}
     · Template:    "Edit zone DNS"
     · Permissions: Zone → DNS → Edit
+                   Zone → SSL and Certificates → Edit  ${D}(only for 'orbit ssl --origin')${R}
     · Zones:       all of yours (or the ones you want to use here)
 
 EOF
@@ -9979,6 +10516,7 @@ EOF
   Crea el token en:  ${B}https://dash.cloudflare.com/profile/api-tokens${R}
     · Plantilla: "Edit zone DNS"
     · Permisos:  Zone → DNS → Edit
+                 Zone → SSL and Certificates → Edit  ${D}(sólo para 'orbit ssl --origin')${R}
     · Zonas:     todas las tuyas (o las que quieras usar aquí)
 
 EOF
@@ -9986,8 +10524,43 @@ EOF
   esac
   local tok; ask tok "Pega el token" ""
   [[ -z "$tok" ]] && { warn "Cancelado"; return 0; }
-  printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$ETC_DIR/cloudflare.ini"
-  chmod 0600 "$ETC_DIR/cloudflare.ini"
+  # Acaba en un fichero que lee certbot: un espacio o un salto de línea pegados
+  # sin querer lo romperían sin que nadie se enterase hasta la renovación.
+  [[ "$tok" =~ ^[A-Za-z0-9_-]+$ ]] \
+    || die "Eso no parece un token de Cloudflare: sólo lleva letras, números, '-' y '_'."
+
+  # Se escribe a un fichero nuevo con umask 077 y se mueve encima: con
+  # 'printf > fichero; chmod' el token existía un instante legible por todos
+  # —o para siempre, si el fichero ya existía con otros permisos, porque '>'
+  # conserva los del fichero—.
+  local f="$ETC_DIR/cloudflare.ini" new out code st
+  new="$(umask 077; mktemp "$ETC_DIR/.cloudflare.ini.XXXXXX")"
+  printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$new"
+  chmod 0600 "$new"
+
+  # Y se prueba antes de guardarlo. Un token mal copiado no fallaba al
+  # guardarlo ni al emitir el primer certificado por HTTP: fallaba en la
+  # primera renovación por DNS, dos meses después.
+  out="$(mktemp)"
+  code="$(CF_INI="$new" _cf_api GET /user/tokens/verify "$out")"
+  # jq es opcional en el resto de Orbit, y guardar el token no puede pasar a
+  # necesitarlo: sin él se mira el campo a mano. Sin esto, un token bueno se
+  # rechazaba con «HTTP 200».
+  if command -v jq >/dev/null 2>&1; then
+    st="$(jq -r '.result.status // empty' "$out" 2>/dev/null || true)"
+  else
+    st="$(grep -o '"status" *: *"[a-z_]*"' "$out" 2>/dev/null | head -1 | sed 's/.*"\([a-z_]*\)"$/\1/' || true)"
+  fi
+  rm -f "$out"
+  if [[ "$code" == 200 && "$st" == active ]]; then
+    ok "Cloudflare reconoce el token y está activo"
+  elif [[ "$code" == 000 ]]; then
+    warn "No he podido preguntarle a Cloudflare si el token vale. Lo guardo igualmente."
+  else
+    rm -f "$new"
+    die "Cloudflare no da ese token por bueno (HTTP %s%s). No lo he guardado." "$code" "${st:+, $st}"
+  fi
+  mv -f "$new" "$f"
   ok "Token guardado en %s/cloudflare.ini (sólo root puede leerlo)" "$ETC_DIR"
 }
 
@@ -10313,6 +10886,7 @@ EOF
 #   ├── app.conf          la configuración de la app
 #   ├── redirects.list    sus redirecciones, si tiene
 #   ├── database.sql.gz   volcado de PostgreSQL, si tiene
+#   ├── tls/              el certificado de origen de Cloudflare y su clave, si tiene
 #   └── shared/           el .env, la página de mantenimiento y las subidas
 #
 # El fichero se crea con permisos 0600 y dueño root, porque lleva secretos.
@@ -10382,7 +10956,7 @@ _dump_ok() { # _dump_ok <fichero.sql.gz>
 _backup_one() { # _backup_one <app> -> imprime la ruta del fichero
   local name="$1"
   load_app "$name"
-  local out tmp db con_db="no" con_redir="no" con_env="no" n_shared=0
+  local out tmp db con_db="no" con_redir="no" con_env="no" con_origen="no" n_shared=0
   out="$(backup_file "$name")"
   tmp="$(mktemp -d)"
   db="$(app_db "$name")"
@@ -10418,6 +10992,21 @@ _backup_one() { # _backup_one <app> -> imprime la ruta del fichero
     [[ -f "$tmp/shared/.env" ]] && con_env="si"
     # Cuántos ficheros van dentro, para que 'verify' pueda notar que faltan.
     n_shared="$(find "$tmp/shared" -type f 2>/dev/null | wc -l)"
+  fi
+
+  # El certificado de origen sí va dentro, y su clave con él (§6.5). Al
+  # contrario que el de Let's Encrypt —que se vuelve a emitir con un comando—,
+  # uno de origen nuevo pide un token con permiso de certificados, que no viaja
+  # en la copia (§17.1); y mientras no lo haya, Cloudflare en «Full (strict)»
+  # contesta 526 a cada visita del servidor restaurado. La copia ya es 0600 y
+  # ya lleva el .env: la clave no cambia la clase de secreto que hay dentro.
+  if has_origin "$name"; then
+    install -d -m 0700 "$tmp/tls"
+    install -m 0644 "$(origin_cert "$name")" "$tmp/tls/cert.pem"
+    install -m 0600 "$(origin_key "$name")"  "$tmp/tls/key.pem"
+    [[ -f "$(origin_dir "$name")/origin.info" ]] \
+      && install -m 0644 "$(origin_dir "$name")/origin.info" "$tmp/tls/origin.info"
+    con_origen="si"
   fi
 
   if _db_exists "$db"; then
@@ -10460,6 +11049,7 @@ base_de_datos=$con_db
 redirecciones=$con_redir
 entorno=$con_env
 ficheros_shared=$n_shared
+certificado_origen=$con_origen
 # El código NO está aquí: está en el repositorio de arriba. Para volver a
 # levantar esta app:  orbit restore <este fichero>  y después  orbit deploy $name
 EOF
@@ -10568,6 +11158,10 @@ _verify_one() { # _verify_one <fichero.tar.gz> -> 0 si sirve
       VERIFY_MSG="$(t "el volcado de la base está incompleto o corrupto")"
       return 1
     fi
+  fi
+  if [[ "$(sed -n 's/^certificado_origen=//p' "$tmp/manifest" | head -1)" == "si" ]] \
+     && [[ ! -f "$tmp/tls/cert.pem" || ! -f "$tmp/tls/key.pem" ]]; then
+    rm -rf "$tmp"; VERIFY_MSG="$(t "dice llevar el certificado de origen y no está")"; return 1
   fi
   if [[ "$dice_env" == "si" && ! -f "$tmp/shared/.env" ]]; then
     rm -rf "$tmp"; VERIFY_MSG="$(t "dice llevar .env y no está — es lo único irrecuperable")"; return 1
@@ -11001,6 +11595,25 @@ _restore_one() { # _restore_one <fichero> [--sin-siguiente-paso]
     ok "Datos compartidos restaurados (.env, subidas, página de mantenimiento)"
   fi
 
+  # El certificado de origen, con los mismos permisos que al pedirlo. Se
+  # comprueba que sean pareja porque la copia es un fichero del que no tiene
+  # por qué fiarse nadie (§17.4b): una clave cambiada dejaría a nginx sin
+  # arrancar en el siguiente despliegue, que es cuando se lee.
+  if [[ -f "$tmp/tls/cert.pem" && -f "$tmp/tls/key.pem" ]] \
+     && [[ ! -L "$tmp/tls/cert.pem" && ! -L "$tmp/tls/key.pem" && ! -L "$tmp/tls/origin.info" ]]; then
+    if _cert_key_match "$tmp/tls/cert.pem" "$tmp/tls/key.pem"; then
+      local od; od="$(origin_dir "$name")"
+      install -d -m 0755 "$ORIGIN_CERT_DIR"
+      rm -rf "$od"; install -d -m 0700 "$od"
+      install -m 0644 "$tmp/tls/cert.pem" "$od/cert.pem"
+      install -m 0600 "$tmp/tls/key.pem"  "$od/key.pem"
+      [[ -f "$tmp/tls/origin.info" ]] && install -m 0644 "$tmp/tls/origin.info" "$od/origin.info"
+      ok "Certificado de origen de Cloudflare restaurado"
+    else
+      warn "El certificado de origen de la copia no casa con su clave: no lo restauro."
+    fi
+  fi
+
   [[ -f "$tmp/database.sql.gz" ]] && _restore_db "$name" "$tmp/database.sql.gz"
   rm -rf "$tmp"
 
@@ -11329,7 +11942,7 @@ cmd_list() {
     # printf -v y no "$(printf …)": rellenar a nueve columnas no merece un fork.
     local pad state; printf -v pad '%-9s' "$word"; state="$color$pad$R"
     local ssl="$SSL_NO"
-    has_cert "$A_DOMAIN" && ssl="$SSL_SI"
+    app_has_cert && ssl="$SSL_SI"
     local lk=""; [[ -f "$APPS_CONF/$n.lock" ]] && lk="$W_LOCKED"
     printf "  %-16s %-8s %-30s %-7s %b %b%b\n" "$A_NAME" "$A_TYPE" "$A_DOMAIN" "${A_PORT:--}" "$state" "$ssl" "$lk"
   done
@@ -11360,6 +11973,11 @@ cmd_info() {
   printf "%s\n" "$(t "  Build         %s" "${A_BUILD:--}")"
   printf "%s\n" "$(t "  Start         %s" "${A_START:--}")"
   printf "%s\n" "$(t "  Puerto        %s" "${A_PORT:--}")"
+  case "$(app_cert_type)" in
+    origin)      printf "%s\n" "$(t "  HTTPS         origen de Cloudflare, %s días (sólo vale detrás del proxy)" "$(app_cert_days)")" ;;
+    letsencrypt) printf "%s\n" "$(t "  HTTPS         Let's Encrypt, %s días" "$(app_cert_days)")" ;;
+    *)           printf "%s\n" "$(t "  HTTPS         sin certificado")" ;;
+  esac
   printf "%s\n" "$(t "  Ruta          %s" "$(app_dir "$name")")"
   printf "%s\n" "$(t "  Último deploy %s" "${A_LASTDEPLOY:-$(t "nunca")}")"
   printf "%s\n" "$(t "  Releases      %s" "$(releases_desc "$(app_dir "$name")" | wc -l)")"
@@ -12935,19 +13553,23 @@ _watch_maint() {
 }
 
 _watch_certs() {
-  local n left now
+  local n left now como
   printf -v now '%(%s)T' -1
   for n in $(app_names); do
     load_app "$n"
     [[ -n "$A_DOMAIN" ]] || continue
     # Sin "$(cert_days_left …)": dentro de un subshell lo leído se perdería, y
     # las métricas de Prometheus de esta misma pasada tendrían que volver a
-    # abrir cada certificado.
+    # abrir cada certificado. _cert_end_load ya lee el de origen si es el que
+    # sirve la app.
     _cert_end_load "$A_DOMAIN"
     [[ -n "${CERT_END[$A_DOMAIN]}" ]] || continue
     left=$(( (${CERT_END[$A_DOMAIN]} - now) / 86400 ))
+    # El de origen no lo renueva certbot: decir «orbit ssl» a secas mandaría a
+    # cambiarlo por uno de Let's Encrypt, que no es lo que se pidió.
+    como="orbit ssl $n"; has_origin "$n" && como="orbit ssl $n --origin"
     _watch_warn "cert:$A_DOMAIN" "$(( left < WATCH_CERT_DAYS ))" crit \
-      "$(t "El certificado de %s caduca en %s días. Renueva con 'orbit ssl %s'." "$A_DOMAIN" "$left" "$n")" \
+      "$(t "El certificado de %s caduca en %s días. Renueva con '%s'." "$A_DOMAIN" "$left" "$como")" \
       "$(t "El certificado de %s vuelve a estar vigente (%s días)" "$A_DOMAIN" "$left")"
   done
 }
@@ -14625,7 +15247,23 @@ cmd_domain() {
   _domain_list A_ALIASES "$A_ALIASES"
   save_app
   render_nginx "$name" && ok "Dominios actualizados"
-  confirm "¿Emitir/renovar el certificado para %s?" y "$A_DOMAIN" && cmd_ssl "$name"
+  # Con un certificado de origen, 'orbit ssl' a secas lo cambiaría por uno de
+  # Let's Encrypt. Lo que hace falta es otro de origen que cubra los nombres
+  # nuevos: el de ahora sólo cubre los de antes, y Cloudflare en «Full
+  # (strict)» rechaza con un 526 cualquier nombre que no esté dentro.
+  #
+  # Y fuera del '&&': detrás de uno, bash apaga errexit dentro de cmd_ssl y lo
+  # que fallara a mitad seguiría hasta anunciar un certificado que no está
+  # (ARCHITECTURE §20.7). El patrón es el único que lo mantiene encendido.
+  local -a sslargs=("$name"); local rc=0
+  if has_origin "$name"; then
+    confirm "¿Pedir un certificado de origen nuevo para %s?" y "$A_DOMAIN" || return 0
+    sslargs+=(--origin)
+  else
+    confirm "¿Emitir/renovar el certificado para %s?" y "$A_DOMAIN" || return 0
+  fi
+  set +e; ( set -Eeuo pipefail; cmd_ssl "${sslargs[@]}" ); rc=$?; set -e
+  return "$rc"
 }
 
 # Dos confirmaciones distintas porque son dos daños distintos: quitar la app de
@@ -14684,7 +15322,23 @@ cmd_remove() {
   # puede significar «y además llévate el .env y las subidas».
   if [[ "$purge" == "yes" ]] || { [[ "$yes" != "yes" ]] && confirm "¿Borrar también %s (código y releases)?" n "$(app_dir "$name")"; }; then
     rm -rf "$(app_dir "$name")"
+    # El certificado de origen es de esta app y de nadie más (§6.5), y su clave
+    # no puede quedarse huérfana en el disco. El de Let's Encrypt no se toca:
+    # va por dominio y certbot lo gestiona, como siempre.
+    if [[ -d "$(origin_dir "$name")" ]]; then
+      rm -rf "$(origin_dir "$name")"
+      ok "Certificado de origen de Cloudflare borrado"
+    fi
     purge="yes"
+  elif [[ -d "$(origin_dir "$name")" ]]; then
+    # Sin --purge no se borra, pero tampoco se puede quedar donde está: va por
+    # nombre de app, y una app nueva con el mismo nombre y otro dominio lo
+    # serviría al instante —HTTPS en verde en 'list' y un 526 en Cloudflare,
+    # porque no cubre sus nombres—. Se aparta con un nombre que ninguna app
+    # puede tener, y se dice dónde.
+    local apartado; apartado="$(_origin_aside "$name" eliminada)"
+    mv "$(origin_dir "$name")" "$apartado"
+    info "El certificado de origen se queda en %s; bórralo cuando quieras." "$apartado"
   else
     info "Los ficheros siguen en %s. Bórralos con 'rm -rf' o repite con --purge." "$(app_dir "$name")"
   fi
@@ -14884,6 +15538,114 @@ cmd_status() {
     _lock_read "$n" && printf "    ${YEL}%s${R}\n" "$(_lock_desc)"
   done
   echo
+}
+
+# ── El certificado, mirado sin salir de la máquina ─────────────────────────
+#
+# Doctor se ejecuta a menudo —lo llama Orbit Desktop cada vez que abre un
+# servidor—, y las dos preguntas que importan de un certificado son caras de
+# contestar de verdad: si la renovación saldría bien hoy (un 'certbot --dry-run'
+# contra el staging de Let's Encrypt, con su límite de frecuencia) y si el
+# dominio está detrás del proxy de Cloudflare (una llamada a su API). Las dos
+# tienen una versión barata que acierta en los fallos que de verdad ocurren, y
+# la cara se pide a mano: 'orbit ssl <app> --dry-run'.
+
+# Los rangos de Cloudflare que ya escribió el instalador para las IPs reales
+# (§6). Están en el disco y se refrescan con 'orbit cf-update': no hay que
+# preguntar a nadie para saber si una IP es suya.
+CF_REALIP_CONF="${CF_REALIP_CONF:-/etc/nginx/snippets/orbit-cloudflare.conf}"
+
+_ip4_int() { # _ip4_int <a.b.c.d> <variable>
+  local -a o; IFS=. read -ra o <<<"$1"
+  printf -v "$2" '%s' "$(( (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3] ))"
+}
+
+# ¿Es esta IPv4 de Cloudflare? 0 sí, 1 no. Sin la lista no se puede saber, y
+# entonces tampoco se acusa: devuelve 0, porque «no lo sé» no es «no».
+_ip4_in_cf() { # _ip4_in_cf <a.b.c.d>
+  [[ -r "$CF_REALIP_CONF" ]] || return 0
+  local ip net bits l n m
+  _ip4_int "$1" ip
+  while IFS= read -r l <&3; do
+    [[ "$l" =~ ^set_real_ip_from[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/([0-9]+)\; ]] || continue
+    _ip4_int "${BASH_REMATCH[1]}" net; bits="${BASH_REMATCH[2]}"
+    m=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    n=$(( ip & m ))
+    (( n == (net & m) )) && return 0
+  done 3< "$CF_REALIP_CONF"
+  return 1
+}
+
+# Lo que hará fallar la próxima renovación de Let's Encrypt, leído de la
+# configuración que certbot va a usar: vacío si no se ve nada. No sustituye al
+# dry-run —no sabe si el token sigue vivo en Cloudflare— pero ve los tres
+# fallos que se producen en la máquina y que nadie nota en 60 días: que esa
+# configuración no exista, que el fichero del token se haya borrado o que la
+# carpeta del reto ya no esté.
+_le_renewal_problem() { # _le_renewal_problem <dominio>
+  local f="$LE_RENEWAL_DIR/$1.conf" auth cred wr
+  if [[ ! -f "$f" ]]; then
+    t "certbot no tiene configuración para renovarlo (%s)" "$f"; return 0
+  fi
+  auth="$(sed -n '/^authenticator[[:space:]]*=/{s/^[^=]*=[[:space:]]*//p;q}' "$f")"
+  case "$auth" in
+    dns-cloudflare)
+      cred="$(sed -n '/^dns_cloudflare_credentials[[:space:]]*=/{s/^[^=]*=[[:space:]]*//p;q}' "$f")"
+      if [[ -z "$cred" || ! -f "$cred" ]]; then
+        t "usa el token de Cloudflare de %s, y ese fichero no existe" "${cred:-?}"
+      elif [[ "$(grep -cE '^[[:space:]]*dns_cloudflare_api_(token|key)[[:space:]]*=[[:space:]]*[^[:space:]]' "$cred" 2>/dev/null)" == 0 ]]; then
+        t "el fichero %s no lleva ningún token" "$cred"
+      fi ;;
+    webroot)
+      wr="$(sed -n '/^webroot_path[[:space:]]*=/{s/^[^=]*=[[:space:]]*//p;q}' "$f")"; wr="${wr%%,*}"
+      [[ -z "$wr" || -d "$wr" ]] || t "valida por HTTP en %s, y esa carpeta no existe" "$wr" ;;
+  esac
+  return 0
+}
+
+_doctor_cert() { # _doctor_cert <app> <ip que dio dig, o vacío> — con la app cargada
+  local n="$1" ip="$2" days p
+  days="$(app_cert_days)"
+  if has_origin "$n"; then
+    if [[ -n "$days" ]] && (( days < WATCH_CERT_DAYS )); then
+      _doc warn "cert:$A_DOMAIN" "$(t "El certificado de %s caduca en %s días" "$A_DOMAIN" "$days")" \
+        "$(t "pide otro con:  orbit ssl %s --origin" "$n")"
+    elif [[ -n "$days" ]]; then
+      _doc info "cert:$A_DOMAIN" "$(t "Certificado de origen de Cloudflare de %s válido %s días más" "$A_DOMAIN" "$days")"
+    fi
+    # Si cambiaron los dominios y no se pidió otro, el de ahora no cubre los
+    # nuevos y Cloudflare en «Full (strict)» contesta 526. Se mira en local:
+    # un openssl por nombre.
+    local -a names; _ssl_names names
+    local d falta=""
+    for d in "${names[@]}"; do
+      _cert_covers "$(origin_cert "$n")" "$d" || falta="${falta:+$falta }$d"
+    done
+    [[ -z "$falta" ]] || _doc error "origin-names:$A_DOMAIN" \
+      "$(t "El certificado de origen de %s no cubre %s: Cloudflare contestará 526" "$A_DOMAIN" "$falta")" \
+      "$(t "pide otro con:  orbit ssl %s --origin" "$n")"
+    # Un certificado de origen sólo lo acepta Cloudflare. Si el dominio apunta
+    # aquí sin el proxy, cada visitante ve un error de certificado. Sólo se
+    # acusa con una IPv4 de verdad: 'dig +short' devuelve primero el nombre de
+    # un CNAME, y con eso no se puede decir nada.
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! _ip4_in_cf "$ip"; then
+      _doc error "origin-proxy:$A_DOMAIN" \
+        "$(t "%s tiene un certificado de origen de Cloudflare y resuelve a %s, que no es de Cloudflare: los visitantes ven un error de certificado" "$A_DOMAIN" "$ip")" \
+        "$(t "activa el proxy (nube naranja) en Cloudflare, o vuelve a Let's Encrypt:  orbit ssl %s" "$n")"
+    fi
+    return 0
+  fi
+  [[ -n "$days" ]] || return 0
+  if (( days < WATCH_CERT_DAYS )); then
+    _doc warn "cert:$A_DOMAIN" "$(t "El certificado de %s caduca en %s días" "$A_DOMAIN" "$days")" \
+      "$(t "renuévalo con:  orbit ssl %s" "$n")"
+  else
+    _doc info "cert:$A_DOMAIN" "$(t "Certificado de %s válido %s días más" "$A_DOMAIN" "$days")"
+  fi
+  p="$(_le_renewal_problem "$A_DOMAIN")"
+  [[ -z "$p" ]] || _doc warn "renew:$A_DOMAIN" "$(t "La renovación de %s va a fallar: %s" "$A_DOMAIN" "$p")" \
+    "$(t "compruébalo de verdad con:  orbit ssl %s --dry-run" "$n")"
+  return 0
 }
 
 # El diagnóstico se recoge primero y se pinta después. Antes cada comprobación
@@ -15460,15 +16222,7 @@ _doctor_collect() {
     else
       _doc ok "dns:$A_DOMAIN" "$(t "%s → %s (con el proxy de Cloudflare verás una IP suya, es normal)" "$A_DOMAIN" "$ip")"
     fi
-    days="$(cert_days_left "$A_DOMAIN")"
-    if [[ -n "$days" ]]; then
-      if (( days < WATCH_CERT_DAYS )); then
-        _doc warn "cert:$A_DOMAIN" "$(t "El certificado de %s caduca en %s días" "$A_DOMAIN" "$days")" \
-          "$(t "renuévalo con:  orbit ssl %s" "$n")"
-      else
-        _doc info "cert:$A_DOMAIN" "$(t "Certificado de %s válido %s días más" "$A_DOMAIN" "$days")"
-      fi
-    fi
+    _doctor_cert "$n" "$ip"
   done
 }
 
@@ -16180,6 +16934,8 @@ cat <<EOF
 
   ${B}Infrastructure${R}
     ssl [app]               Let's Encrypt certificate
+    ssl <app> --dry-run     Test today the renewal that will run in two months
+    ssl <app> --origin      Cloudflare origin certificate (15 years, behind the proxy)
     db create|list|backup|shell
     backup [app]|--all|list
                             Copy configuration, .env, uploads and database
@@ -16284,6 +17040,8 @@ cat <<EOF
 
   ${B}Infraestructura${R}
     ssl [app]               Certificado Let's Encrypt
+    ssl <app> --dry-run     Probar hoy la renovación de dentro de dos meses
+    ssl <app> --origin      Certificado de origen de Cloudflare (15 años, tras el proxy)
     db create|list|backup|shell
     backup [app]|--all|list
                             Copiar configuración, .env, subidas y base de datos
@@ -17023,7 +17781,7 @@ _i18n_en() {
     ["Memoria recuperada: %s%% disponible"]="Memory recovered: %s%% available"
     ["«%s» lleva %s min en mantenimiento y responde 503. Quítalo con 'orbit maintenance off %s'."]="«%s» has been in maintenance for %s min and answers 503. Take it out with 'orbit maintenance off %s'."
     ["«%s» ha salido de mantenimiento"]="«%s» is out of maintenance"
-    ["El certificado de %s caduca en %s días. Renueva con 'orbit ssl %s'."]="The certificate for %s expires in %s days. Renew it with 'orbit ssl %s'."
+    ["El certificado de %s caduca en %s días. Renueva con '%s'."]="The certificate for %s expires in %s days. Renew it with '%s'."
     ["El certificado de %s vuelve a estar vigente (%s días)"]="The certificate for %s is valid again (%s days)"
     ["Vigilancia"]="Watch"
     ["correcto"]="fine"
@@ -17573,6 +18331,94 @@ _i18n_en() {
     ["compruébalo con:  orbit github status"]="check it with:  orbit github status"
     ["«%s» está %s"]="«%s» is %s"
     ["se levanta con:  orbit unlock %s"]="lift it with:  orbit unlock %s"
+    ["«%s» necesita un fichero detrás."]="«%s» needs a file after it."
+    ["  uso: orbit ssl <app> [--dry-run]\\n       orbit ssl <app> --origin [--rsa] [--force]\\n       orbit ssl <app> --origin-cert <fichero> --origin-key <fichero>\\n       Sin opciones, Let's Encrypt: por DNS si hay token de Cloudflare, y si no por HTTP.\\n       --dry-run   prueba la renovación contra el entorno de pruebas; no cambia nada\\n       --origin    certificado de origen de Cloudflare (15 años, sólo vale detrás del proxy)\\n"]="  usage: orbit ssl <app> [--dry-run]\\n       orbit ssl <app> --origin [--rsa] [--force]\\n       orbit ssl <app> --origin-cert <file> --origin-key <file>\\n       With no options, Let's Encrypt: over DNS if there is a Cloudflare token, otherwise over HTTP.\\n       --dry-run   test the renewal against the staging environment; changes nothing\\n       --origin    Cloudflare origin certificate (15 years, only valid behind the proxy)\\n"
+    ["orbit ssl: no entiendo «%s». Mira 'orbit ssl --help'."]="orbit ssl: I don't understand «%s». See 'orbit ssl --help'."
+    ["orbit ssl: sobra «%s»."]="orbit ssl: «%s» is one argument too many."
+    ["--rsa y --force son de los certificados de origen: van con --origin."]="--rsa and --force belong to origin certificates: they go with --origin."
+    ["--dry-run prueba una renovación de Let's Encrypt; un certificado de origen no se renueva."]="--dry-run tests a Let's Encrypt renewal; an origin certificate is not renewed."
+    ["Hacen falta los dos: --origin-cert <fichero> y --origin-key <fichero>."]="Both are needed: --origin-cert <file> and --origin-key <file>."
+    ["«%s» es un comodín, y Let's Encrypt sólo emite comodines validando por DNS."]="«%s» is a wildcard, and Let's Encrypt only issues wildcards validating over DNS."
+    ["Guarda el token de Cloudflare con 'orbit cf-token' y repite."]="Store the Cloudflare token with 'orbit cf-token' and try again."
+    ["«%s» usa un certificado de origen de Cloudflare, válido %s días más."]="«%s» uses a Cloudflare origin certificate, valid for %s more days."
+    ["¿Cambiarlo por uno de Let's Encrypt?"]="Replace it with a Let's Encrypt one?"
+    ["Certificado de origen de Cloudflare retirado"]="Cloudflare origin certificate retired"
+    ["Prueba de renovación para %s"]="Renewal test for %s"
+    ["«%s» usa un certificado de origen de Cloudflare: no lo renueva certbot, y le quedan %s días."]="«%s» uses a Cloudflare origin certificate: certbot does not renew it, and it has %s days left."
+    ["Contra el entorno de pruebas de Let's Encrypt: no se guarda ningún certificado ni se toca nginx."]="Against the Let's Encrypt staging environment: no certificate is saved and nginx is not touched."
+    ["certbot renovará por: %s"]="certbot will renew through: %s"
+    ["El certificado no cubre %s: emítelo otra vez con 'orbit ssl %s'."]="The certificate does not cover %s: issue it again with 'orbit ssl %s'."
+    ["Todavía no hay certificado: pruebo la emisión, por %s."]="There is no certificate yet: testing the issuance, through %s."
+    ["La prueba ha salido bien: Let's Encrypt validaría %s hoy."]="The test went well: Let's Encrypt would validate %s today."
+    ["La prueba ha fallado: así fallará también la renovación de verdad."]="The test failed: the real renewal will fail the same way."
+    ["El detalle está en /var/log/letsencrypt/letsencrypt.log"]="The details are in /var/log/letsencrypt/letsencrypt.log"
+    ["Certificado de origen de Cloudflare para %s"]="Cloudflare origin certificate for %s"
+    ["Para pedirlo hace falta el token de Cloudflare, con el permiso de certificados."]="Requesting it needs the Cloudflare token, with the certificates permission."
+    ["Guárdalo con 'orbit cf-token', o sube uno hecho en el panel con --origin-cert y --origin-key."]="Store it with 'orbit cf-token', or upload one made in the dashboard with --origin-cert and --origin-key."
+    ["%s pasa por el proxy de Cloudflare"]="%s goes through the Cloudflare proxy"
+    ["%s NO pasa por el proxy (nube gris)"]="%s does NOT go through the proxy (grey cloud)"
+    ["%s no tiene registro en Cloudflare"]="%s has no record in Cloudflare"
+    ["No he podido comprobar si %s pasa por el proxy (¿está su zona en el alcance del token?)"]="I could not check whether %s goes through the proxy (is its zone within the token's scope?)"
+    ["Sin token de Cloudflare no puedo comprobar que %s pase por el proxy."]="Without a Cloudflare token I cannot check that %s goes through the proxy."
+    ["Con un certificado de origen, quien entre a %s sin pasar por Cloudflare vería un error de certificado."]="With an origin certificate, anyone reaching %s without going through Cloudflare would see a certificate error."
+    ["Activa el proxy (nube naranja) en el panel de DNS de Cloudflare y repite."]="Turn on the proxy (orange cloud) in Cloudflare's DNS dashboard and try again."
+    ["No he cambiado nada. Si lo quieres así de todos modos, repite con --force."]="I have changed nothing. If you want it this way anyway, repeat with --force."
+    ["Si %s no pasa por el proxy, los visitantes verán un error de certificado."]="If %s does not go through the proxy, visitors will see a certificate error."
+    ["No lo ha firmado Cloudflare: sirve igual, pero entonces no es un certificado de origen."]="Cloudflare did not sign it: it works all the same, but then it is not an origin certificate."
+    ["Pidiendo el certificado a Cloudflare (15 años)…"]="Requesting the certificate from Cloudflare (15 years)…"
+    ["nginx ha rechazado el certificado. He dejado todo como estaba."]="nginx rejected the certificate. I have left everything as it was."
+    ["HTTPS con certificado de origen de Cloudflare en %s"]="HTTPS with a Cloudflare origin certificate on %s"
+    ["Caduca el %s. Clave en %s, sólo para root."]="It expires on %s. Key in %s, root only."
+    ["Certificado de Let's Encrypt de %s retirado: certbot ya no lo renovará"]="Let's Encrypt certificate for %s retired: certbot will no longer renew it"
+    ["No he podido retirar el certificado de Let's Encrypt de %s; bórralo con:  certbot delete --cert-name %s"]="I could not retire the Let's Encrypt certificate for %s; delete it with:  certbot delete --cert-name %s"
+    ["El token de Cloudflare no tiene permiso para pedir certificados de origen."]="The Cloudflare token has no permission to request origin certificates."
+    ["Cloudflare dice: %s"]="Cloudflare says: %s"
+    ["Añádeselo en https://dash.cloudflare.com/profile/api-tokens → «Edit» en el token:"]="Add it at https://dash.cloudflare.com/profile/api-tokens → «Edit» on the token:"
+    ["  Zone → SSL and Certificates → Edit   (en las mismas zonas que ya tiene)"]="  Zone → SSL and Certificates → Edit   (on the same zones it already has)"
+    ["El token no cambia al editarlo: no hay que volver a guardarlo."]="The token does not change when edited: there is no need to store it again."
+    ["No he podido hablar con la API de Cloudflare."]="I could not talk to the Cloudflare API."
+    ["Cloudflare no ha dado el certificado (HTTP %s)."]="Cloudflare did not issue the certificate (HTTP %s)."
+    ["Eso no parece un token de Cloudflare: sólo lleva letras, números, '-' y '_'."]="That does not look like a Cloudflare token: it only has letters, digits, '-' and '_'."
+    ["Cloudflare reconoce el token y está activo"]="Cloudflare recognises the token and it is active"
+    ["No he podido preguntarle a Cloudflare si el token vale. Lo guardo igualmente."]="I could not ask Cloudflare whether the token is valid. Storing it anyway."
+    ["Cloudflare no da ese token por bueno (HTTP %s%s). No lo he guardado."]="Cloudflare does not accept that token (HTTP %s%s). I have not stored it."
+    ["dice llevar el certificado de origen y no está"]="it claims to carry the origin certificate and it is not there"
+    ["Certificado de origen de Cloudflare restaurado"]="Cloudflare origin certificate restored"
+    ["El certificado de origen de la copia no casa con su clave: no lo restauro."]="The origin certificate in the backup does not match its key: not restoring it."
+    ["  HTTPS         origen de Cloudflare, %s días (sólo vale detrás del proxy)"]="  HTTPS         Cloudflare origin, %s days (only valid behind the proxy)"
+    ["  HTTPS         Let's Encrypt, %s días"]="  HTTPS         Let's Encrypt, %s days"
+    ["  HTTPS         sin certificado"]="  HTTPS         no certificate"
+    ["¿Pedir un certificado de origen nuevo para %s?"]="Request a new origin certificate for %s?"
+    ["Certificado de origen de Cloudflare borrado"]="Cloudflare origin certificate deleted"
+    ["certbot no tiene configuración para renovarlo (%s)"]="certbot has no configuration to renew it (%s)"
+    ["usa el token de Cloudflare de %s, y ese fichero no existe"]="it uses the Cloudflare token in %s, and that file does not exist"
+    ["el fichero %s no lleva ningún token"]="the file %s has no token in it"
+    ["valida por HTTP en %s, y esa carpeta no existe"]="it validates over HTTP in %s, and that folder does not exist"
+    ["pide otro con:  orbit ssl %s --origin"]="request another with:  orbit ssl %s --origin"
+    ["Certificado de origen de Cloudflare de %s válido %s días más"]="Cloudflare origin certificate for %s valid for %s more days"
+    ["%s tiene un certificado de origen de Cloudflare y resuelve a %s, que no es de Cloudflare: los visitantes ven un error de certificado"]="%s has a Cloudflare origin certificate and resolves to %s, which is not Cloudflare's: visitors see a certificate error"
+    ["activa el proxy (nube naranja) en Cloudflare, o vuelve a Let's Encrypt:  orbit ssl %s"]="turn on the proxy (orange cloud) in Cloudflare, or go back to Let's Encrypt:  orbit ssl %s"
+    ["La renovación de %s va a fallar: %s"]="The renewal of %s is going to fail: %s"
+    ["compruébalo de verdad con:  orbit ssl %s --dry-run"]="check it for real with:  orbit ssl %s --dry-run"
+    ["«%s» no es un certificado PEM."]="«%s» is not a PEM certificate."
+    ["«%s» no es una clave privada PEM (¿lleva contraseña?)."]="«%s» is not a PEM private key (does it have a passphrase?)."
+    ["openssl no ha podido generar la clave."]="openssl could not generate the key."
+    ["openssl no ha podido generar la petición (CSR)."]="openssl could not generate the request (CSR)."
+    ["No he cambiado nada."]="I have changed nothing."
+    ["El certificado y la clave no son pareja."]="The certificate and the key do not match."
+    ["El certificado ya ha caducado."]="The certificate has already expired."
+    ["El certificado no cubre %s."]="The certificate does not cover %s."
+    ["No he podido apartar el certificado de origen. No he cambiado nada."]="I could not move the origin certificate aside. I have changed nothing."
+    ["La renovación no puede funcionar: %s"]="The renewal cannot work: %s"
+    ["Vuelve a emitirlo con 'orbit ssl %s': certbot guardará cómo renovarlo."]="Issue it again with 'orbit ssl %s': certbot will store how to renew it."
+    ["Para hablar con la API de Cloudflare hace falta jq:  sudo apt-get install -y jq"]="Talking to the Cloudflare API needs jq:  sudo apt-get install -y jq"
+    ["No puedo crear %s."]="I cannot create %s."
+    ["No puedo crear una carpeta en %s."]="I cannot create a folder in %s."
+    ["El certificado de origen se queda en %s; bórralo cuando quieras."]="The origin certificate stays in %s; delete it whenever you like."
+    ["El certificado de origen de %s no cubre %s: Cloudflare contestará 526"]="The origin certificate for %s does not cover %s: Cloudflare will answer 526"
+    ["No he podido preparar la petición."]="I could not prepare the request."
+    ["No he podido apartar el certificado anterior. No he cambiado nada."]="I could not move the previous certificate aside. I have changed nothing."
+    ["No he podido poner el certificado en %s. No he cambiado nada."]="I could not put the certificate in %s. I have changed nothing."
   )
 }
 
