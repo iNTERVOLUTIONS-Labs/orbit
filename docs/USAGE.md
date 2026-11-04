@@ -1104,6 +1104,8 @@ El fichero es `/srv/apps/mi-web/shared/.env`: sobrevive a los despliegues y se e
 
 **`PORT`, `HOST` y `NODE_ENV` los pone Orbit, y el `.env` no los cambia.** Una app con proceso arranca siempre con `PORT` = su puerto (`orbit port`), `HOST=127.0.0.1` y `NODE_ENV=production`, aunque el `.env` diga otra cosa. Un `PORT=3000` copiado de tu portátil hacía que la app escuchara donde nadie la buscaba —health check fallido y rollback en cada despliegue— y un `HOST=0.0.0.0` la publicaba en internet sin pasar por nginx. El build sí ve lo que pongas en el `.env`; el proceso, no. `orbit env set` te avisa si tocas una de las tres. Para cambiar el puerto: `orbit port mi-web 3010`.
 
+**Y `HOME`, `PATH`, `COREPACK_HOME` y `DENO_DIR` tampoco**, ni en el proceso ni en el build ni en `orbit exec`. Un `HOME` de otra máquina dejaba la unidad muriendo con «permission denied» en bucle, y un `PATH` ajeno la dejaba sin `node` o con otro. Las herramientas tienen que estar donde las ve la unidad (`/usr/local/bin` y compañía). `orbit env set` también avisa de éstas.
+
 ### Desde un script
 
 `get` imprime **solo el valor**, sin adornos, y devuelve un código distinto de cero si la clave no existe. Así se distingue «vacía» de «no está»:

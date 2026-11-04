@@ -87,6 +87,38 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.2] - 2026-11-04
+
+Lo que quedaba de la auditoría anterior y una pasada adversarial más sobre lo de 1.3.7–1.4.1. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código).
+
+### Seguridad — root seguía los enlaces que la app deja en `shared/` y `releases/`
+
+Las dos carpetas son del usuario de la app, y el despliegue creaba dentro —las rutas de `shared` del `orbit.json`, el `shared/storage` de Laravel y la propia release— con `install -d -o <app>` de root. **GNU install sigue un enlace y le cambia dueño y modo al destino** (comprobado con el de Ubuntu 24.04): una app comprometida que cambiara `shared/data` por un enlace a `/usr/local/bin` y borrara la hoja declarada recibía `/usr/local/bin` en el despliegue siguiente, o sea root. La release, plantando el enlace con su nombre —la hora— durante el fetch. Ahora lo crea el usuario de la app (`as_app mkdir`), así que seguir un enlace no da nada que no tuviera, y uno que puso quien administra sigue funcionando. Si ya hay algo con el nombre de la release nueva, el despliegue se para. Ver ARCHITECTURE §5.3.
+
+### Seguridad — una app PHP servida desde la raíz del repositorio publicaba `vendor/`
+
+El default-deny de 1.4.0 para la web estática con PHP en la raíz no llegaba a las apps `php` (ni `laravel`) cuyo docroot es la raíz de la app, que es lo que deja la detección sin `public/`, `web/` ni `html/`. Medido con nginx y php-fpm: `/vendor/…/eval-stdin.php` **se ejecutaba**, y `composer.json`, `composer.lock`, `README.md`, `lib/*.php`, `_x.php`, `x.php~` y los volcados salían con 200. `_php_root_denies` vale ahora para los tres tipos, también en un monorepo (la raíz de la app es su carpeta). Con `public/`, nada cambia.
+
+### Seguridad — `.env.example` se leía como root a través de un enlace del repositorio
+
+Sólo se miraba si el fichero era un enlace, no la carpeta: con un `cfg` del repositorio apuntando a `/etc/orbit` y `"example": "cfg/orbit.conf"`, root leía la configuración del servidor y ofrecía sus valores como valores por defecto del `.env` de la app. Ahora lo resuelto tiene que seguir dentro de la release.
+
+### Corregido — el `.env` podía cambiar el `HOME`, el `PATH`, `COREPACK_HOME` y `DENO_DIR`
+
+Lo de `PORT` en 1.4.1, con el resto de lo que fija Orbit. En la unidad, `EnvironmentFile=` gana a `Environment=` (comprobado con `systemd-run`): un `HOME=/home/ana` copiado del portátil devolvía el EACCES en bucle de §5.1, un `PATH` ajeno dejaba la unidad sin `node` o con otro, y `COREPACK_HOME`/`DENO_DIR` mandaban al servicio a buscar donde el build no dejó nada. Van ahora en la orden de arranque de la unidad, del puente y de las tareas de `cron`, y el build, `orbit exec` y el comando `release` apartan `HOME` y `PATH` antes de cargar el `.env` y los reponen después. `orbit env set` avisa si tocas una de las cuatro.
+
+### Corregido — un `kill -9` a mitad de despliegue dejaba una release a medias como destino de rollback
+
+La trampa de salida no corre con SIGKILL. La carpeta con medio build ocupaba un hueco de `KEEP_RELEASES` y `orbit rollback` la ofrecía. Ahora el despliegue deja un testigo junto al cerrojo (`/var/lib/orbit/locks/<app>.partial`) que sólo quita la trampa; el despliegue o el rollback siguientes borran la release que apunta —nunca la que sirve `current` ni la que ejecuta un puente— y `orbit doctor` la cuenta mientras tanto. Y el puente huérfano, que sólo recogía el camino del solape, se retira también por el clásico (app parada o `DEPLOY_OVERLAP="no"`) una vez la canónica responde; doctor también lo cuenta. Probado matando de verdad un despliegue a mitad de build.
+
+### Corregido — una tarea de `cron` con un salto de línea corría sólo su primera línea
+
+El registro iba una tarea por línea y el salto de la orden lo partía en dos: se escribía la unidad con la primera línea sola, sin su `timeout`, y la segunda salía como «no vale como nombre». La comprobación de «una línea» que había no podía dispararse nunca. Ahora la tarea se salta entera, diciendo por qué.
+
+### Corregido — `orbit rollback <app> ../../x` apuntaba `current` fuera de `releases/`
+
+El destino se comprobaba con `-d`, que acepta cualquier ruta. Ahora tiene que ser una de la lista.
+
 ## [1.4.1] - 2026-11-04
 
 Una auditoría del camino de despliegue, leída con la lista de trampas de CLAUDE.md delante. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código).
