@@ -1173,4 +1173,75 @@ JSON
     "$(grep -c '^CLAVE=' "$TMP/apps/conenv/shared/.env" 2>/dev/null || true)"
 fi
 
+section "Las rutas compartidas que el repo añade después también se enlazan"
+# A_SHARED se congelaba al crear la app: una ruta añadida luego al 'shared' del
+# orbit.json no se enlazaba nunca y lo que la app guardaba ahí se perdía en el
+# despliegue siguiente. Pasó en producción con una base de datos SQLite.
+if ! command -v jq >/dev/null; then
+  echo "  jq no está instalado: me salto las rutas compartidas del repo."
+else
+  SORIGIN="$TMP/shorigin"
+  git init -q -b main "$SORIGIN"
+  git -C "$SORIGIN" config user.email orbit@test
+  git -C "$SORIGIN" config user.name Orbit
+  printf 'hola\n' > "$SORIGIN/index.html"
+  printf '{ "type": "static", "outdir": "." }\n' > "$SORIGIN/orbit.json"
+  git -C "$SORIGIN" add -A; git -C "$SORIGIN" commit -qm "sin shared"
+  {
+    A_NAME="conshared"; A_REPO="$SORIGIN"; A_BRANCH="main"; A_DOMAIN="conshared.test"
+    A_ALIASES=""; A_TYPE="static"; A_PKG="pnpm"; A_BUILD=""; A_START=""
+    A_OUTDIR="."; A_SPA="no"; A_PORT=""; A_DOCROOT=""; A_PHP="yes"; A_SHARED="logs"
+    A_ENV_FILE=""; A_ENV_SPEC=""
+    A_CREATED="2026-01-01T00:00:00+00:00"; A_LASTDEPLOY=""
+  }
+  save_app
+  _http_code() { printf '200'; }
+  run cmd_deploy conshared >"$TMP/sh1" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/sh1"
+  check "primer despliegue" "0" "$r"
+  printf '{ "type": "static", "outdir": ".", "shared": ["data", "logs"] }\n' > "$SORIGIN/orbit.json"
+  git -C "$SORIGIN" commit -qam "con shared"
+  sleep 1
+  run cmd_deploy conshared >"$TMP/sh2" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/sh2"
+  check "segundo despliegue" "0" "$r"
+  SBASE="$TMP/apps/conshared"
+  check "la ruta nueva es un enlace a shared/" "$SBASE/shared/data" "$(readlink "$SBASE/current/data")"
+  check "y la de antes sigue" "$SBASE/shared/logs" "$(readlink "$SBASE/current/logs")"
+  check "lo dice" "1" "$(grep -c 'ruta compartida nueva: data' "$TMP/sh2")"
+  A_SHARED=""; load_app conshared
+  check "la configuración la apunta" "logs data" "$A_SHARED"
+  sleep 1
+  git -C "$SORIGIN" commit -q --allow-empty -m "otra"
+  run cmd_deploy conshared >"$TMP/sh3" 2>&1
+  check "y la tercera vez ya no es nueva" "0" "$(grep -c 'ruta compartida nueva' "$TMP/sh3")"
+
+  section "rollback recarga php-fpm, igual que el despliegue"
+  # Sin la recarga, la caché de realpath de php-fpm sigue resolviendo 'current'
+  # a la release de la que se huye hasta 120 s.
+  ANTES="$(grep -c "^reload php${PHP_VER}-fpm$" "$SYSCTL_LOG")"
+  PRIMERA="$(releases_desc "$SBASE" | tail -1)"
+  run cmd_rollback conshared "$PRIMERA" >"$TMP/shrb" 2>&1; r=$?
+  check "revierte" "0" "$r"
+  check "y recarga php-fpm" "$((ANTES + 1))" "$(grep -c "^reload php${PHP_VER}-fpm$" "$SYSCTL_LOG")"
+
+  section "Dos despliegues de la misma app no corren a la vez"
+  # Un 'orbit deploy' a mano y el autodespliegue podían pisarse en la caché.
+  ACTUAL="$(readlink "$SBASE/current")"
+  mkdir -p "$DEPLOY_LOCK_DIR"
+  flock "$DEPLOY_LOCK_DIR/conshared.lock" sleep 4 &
+  LPID=$!
+  sleep 0.5
+  DEPLOY_LOCK_WAIT=1 run cmd_deploy conshared >"$TMP/lk1" 2>&1; r=$?
+  check "si el otro no termina a tiempo, falla" "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  check "diciendo por qué" "1" "$(grep -c 'sigue en curso' "$TMP/lk1")"
+  check "sin tocar producción" "$ACTUAL" "$(readlink "$SBASE/current")"
+  sleep 1
+  git -C "$SORIGIN" commit -q --allow-empty -m "espera"
+  DEPLOY_LOCK_WAIT=20 run cmd_deploy conshared >"$TMP/lk2" 2>&1; r=$?
+  check "si termina, espera y despliega" "0" "$r"
+  check "avisando de que espera" "1" "$(grep -c 'espero a que termine' "$TMP/lk2")"
+  wait "$LPID" 2>/dev/null
+fi
+
 report

@@ -103,6 +103,8 @@ queue_service()      { echo "$TMP/systemd/orbit-queue.service"; }
 # directorio del servidor.
 # shellcheck disable=SC2034  # la lee el 'orbit' cargado más arriba, no lib.sh
 QUEUE_LOCK_DIR="$TMP/locks"
+# shellcheck disable=SC2034  # ídem: el cerrojo de despliegue
+DEPLOY_LOCK_DIR="$TMP/locks"
 
 # 'orbit' activa errexit. En las pruebas queremos seguir ejecutando después de
 # un fallo esperado para poder contarlo, así que lo desactivamos a propósito.
