@@ -323,7 +323,7 @@ orbit exec mi-web sh -c 'echo "$DATABASE_URL"'    # lo que ve la app de verdad
 Dos causas concretas:
 
 - **Estabas ejecutando desde `cache/` en vez de desde `current/`.** El clon de git no tiene el `.env` enlazado ni los artefactos del build.
-- **Tu `.env` define `NODE_ENV=development`.** No sirve de nada: la unidad de systemd declara `EnvironmentFile` **antes** que `Environment=NODE_ENV=production`, así que gana la unidad. `orbit exec` se comporta igual, a propósito. Si necesitas otro valor, cámbialo en la unidad, no en el `.env`.
+- **Tu `.env` define `NODE_ENV=development`.** No sirve de nada: la unidad fija `NODE_ENV=production` en su orden de arranque, que es lo único que gana a un `EnvironmentFile` (lo mismo con `PORT`, `HOST`, `HOME`, `PATH`, `COREPACK_HOME` y `DENO_DIR`). `orbit exec` se comporta igual, a propósito. Si necesitas otro valor, cámbialo en la unidad, no en el `.env`.
 
 ---
 

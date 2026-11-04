@@ -458,6 +458,13 @@ check "dos releases"           "2" "$(releases_desc "$LBASE" | wc -l)"
 check "APP_KEY con valor" "1" "$(grep -c '^APP_KEY=base64:' "$LBASE/shared/.env")"
 check "y la misma que en el primer despliegue" "$PRIMERA_KEY" \
   "$(grep '^APP_KEY=' "$LBASE/shared/.env")"
+# shared/storage es de la app: si lo cambia por un enlace, root no lo sigue. Con
+# 'install -d -o <app>' de root, el destino cambiaba de modo —y con GNU install
+# de dueño—: un enlace a /usr/local/bin le daba /usr/local/bin a la app. Aquí no
+# se puede medir con un enlace —sin root, el rsync de la siembra le cambia el
+# modo igual, porque el destino es de quien corre la prueba—, así que se fija
+# quién lo crea, que es lo que decide qué puede tocar.
+check "shared/storage lo crea la app"  "1" "$(grep -c "^as_app mkdir -p '$LBASE/shared/storage'$" "$QUIEN_LOG" | sed 's/^[1-9][0-9]*$/1/')"
 
 section "Laravel: los pasos de artisan, y en qué orden"
 # El fixture apunta cada subcomando en artisan.log, así que aquí se comprueba
@@ -1168,6 +1175,29 @@ systemctl() {
 }
 render_nginx() { nginx_vhost "$1" > "$TMP/vhost-$1.conf"; }
 
+section "Un puente huérfano también se retira por el camino clásico"
+# Sólo lo recogía el camino del solape, y ése no se toma con la app parada ni
+# con DEPLOY_OVERLAP="no": el puente que dejó un SIGKILL seguía corriendo, con
+# su fichero en /etc/systemd/system, hasta reiniciar la máquina. Aquí la
+# canónica no está activa (is-active dice que no) y el despliegue va por el
+# camino clásico; con la canónica sana y nginx ya en su puerto, se retira.
+needs_svc() { [[ "$1" == "node" ]]; }
+journalctl() { :; }
+curl() { [[ "$*" == *http_code* ]] && printf 200; return 0; }
+echo "unidad huérfana" > "$(svc_next_unit fluida)"
+_doctor_collect >/dev/null 2>&1 || true
+check "doctor lo cuenta mientras tanto" "1" "$(printf '%s\n' "${DOC_ID[@]}" | grep -cx 'bridge-fluida')"
+: > "$SYSCTL_LOG"
+publish "clasico con huerfano"
+run cmd_deploy fluida >"$TMP/ov4" 2>&1; r=$?
+[[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/ov4"
+check "despliega"                 "0" "$r"
+check "por el camino clásico"     "1" "$(grep -c '^restart orbit-fluida$' "$SYSCTL_LOG")"
+check "y retira el huérfano"      "0" "$([[ -f "$(svc_next_unit fluida)" ]] && echo 1 || echo 0)"
+check "parándolo"                 "1" "$(grep -c '^stop orbit-fluida-next$' "$SYSCTL_LOG")"
+check "diciéndolo"                "1" "$(grep -c 'Quedaba una unidad puente' "$TMP/ov4")"
+unset -f curl; unset -f needs_svc; unset -f journalctl
+
 section "--progress sin --json no tiene sentido"
 JSON="no"; _ui_route
 run cmd_deploy web --progress >/dev/null 2>"$TMP/j6err"; r=$?
@@ -1458,7 +1488,8 @@ JSON
     { "name": "portal", "every": "5m", "command": "curl -fsS -H \"X-Token: $TOKEN\" 'https://x.test/api?a=cron&p=50%'" },
     { "name": "informe", "schedule": "Mon *-*-* 07:00:00", "command": "php informe.php", "timeout": 120 },
     { "name": "Mal Nombre", "every": "5m", "command": "true" },
-    { "name": "rapida", "every": "10s", "command": "true" }
+    { "name": "rapida", "every": "10s", "command": "true" },
+    { "name": "dos-lineas", "every": "5m", "command": "echo uno\nrm -rf datos", "timeout": 60 }
   ] }
 JSON
   git -C "$KORIGIN" commit -qam "cron"
@@ -1478,6 +1509,15 @@ JSON
   check "con su timeout"                    "1" "$(grep -c '^TimeoutStartSec=120$' "$TMP/systemd/orbit-conrel.cron-informe.service" 2>/dev/null)"
   check "un nombre raro se salta"           "1" "$(grep -c 'no vale como nombre' "$TMP/kc1")"
   check "menos de un minuto no"             "0" "$(find "$TMP/systemd" -name '*cron-rapida*' | wc -l)"
+  # Una orden con un salto de línea partía el registro en dos: la tarea se
+  # escribía con la primera línea sola —sin su timeout— y la segunda salía como
+  # «no vale como nombre». Tiene que saltarse entera, diciendo por qué.
+  check "una orden de dos líneas se salta"  "0" "$(find "$TMP/systemd" -name '*cron-dos-lineas*' | wc -l)"
+  check "diciendo por qué"                  "1" "$(grep -c "dos-lineas.*una línea" "$TMP/kc1")"
+  check "y sin un nombre fantasma"          "1" "$(grep -c 'no vale como nombre' "$TMP/kc1")"
+  # El entorno fijo va en la orden, como en la unidad de la app: con sólo
+  # Environment=HOME, un HOME del .env ganaba (EnvironmentFile manda).
+  check "HOME fijo en la orden"             "1" "$(grep -c "^ExecStart=/usr/bin/env NODE_ENV=production HOME=$KBASE/shared/home PATH=" "$PS.service" 2>/dev/null)"
   check "y se activan"                      "1" "$(grep -c '^enable --now orbit-conrel.cron-portal.timer$' "$SYSCTL_LOG")"
   SALIDA="$(run cmd_cron conrel 2>&1)"
   check "orbit cron las lista"              "1" "$(grep -c 'portal' <<<"$SALIDA")"
@@ -1531,5 +1571,106 @@ check "un 401 también"     "0" "$(_health_ok "$HPORT" /; echo $?)"
 printf '502' > "$HC"
 check "un 502 no"          "1" "$(_health_ok "$HPORT" /; echo $?)"
 check "nadie escuchando, no" "1" "$(_health_ok 1 /; echo $?)"
+
+section "Lo que la app deja en shared/ y releases/ no lo sigue root"
+# shared/ y releases/ son del usuario de la app, enlaces incluidos. Root los
+# creaba con 'install -d -o <app>', que sigue un enlace y le cambia el modo
+# —y con GNU install, el dueño— al destino: un shared/secreto cambiado por un
+# enlace a /etc le daba /etc a la app en el despliegue siguiente. Aquí no hay
+# root, pero el modo sí se ve: el destino está en 0700 y el 'install -d' lo
+# dejaba en 0755.
+publish "version enlaces"
+mkapp enlaces static "" enlaces.test
+load_app enlaces; A_REPO="$ORIGIN"; A_BRANCH="main"; A_OUTDIR="."; A_SHARED="secreto/clave.txt"; save_app
+EBASE="$TMP/apps/enlaces"
+mkdir -p "$EBASE/shared" "$TMP/ajeno"; chmod 0700 "$TMP/ajeno"
+ln -sfn "$TMP/ajeno" "$EBASE/shared/secreto"
+run cmd_deploy enlaces >"$TMP/en1" 2>&1; r=$?
+[[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/en1"
+check "despliega"                          "0" "$r"
+check "el destino del enlace no cambia de modo" "700" "$(stat -c %a "$TMP/ajeno")"
+check "y la crea quien la usa"             "1" "$(grep -c "^as_app install -m 0640 /dev/null '$EBASE/shared/secreto/clave.txt'" "$QUIEN_LOG")"
+# La release nueva lleva la hora por nombre, y la app puede poner en releases/
+# lo que quiera mientras dura el fetch. El doble del fetcher planta ahí un
+# enlace con el nombre exacto, que es lo que haría una app comprometida.
+EBUENA="$(readlink -f "$EBASE/current")"
+publish "version planta"
+as_deploy() {
+  printf 'as_deploy %s\n' "$*" >> "$QUIEN_LOG"
+  [[ -n "${DEP_RELDIR:-}" && ! -e "$DEP_RELDIR" ]] && ln -s "$TMP/ajeno" "$DEP_RELDIR"
+  bash -lc "$*"
+}
+sleep 1
+run cmd_deploy enlaces >"$TMP/en2" 2>&1; r=$?
+as_deploy() { printf 'as_deploy %s\n' "$*" >> "$QUIEN_LOG"; bash -lc "$*"; }
+check "un enlace con el nombre de la release lo para" "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+check "diciendo qué pasa"                  "1" "$(grep -c 'ya hay algo con ese nombre' "$TMP/en2")"
+check "el destino no cambia de modo"       "700" "$(stat -c %a "$TMP/ajeno")"
+check "ni se escribe en él"                "0" "$(find "$TMP/ajeno" -name index.html | wc -l)"
+check "producción sigue en la buena"       "$EBUENA" "$(readlink -f "$EBASE/current")"
+check "y el enlace plantado no se queda"   "0" "$(find "$EBASE/releases" -maxdepth 1 -type l | wc -l)"
+
+section "Lo que deja un despliegue muerto con SIGKILL se recoge en el siguiente"
+# Un 'kill -9' a mitad de build no deja correr la trampa de salida: la release a
+# medias se quedaba, ocupaba un hueco de KEEP_RELEASES y salía en 'orbit
+# rollback' como destino. Se mata de verdad, con el build en marcha.
+publish "version corte"
+mkapp corte static "" corte.test
+load_app corte; A_REPO="$ORIGIN"; A_BRANCH="main"; A_OUTDIR="."; A_BUILD=""; save_app
+CBASE="$TMP/apps/corte"
+run cmd_deploy corte >/dev/null 2>&1
+CBUENA="$(readlink -f "$CBASE/current")"
+load_app corte; A_BUILD='touch "$PWD/empezado"; sleep 30'; save_app
+sleep 1
+publish "version que no llega"
+run cmd_deploy corte >"$TMP/cut1" 2>&1 &
+CPID=$!
+for _ in $(seq 100); do compgen -G "$CBASE/releases/*/empezado" >/dev/null && break; sleep 0.1; done
+# Se mata el árbol entero de una vez, como hace el OOM killer con el cgroup:
+# sólo el padre dejaría el 'sleep' del build vivo y con el cerrojo heredado.
+_arbol() { local c; for c in $(cat /proc/"$1"/task/*/children 2>/dev/null); do _arbol "$c"; printf '%s ' "$c"; done; }
+# shellcheck disable=SC2046  # la lista de PID se parte a propósito
+kill -9 "$CPID" $(_arbol "$CPID") 2>/dev/null; wait "$CPID" 2>/dev/null
+CMEDIA="$(dirname "$(compgen -G "$CBASE/releases/*/empezado" | head -1)")"
+check "queda la release a medias"          "1" "$([[ -n "$CMEDIA" && -d "$CMEDIA" && "$CMEDIA" != "$CBUENA" ]] && echo 1 || echo 0)"
+check "y su testigo, con su ruta"          "$CMEDIA" "$(cat "$(_rel_partial corte)" 2>/dev/null)"
+check "producción no se ha movido"         "$CBUENA" "$(readlink -f "$CBASE/current")"
+# doctor lo cuenta mientras tanto: es un destino de rollback que no lo es.
+_doctor_collect >/dev/null 2>&1 || true
+check "doctor lo cuenta"                   "1" "$(printf '%s\n' "${DOC_ID[@]}" | grep -cx 'partial-corte')"
+# Un rollback no la ofrece: la barre antes de listar.
+run cmd_rollback corte "$(basename "$CMEDIA")" >"$TMP/cut2" 2>&1; r=$?
+check "rollback no vuelve a la de a medias" "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+check "y la borra"                         "0" "$([[ -d "$CMEDIA" ]] && echo 1 || echo 0)"
+check "diciéndolo"                         "1" "$(grep -c 'Quedaba a medias la release' "$TMP/cut2")"
+check "sin testigo ya"                     "0" "$([[ -f "$(_rel_partial corte)" ]] && echo 1 || echo 0)"
+check "producción sigue donde estaba"      "$CBUENA" "$(readlink -f "$CBASE/current")"
+# Y el despliegue siguiente la barre igual, con el testigo puesto a mano.
+mkdir -p "$CBASE/releases/20200101-000000"; printf '%s\n' "$CBASE/releases/20200101-000000" > "$(_rel_partial corte)"
+load_app corte; A_BUILD=""; save_app
+sleep 1
+run cmd_deploy corte >"$TMP/cut3" 2>&1; r=$?
+check "el despliegue siguiente va bien"    "0" "$r"
+check "y se lleva la de a medias"          "0" "$([[ -d "$CBASE/releases/20200101-000000" ]] && echo 1 || echo 0)"
+check "sin dejar su propio testigo"        "0" "$([[ -f "$(_rel_partial corte)" ]] && echo 1 || echo 0)"
+# Pero nunca la que sirve: el SIGKILL pudo llegar después del symlink.
+printf '%s\n' "$(readlink -f "$CBASE/current")" > "$(_rel_partial corte)"
+CSIRVE="$(readlink -f "$CBASE/current")"
+sleep 1
+run cmd_deploy corte >/dev/null 2>&1
+check "la que sirve no se toca"            "1" "$([[ -d "$CSIRVE" ]] && echo 1 || echo 0)"
+# Ni una ruta que no sea una release de la app: el testigo acaba en un rm -rf.
+mkdir -p "$TMP/no-es-release"; printf '%s\n' "$TMP/no-es-release" > "$(_rel_partial corte)"
+sleep 1
+run cmd_deploy corte >/dev/null 2>&1
+check "ni nada fuera de releases/"         "1" "$([[ -d "$TMP/no-es-release" ]] && echo 1 || echo 0)"
+
+section "orbit rollback sólo acepta una release de la lista"
+# Con '../../x', '-d' miraba fuera de releases/ y 'current' acababa apuntando a
+# cualquier carpeta del disco.
+mkdir -p "$TMP/fuera/x"
+run cmd_rollback corte "../../../fuera/x" >"$TMP/rb1" 2>&1; r=$?
+check "rechaza una ruta"                   "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+check "y current no se mueve"              "1" "$(readlink -f "$CBASE/current" | grep -c "^$CBASE/releases/")"
 
 report

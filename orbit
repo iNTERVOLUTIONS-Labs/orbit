@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.1"
+ORBIT_VERSION="1.4.2"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -3904,9 +3904,22 @@ EOF
 # Van al principio del cuerpo porque entre expresiones regulares gana la
 # primera, y la de los estáticos dejaría pasar un '/vendor/x.js'. Las dos
 # carpetas van con '^~', que gana a todas.
+#
+# Y lo mismo en una app PHP —'php' o 'laravel'— cuyo docroot es la raíz de la
+# app, que es lo que deja la detección cuando no hay public/, web/ ni html/: el
+# mismo agujero con otro tipo. Medido con nginx y php-fpm antes de esto: con un
+# index.php en la raíz, '/vendor/…/eval-stdin.php' **se ejecutaba**, y
+# composer.json, composer.lock y README.md salían con 200. En un monorepo la
+# raíz de la app es su carpeta (A_APPDIR), no la del repositorio, y las URL
+# parten de ahí igual.
 _php_root_denies() {
-  [[ "$A_TYPE" == "static" && "$A_PHP" == "yes" ]] || return 0
-  [[ -z "${A_OUTDIR:-}" || "$A_OUTDIR" == "." ]] || return 0
+  local docroot
+  case "$A_TYPE" in
+    static)      [[ "$A_PHP" == "yes" ]] || return 0; docroot="${A_OUTDIR:-.}" ;;
+    php|laravel) docroot="${A_DOCROOT:-.}" ;;
+    *)           return 0 ;;
+  esac
+  [[ "$docroot" == "." || "$docroot" == "${A_APPDIR:-.}" ]] || return 0
 cat <<'EOF'
 
     location ^~ /vendor/       { return 404; }
@@ -3974,6 +3987,7 @@ _body_php() {
 cat <<EOF
     root $root;
     index index.php index.html;
+$(_php_root_denies)
 
     location / {
 $(_maint_guard)
@@ -4417,6 +4431,32 @@ render_systemd() {
   systemctl enable "$svc" >/dev/null 2>&1 || true
 }
 
+# Lo que Orbit fija en el entorno de todo lo que ejecuta de una app —la unidad,
+# sus tareas de cron, el build y 'orbit exec'— y que el .env de la app no puede
+# cambiar. En la orden de arranque y no sólo en Environment=, por lo mismo que
+# PORT (ver _systemd_unit_body): EnvironmentFile gana a Environment=, y
+# comprobado con systemd-run, un HOME=/nope en el .env llegaba al proceso.
+#
+# Lo que pasaba cuando el .env ganaba, cada una por su lado:
+#   · HOME copiado de un portátil (/home/ana) o el /home/deploy de siempre:
+#     ProtectHome=true tapa /home, y el arranque muere con EACCES en bucle —el
+#     fallo de §5.1, vuelto a abrir desde un fichero que no es de Orbit—. Y
+#     fuera de /home, la caché se escribe donde no es suya, como otro usuario.
+#   · PATH: el de quien escribió el .env no tiene /usr/local/bin, o pone
+#     delante otro node; la unidad da 127 o arranca un runtime distinto del
+#     que compiló.
+#   · COREPACK_HOME y DENO_DIR: el build deja el gestor de paquetes y las
+#     dependencias en la ruta fija de shared/, y el servicio las buscaría en
+#     otra: compila bien y no arranca, la misma pista falsa de §5.1.
+# Las herramientas tienen que estar donde las ve UNIT_PATH (§18.6), no donde
+# las ponga un .env.
+_unit_pinned_env() { # _unit_pinned_env <app>  -> CLAVE=valor separados por espacios
+  local name="$1" out
+  out="HOME=$(app_home "$name") PATH=$UNIT_PATH COREPACK_HOME=$(app_corepack "$name")"
+  [[ "$A_TYPE" == "deno" ]] && out+=" DENO_DIR=$(app_deno "$name")"
+  printf '%s' "$out"
+}
+
 # El cuerpo de la unidad, aparte, porque ahora lo escriben dos: la unidad
 # canónica (sobre 'current' y el puerto de la app) y la unidad puente del
 # reinicio sin corte (sobre la release concreta y un puerto libre). Dos
@@ -4445,6 +4485,7 @@ _systemd_unit_body() { # _systemd_unit_body <svc> <workdir> <puerto> <denodir>
   # orden llegue a ejecutarse. Con '$$' le llega a bash el '${PORT}' literal y
   # lo expande del entorno que acabamos de fijar.
   local start="${A_START//\$/\$\$}"
+  local pinned; pinned="$(_unit_pinned_env "$name")"
   cat <<EOF
 [Unit]
 Description=Orbit · $A_NAME ($A_TYPE)
@@ -4465,7 +4506,7 @@ Environment=PATH=$UNIT_PATH
 # y el HOME que systemd deduce de User= no se podría ni abrir. Ver app_home().
 Environment=HOME=$(app_home "$name")
 Environment=COREPACK_HOME=$(app_corepack "$name")
-${denodir}ExecStart=/usr/bin/env PORT=$port HOST=127.0.0.1 NODE_ENV=production /bin/bash -c '$start'
+${denodir}ExecStart=/usr/bin/env PORT=$port HOST=127.0.0.1 NODE_ENV=production $pinned /bin/bash -c '$start'
 Restart=always
 RestartSec=3
 KillSignal=$kill_sig
@@ -4910,8 +4951,13 @@ _build_run() { # _build_run <release>
   # instalando sin lockfile congelado para siempre, que es justo lo que no
   # queremos; el despliegue siguiente, con el lockfile ya arreglado, va solo.
   [[ "$BUILD_UNFREEZE" == "yes" ]] && cmd="${cmd//--frozen-lockfile/--no-frozen-lockfile}"
+  # HOME y PATH se apartan antes del .env y se reponen después: un .env que los
+  # trae —el HOME del portátil de quien lo escribió, su PATH con un nvm— le
+  # cambiaba al build la caché y las herramientas, y el build escribía su
+  # caché en un HOME que no es el del usuario que lo corre. Ver
+  # _unit_pinned_env. COREPACK_HOME y DENO_DIR ya van detrás del .env, en extra.
   sudo -u "$(app_user)" -H bash -lc \
-    "cd '$rel' && set -a; [ -f .env ] && . ./.env; set +a; unset NODE_ENV; export PORT=$A_PORT NEXT_TELEMETRY_DISABLED=1 CI=1; ${extra}$cmd"
+    "cd '$rel' && __orbit_home=\"\$HOME\" __orbit_path=\"\$PATH\"; set -a; [ -f .env ] && . ./.env; set +a; export HOME=\"\$__orbit_home\" PATH=\"\$__orbit_path\"; unset __orbit_home __orbit_path NODE_ENV; export PORT=$A_PORT NEXT_TELEMETRY_DISABLED=1 CI=1; ${extra}$cmd"
 }
 
 # Lo aprendido en despliegues anteriores, aplicado antes del primer intento.
@@ -5375,6 +5421,9 @@ _deploy_on_exit() {
   # necesita saber si salió bien, y eso lo fija el código de salida.
   (( rc != 0 )) && DEP_OK="no"
   _deploy_drop_failed
+  # La trampa ha corrido, así que lo que quede es lo que se ha decidido dejar:
+  # el testigo sólo tiene que sobrevivir a lo que no la deja correr.
+  _rel_partial_clear
   _metrics_record
   _deploy_json_trap "$rc"
   return 0
@@ -5595,6 +5644,83 @@ _app_unlock() {
   return 0
 }
 
+# La release a medio hacer de un despliegue que no llegó a su trampa de salida.
+#
+# La trampa EXIT borra la release que no llegó a servirse (_deploy_drop_failed),
+# pero un SIGKILL no la deja correr: 'kill -9', el OOM killer, el
+# TimeoutStopSec de systemd o un corte de luz. Lo que quedaba era una carpeta
+# con medio rsync o medio build dentro, indistinguible de una release buena:
+# ocupaba un hueco de KEEP_RELEASES y salía en 'orbit rollback' como destino,
+# y volver a ella era servir una web rota con la palabra «Revertido» encima.
+#
+# El testigo se escribe al empezar y lo quita la trampa, así que sólo existe si
+# la trampa no corrió. Vive junto al cerrojo y no en releases/: releases/ es de
+# la app, y un fichero que root escribe ahí es un fichero que la app puede
+# cambiar por un enlace. Contiene la ruta, para leerlo con 'cat'.
+_rel_partial() { echo "$DEPLOY_LOCK_DIR/$1.partial"; }
+# ¿Hay un despliegue o un rollback de la app en marcha? Para quien sólo mira
+# (doctor): lo que encuentre a medias puede ser de ése.
+_app_busy() { # _app_busy <app>
+  local f="$DEPLOY_LOCK_DIR/$1.lock"
+  [[ -f "$f" ]] || return 1
+  ! flock -n "$f" true 2>/dev/null
+}
+DEP_PARTIAL=""
+_rel_partial_mark() { # _rel_partial_mark <app> <release>
+  # Sin cerrojo no se apunta nada: otro despliegue podría estar a mitad, y su
+  # barrido se llevaría esta release mientras se construye.
+  [[ -n "$DEP_LOCK_FD" ]] || return 0
+  DEP_PARTIAL="$(_rel_partial "$1")"
+  printf '%s\n' "$2" > "$DEP_PARTIAL" 2>/dev/null || DEP_PARTIAL=""
+  return 0
+}
+_rel_partial_clear() {
+  [[ -n "$DEP_PARTIAL" ]] && rm -f "$DEP_PARTIAL"
+  DEP_PARTIAL=""
+  return 0
+}
+
+# La release que apunta el testigo, si sigue a medias y se puede borrar: ni la
+# que sirve 'current' —el SIGKILL pudo llegar después del symlink, y entonces
+# es la web— ni la que ejecuta una unidad puente que siga escrita.
+_rel_partial_orphan() { # _rel_partial_orphan <app>  -> imprime la ruta, o nada
+  local name="$1" f d base
+  f="$(_rel_partial "$name")"
+  [[ -f "$f" ]] || return 0
+  d="$(head -n 1 "$f" 2>/dev/null || true)"
+  base="$(app_dir "$name")"
+  # Sólo una release de esta app, con nombre de release: el contenido acaba
+  # en un 'rm -rf'.
+  [[ "$d" =~ ^"$base"/releases/[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || return 0
+  [[ -d "$d" && ! -L "$d" ]] || return 0
+  [[ "$(readlink -f "$base/current" 2>/dev/null || true)" != "$(readlink -f "$d")" ]] || return 0
+  _rel_bridged "$name" "$d" && return 0
+  printf '%s' "$d"
+}
+_rel_bridged() { # _rel_bridged <app> <release>  -> 0 si la ejecuta el puente
+  [[ -f "$(svc_next_unit "$1")" ]] && grep -qxF "WorkingDirectory=$2" "$(svc_next_unit "$1")" 2>/dev/null
+}
+
+# Con el cerrojo puesto, y antes de crear nada: lo que dejó el anterior se
+# borra, y el testigo se va. Si la release resultó ser la que sirve, se queda
+# como una release más —llegó a activarse, así que terminó de construirse—. Si
+# la ejecuta un puente, el testigo también se queda: el puente lo retira quien
+# sabe comprobar si está sirviendo (§5.2), y hasta entonces no es basura.
+_rel_partial_sweep() { # _rel_partial_sweep <app>
+  local name="$1" f d
+  f="$(_rel_partial "$name")"
+  [[ -n "$DEP_LOCK_FD" && -f "$f" ]] || return 0
+  d="$(_rel_partial_orphan "$name")"
+  if [[ -n "$d" ]]; then
+    rm -rf "$d"
+    warn "Quedaba a medias la release %s de un despliegue interrumpido; la borro." "${d##*/}"
+  elif _rel_bridged "$name" "$(head -n 1 "$f" 2>/dev/null || true)"; then
+    return 0
+  fi
+  rm -f "$f"
+  return 0
+}
+
 # Las rutas compartidas que declara el orbit.json de la release que se está
 # desplegando. A_SHARED se escribe al crear la app y no se volvía a mirar: una
 # carpeta añadida después a 'shared' en el repositorio no se enlazaba nunca, y
@@ -5687,7 +5813,7 @@ _read_repo_runtime() { # _read_repo_runtime <release>
       (if .every then "every" else "calendar" end),
       (.command // "" | tostring),
       (.timeout // "" | tostring)
-    ] | map(gsub("[\u001f\r]"; " ")) | join("\u001f")' "$f" 2>/dev/null || true)"
+    ] | map(gsub("[\u001f\r]"; " ") | gsub("\n"; "\u001e")) | join("\u001f")' "$f" 2>/dev/null || true)"
   return 0
 }
 
@@ -5705,8 +5831,9 @@ _unit_limits() {
 # con su .env cargado. Es el mismo camino que 'orbit exec', sobre una release
 # que todavía no es 'current'.
 _run_release_cmd() { # _run_release_cmd <release> <comando>
+  local ddir=""; [[ "$A_TYPE" == "deno" ]] && ddir="$(app_deno "$A_NAME")"
   sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-release \
-    "$(app_shared "$A_NAME")/.env" "${A_PORT:-}" "$(_app_root "$1")" "$(app_corepack "$A_NAME")" \
+    "$(app_shared "$A_NAME")/.env" "${A_PORT:-}" "$(_app_root "$1")" "$(app_corepack "$A_NAME")" "$ddir" \
     timeout --kill-after=10 "$RELEASE_TIMEOUT" bash -c "$2"
 }
 
@@ -5716,6 +5843,9 @@ _run_release_cmd() { # _run_release_cmd <release> <comando>
 # sobre 'current', así que tras un despliegue la siguiente pasada ya ejecuta el
 # código nuevo. Un oneshot no puede arrancar mientras sigue activo, de modo que
 # dos pasadas nunca se solapan, que es el fallo clásico del cron de toda la vida.
+# El entorno fijo va en la orden, igual que en la unidad (ver _unit_pinned_env):
+# con sólo Environment=HOME, un HOME del .env ganaba y la tarea corría con el
+# HOME que ProtectHome tapa.
 _cron_base()  { echo "$CRON_UNIT_DIR/orbit-$1.cron-$2"; }
 _cron_units() { # _cron_units <app>  -> nombres de las tareas con unidad escrita
   local f n
@@ -5744,7 +5874,7 @@ _cron_when() { # _cron_when <every|calendar> <valor>  -> líneas [Timer], o 1 si
     printf 'OnBootSec=%s\nOnUnitActiveSec=%s\n' "$secs" "$secs"
     return 0
   fi
-  [[ -n "$val" && "$val" != *$'\n'* ]] || return 1
+  [[ -n "$val" && "$val" != *$'\n'* && "$val" != *$'\x1e'* ]] || return 1
   # La sintaxis de OnCalendar la valida quien la va a usar. Sin systemd-analyze
   # (contenedores, pruebas) se acepta lo que tenga forma razonable.
   if command -v systemd-analyze >/dev/null 2>&1; then
@@ -5764,7 +5894,11 @@ _cron_sync() { # _cron_sync <app>  (con la app cargada y DEP_CRON leído)
       warn "cron: «%s» no vale como nombre (minúsculas, números y '-'); me la salto." "$cname"; continue
     fi
     [[ "$seen" == *" $cname "* ]] && { warn "cron: «%s» está repetida; me quedo con la primera." "$cname"; continue; }
-    if [[ -z "$cmd" || "$cmd" == *$'\n'* ]]; then
+    # Un salto de línea dentro de un campo llega como RS (\x1e): el registro es
+    # una línea, y con el salto tal cual la orden se partía en dos registros —la
+    # tarea corría sólo la primera línea, sin su timeout, y la segunda salía como
+    # un nombre que no vale—. Lo que el autor escribió no era eso.
+    if [[ -z "$cmd" || "$cmd" == *$'\x1e'* ]]; then
       warn "cron: «%s» necesita un 'command' de una línea; me la salto." "$cname"; continue
     fi
     if ! lines="$(_cron_when "$kind" "$when")"; then
@@ -5790,7 +5924,7 @@ EnvironmentFile=-$(app_shared "$name")/.env
 Environment=NODE_ENV=production
 Environment=PATH=$UNIT_PATH
 Environment=HOME=$(app_home "$name")
-ExecStart=/bin/bash -c $(_unit_quote "$cmd")
+ExecStart=/usr/bin/env NODE_ENV=production $(_unit_pinned_env "$name") /bin/bash -c $(_unit_quote "$cmd")
 TimeoutStartSec=$tout
 SyslogIdentifier=orbit-$name.cron-$cname
 NoNewPrivileges=true
@@ -5956,7 +6090,7 @@ cmd_deploy() {
 
   DEP_T0=$SECONDS; DEP_EMITTED="no"; DEP_OK="no"; DEP_REL=""; DEP_PREV=""
   DEP_SHA=""; DEP_SUBJ=""; DEP_REF="$ref"; DEP_ROLLBACK="no"; DEP_RECOVER="no"
-  DEP_ERR=""; DEP_STEP=""; DEP_RELDIR=""
+  DEP_ERR=""; DEP_STEP=""; DEP_RELDIR=""; DEP_PARTIAL=""
   # Un solo manejador de salida para todo el despliegue, y siempre, no sólo
   # con --json: 'trap X EXIT' sustituye en vez de encadenar, así que dos sitios
   # poniendo el suyo significa que uno de los dos no corre. Costó un bug —
@@ -5978,6 +6112,7 @@ cmd_deploy() {
   load_app "$name"
   _app_lock "$name" || { DEP_ERR="$(t "otro despliegue de la app sigue en curso")"
     die "Otro despliegue de '%s' sigue en curso tras %s s. No he tocado nada." "$name" "$DEPLOY_LOCK_WAIT"; }
+  _rel_partial_sweep "$name"
   # En modo EVA se pregunta siempre qué desplegar: es justo la decisión que el
   # modo sencillo toma por ti. Con --json, nunca: no hay a quién preguntar.
   [[ "$JSON" != "yes" ]] && \
@@ -6005,6 +6140,7 @@ cmd_deploy() {
   # en cada fetch. Releases y shared son del builder — el usuario de la app.
   install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$base"
   install -d -o "$(app_user)" -g "$(app_user)" "$base/releases" "$shared"
+  _rel_partial_mark "$name" "$rel"
 
   # 1 · código
   _dstep code
@@ -6056,8 +6192,19 @@ cmd_deploy() {
   _dprog code ok
 
   # 2 · nueva release
+  #
+  # La crea el usuario de la app, y no root, porque releases/ es suya: puede
+  # poner lo que quiera en ella mientras dura el fetch, y el nombre de la
+  # release es la hora, o sea adivinable. Un enlace con ese nombre hacia
+  # /usr/local/bin convertía el 'install -d -o <app>' de root en un chown de
+  # /usr/local/bin para la app (GNU install sigue el enlace y le cambia dueño y
+  # modo al destino; comprobado). Con 'mkdir' de la propia app, lo peor que
+  # consigue es escribir donde ya podía. Y sin '-p': si ya hay algo ahí, no es
+  # nuestro y se para.
   _dstep release
-  install -d -o "$(app_user)" -g "$(app_user)" "$rel"
+  as_app "mkdir '$rel'" 2>/dev/null || {
+    DEP_ERR="$(t "ya había algo con el nombre de la release nueva")"
+    die "No he podido crear la release %s: ya hay algo con ese nombre. Nada tocado." "$rel"; }
   as_app "rsync -a --delete --exclude '.git' '$cache/' '$rel/'"
 
   # 3 · fichero de entorno compartido
@@ -6142,16 +6289,24 @@ cmd_deploy() {
       odir="$(readlink -m "$(dirname "$origen")")"
       [[ "$odir" == "$relreal" || "$odir" == "$relreal/"* ]] \
         || { warn "shared: me salto '%s', su carpeta sale de la release por un enlace." "$sp"; continue; }
+      # Lo crea el usuario de la app, no root: shared/ es suyo y lo que haya
+      # dentro también, enlaces incluidos. Con 'install -d -o <app>' de root,
+      # un shared/data convertido en enlace a /etc le daba /etc a la app —GNU
+      # install sigue el enlace y le cambia dueño y modo al destino—, y sin
+      # carrera que ganar: bastaba con borrar la hoja y esperar al despliegue
+      # siguiente. Siguiéndolo como la app, un enlace que puso quien
+      # administra (shared/uploads en otro disco) sigue funcionando, y uno que
+      # puso la app no le da nada que no tuviera.
       if [[ ! -e "$shared/$sp" ]]; then
-        install -d -o "$(app_user)" -g "$(app_user)" "$shared/$(dirname "$sp")"
+        as_app "mkdir -p '$shared/$(dirname "$sp")'"
         if [[ -e "$origen" && ! -L "$origen" ]]; then
           # Lo que traiga el repositorio es la semilla: un config de ejemplo, un
           # directorio con su .gitignore dentro.
           as_app "cp -a '$origen' '$shared/$sp'"
         elif [[ "$sp" == */ || "$sp" != *.* ]]; then
-          install -d -o "$(app_user)" -g "$(app_user)" "$shared/$sp"
+          as_app "mkdir -p '$shared/$sp'"
         else
-          install -o "$(app_user)" -g "$(app_user)" -m 0640 /dev/null "$shared/$sp"
+          as_app "install -m 0640 /dev/null '$shared/$sp'"
         fi
       fi
       as_app "rm -rf '$origen' && mkdir -p '$(dirname "$origen")' && ln -sfn '$shared/$sp' '$origen'"
@@ -6221,8 +6376,10 @@ cmd_deploy() {
   # siendo un único shared/storage —hay una sola app por vhost— y lo que cambia
   # es de dónde sale y adónde se enlaza.
   local lrel; lrel="$(_app_root "$rel")"
+  # Como la app, por lo mismo que las rutas de 'shared': shared/storage es
+  # suyo, y si lo cambia por un enlace, root no lo sigue.
   if [[ "$A_TYPE" == "laravel" && -d "$lrel/storage" && ! -L "$lrel/storage" ]]; then
-    install -d -o "$(app_user)" -g "$(app_user)" "$shared/storage"
+    as_app "mkdir -p '$shared/storage'"
     as_app "rsync -a --ignore-existing --include='*/' --include='.gitignore' --exclude='*' '$lrel/storage/' '$shared/storage/'"
   fi
   [[ "$A_TYPE" == "laravel" && -d "$shared/storage" ]] \
@@ -6413,6 +6570,17 @@ cmd_deploy() {
   render_nginx "$name" || { DEP_ERR="$(t "nginx rechazó la configuración")"; die "nginx rechazó la configuración"; }
   A_HEALTH_PATH="$rt_hp"; A_HEALTH_TIMEOUT="$rt_ht"; A_LIMIT_MEM="$rt_lm"; A_LIMIT_CPU="$rt_lc"
   ok "nginx recargado"
+  # Un puente huérfano de un despliegue muerto con SIGKILL sólo lo recogía el
+  # camino del solape, y ése no se toma con la app parada ni con
+  # DEPLOY_OVERLAP="no": el puente seguía corriendo —y con su fichero en
+  # /etc/systemd/system— hasta el reinicio de la máquina. Aquí ya se puede
+  # retirar: la canónica ha pasado su health check y nginx acaba de recargar
+  # apuntándole a ella.
+  if needs_svc "$A_TYPE" && [[ -z "$OVERLAP_APP" && -f "$(svc_next_unit "$name")" ]]; then
+    warn "Quedaba una unidad puente de un despliegue anterior; la retiro"
+    nginx_drain
+    _overlap_cleanup "$name"
+  fi
 
   # 7b · salud de las apps sin unidad
   #
@@ -7544,13 +7712,18 @@ cmd_rollback() {
   [[ -n "$name" ]] || name="$(pick_app 'App a revertir')" || return 0
   load_app "$name"
   _app_lock "$name" || die "Otro despliegue de '%s' sigue en curso tras %s s. No he tocado nada." "$name" "$DEPLOY_LOCK_WAIT"
+  # Antes de listar: una release a medias de un despliegue muerto no puede
+  # ofrecerse como destino.
+  _rel_partial_sweep "$name"
   local base; base="$(app_dir "$name")"
   local -a rels; mapfile -t rels < <(releases_desc "$base")
   (( ${#rels[@]} > 1 )) || die "No hay una release anterior a la que volver"
   local current=""; [[ -L "$base/current" ]] && current="$(basename "$(readlink -f "$base/current")")"
 
   if [[ -n "$target" ]]; then
-    [[ -d "$base/releases/$target" ]] \
+    # Uno de la lista y no una ruta: con '../../x', '-d' miraba fuera de
+    # releases/ y 'current' acababa apuntando a cualquier carpeta del disco.
+    [[ " ${rels[*]} " == *" $target "* && "$target" != */* && -d "$base/releases/$target" ]] \
       || die "La release '%s' no existe. Están: %s" "$target" "${rels[*]}"
     [[ "$target" == "$current" ]] \
       && { info "'%s' ya está sirviendo %s." "$name" "$target"; return 0; }
@@ -10279,7 +10452,12 @@ cmd_service() { # start|stop|restart
 #
 # COREPACK_HOME va con las fijas por el mismo motivo que en la unidad: si
 # 'orbit exec <app> pnpm …' usara otra caché, resolvería otro pnpm que el de
-# producción y depurar un fallo de arranque sería perseguir un fantasma.
+# producción y depurar un fallo de arranque sería perseguir un fantasma. Y
+# DENO_DIR, por lo mismo en Deno.
+#
+# HOME y PATH se apartan antes de cargar el .env y se reponen después, como en
+# la unidad (_unit_pinned_env): un HOME o un PATH copiados de otra máquina
+# llegaban al comando y cambiaban la caché y las herramientas que se usan.
 #
 # El PATH lleva tres añadidos y ninguno es de adorno. node_modules/.bin y
 # .venv/bin porque son las herramientas de la app. La carpeta bin/ de la
@@ -10293,15 +10471,19 @@ cmd_service() { # start|stop|restart
 # Ojo al escribir aquí dentro: esto es una cadena entre comillas simples, así
 # que una comilla simple en un comentario la cierra y parte el script en dos.
 _exec_script='
+  __orbit_home="$HOME" __orbit_path="$PATH"
   set -a
   [ -f "$1" ] && . "$1"
   set +a
+  export HOME="$__orbit_home" PATH="$__orbit_path"
+  unset __orbit_home __orbit_path
   export NODE_ENV=production HOST=127.0.0.1
   [ -n "$2" ] && export PORT="$2"
   [ -n "$4" ] && export COREPACK_HOME="$4"
+  [ -n "$5" ] && export DENO_DIR="$5"
   export PATH="$3/node_modules/.bin:$3/.venv/bin:$3/bin:$PATH:/usr/local/go/bin"
   cd "$3" || exit 1
-  shift 4
+  shift 5
   exec "$@"
 '
 
@@ -10310,8 +10492,9 @@ _run_in_dir() { # _run_in_dir <dir> <.env> <puerto> <comando...>
   # A_NAME está cargada en todas las rutas que llegan aquí (exec, django,
   # _run_in_app). Si alguna vez no lo estuviera, se pasa vacío y el script deja
   # la variable sin tocar en vez de exportar una ruta a medio construir.
-  local cph=""; [[ -n "${A_NAME:-}" ]] && cph="$(app_corepack "$A_NAME")"
-  sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-exec "$envf" "$port" "$dir" "$cph" "$@"
+  local cph="" ddir=""; [[ -n "${A_NAME:-}" ]] && cph="$(app_corepack "$A_NAME")"
+  [[ -n "${A_NAME:-}" && "${A_TYPE:-}" == "deno" ]] && ddir="$(app_deno "$A_NAME")"
+  sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-exec "$envf" "$port" "$dir" "$cph" "$ddir" "$@"
 }
 
 # Igual, pero sobre la release activa de una app ya cargada con load_app.
@@ -12560,9 +12743,17 @@ _env_example_file() { # _env_example_file <release>  -> ruta, o nada
     [[ -n "$A_ENV_FILE" && "$A_ENV_FILE" == */* ]] && cands+=("$rel/$(dirname "$A_ENV_FILE")/.env.example")
     cands+=("$(_app_root "$rel")/.env.example" "$rel/.env.example")
   fi
+  local relreal; relreal="$(readlink -f "$rel" 2>/dev/null || true)"
   for c in "${cands[@]}"; do
     # Un enlace no se sigue: lo lee root, y el repositorio lo elige un tercero.
-    [[ -f "$c" && ! -L "$c" ]] && { printf '%s' "$c"; return 0; }
+    # Tampoco uno en mitad de la ruta: git guarda enlaces, y con un 'cfg' del
+    # repositorio apuntando a /etc/orbit y "example": "cfg/orbit.conf", root
+    # leía la configuración del servidor y ofrecía sus valores —el token de
+    # Telegram, la contraseña del relé— como valores por defecto para el .env
+    # de la app. Lo resuelto tiene que seguir dentro de la release.
+    [[ -f "$c" && ! -L "$c" ]] || continue
+    [[ -n "$relreal" && "$(readlink -f "$c")" == "$relreal/"* ]] || continue
+    printf '%s' "$c"; return 0
   done
   return 0
 }
@@ -12806,6 +12997,12 @@ cmd_env() {
             warn "%s la pone Orbit al arrancar la app y el valor del .env no le llega al proceso." "$key"
             info "Escucha en 127.0.0.1:%s, detrás de nginx. Para cambiar el puerto:  orbit port %s <puerto>" "$A_PORT" "$name"
           fi ;;
+        # Éstas no son de la app ni siquiera en el build: Orbit las fija también
+        # ahí y en 'orbit exec' (ver _unit_pinned_env), así que valga para el
+        # tipo que sea.
+        HOME|PATH|COREPACK_HOME|DENO_DIR)
+          warn "%s la fija Orbit en el build, en 'orbit exec' y al arrancar la app: el valor del .env se ignora." "$key"
+          [[ "$key" == "PATH" ]] && info "Las herramientas tienen que estar en %s, que es lo que ve la unidad." "$UNIT_PATH" ;;
       esac
       if [[ "$restart" == "yes" ]] && needs_svc "$A_TYPE"; then
         systemctl restart "$(svc_name "$name")"; ok "«%s» reiniciada" "$name"
@@ -12965,6 +13162,8 @@ cmd_remove() {
   # Las tareas programadas del orbit.json también son de la app: un temporizador
   # huérfano seguiría lanzando órdenes contra una carpeta que ya no existe.
   _cron_remove_all "$name"
+  # Y el testigo de una release a medias, que es de esta app y de nadie más.
+  rm -f "$(_rel_partial "$name")"
   # El pool se va siempre que exista: un pool huérfano apuntando a un usuario
   # que ya no está deja a php-fpm negándose a arrancar, y con él TODAS las
   # apps PHP del servidor.
@@ -13366,7 +13565,7 @@ _doctor_collect() {
   #
   # No se arregla desde aquí porque regenerar la unidad sin rehacer el build
   # dejaría la caché vacía: quien lo arregla de verdad es el despliegue.
-  local n ip days edad conn usa_php="" usa_hugo="" usa_go="" usa_bun="" usa_deno="" viejas=""
+  local n ip days edad conn orphan usa_php="" usa_hugo="" usa_go="" usa_bun="" usa_deno="" viejas=""
   for n in $(app_names); do
     load_app "$n"
     [[ "$A_TYPE" == "php" || "$A_TYPE" == "laravel" || "$A_PHP" == "yes" ]] \
@@ -13447,6 +13646,25 @@ _doctor_collect() {
       _doc warn "maint-$n" \
         "$(t "'%s' está en mantenimiento y responde 503 desde hace %s min" "$n" "$edad")" \
         "$(t "quítalo con:  orbit maintenance off %s" "$n")"
+    fi
+    # Lo que deja un despliegue que no llegó a su trampa de salida (SIGKILL,
+    # corte de luz): una release a medias y, si iba por el reinicio sin corte,
+    # la unidad puente. El despliegue siguiente recoge las dos, pero hasta
+    # entonces la release sale en 'orbit rollback' como destino, y el puente
+    # sigue corriendo con su fichero en /etc/systemd/system. Si hay un
+    # despliegue en marcha, las dos cosas son suyas y no se dice nada.
+    #
+    # Sin acción, por lo mismo que el mantenimiento: retirar un puente sin oír
+    # antes a la canónica puede ser el corte (§5.2), y quien sabe hacerlo con
+    # cuidado es el despliegue.
+    if ! _app_busy "$n"; then
+      orphan="$(_rel_partial_orphan "$n")"
+      [[ -n "$orphan" ]] && _doc warn "partial-$n" \
+        "$(t "'%s' tiene a medias la release %s, de un despliegue interrumpido" "$n" "${orphan##*/}")" \
+        "$(t "no vuelvas a ella; el próximo despliegue la borra:  orbit deploy %s" "$n")"
+      [[ -f "$(svc_next_unit "$n")" ]] && _doc warn "bridge-$n" \
+        "$(t "Quedó la unidad puente %s de un despliegue interrumpido" "$(svc_next_name "$n")")" \
+        "$(t "el próximo despliegue la retira:  orbit deploy %s" "$n")"
     fi
     # Una cola sin nadie que la ejecute: los trabajos se apilan, la web sigue
     # contestando 200 y no hay error en ninguna parte (medido, §18.9). El aviso
@@ -14541,6 +14759,13 @@ _i18n_en() {
     ["La app no responde. Rollback automático…"]="The app is not answering. Rolling back automatically…"
     ["Restaurada la release anterior: %s"]="Previous release restored: %s"
     ["Quedaba una unidad puente de un despliegue anterior; la retiro"]="A bridge unit from a previous deploy was left behind; removing it"
+    ["ya había algo con el nombre de la release nueva"]="something already had the new release's name"
+    ["No he podido crear la release %s: ya hay algo con ese nombre. Nada tocado."]="Could not create release %s: something with that name already exists. Nothing touched."
+    ["Quedaba a medias la release %s de un despliegue interrumpido; la borro."]="Release %s was left half-built by an interrupted deploy; removing it."
+    ["'%s' tiene a medias la release %s, de un despliegue interrumpido"]="'%s' has release %s half-built, left by an interrupted deploy"
+    ["no vuelvas a ella; el próximo despliegue la borra:  orbit deploy %s"]="do not roll back to it; the next deploy removes it:  orbit deploy %s"
+    ["Quedó la unidad puente %s de un despliegue interrumpido"]="Bridge unit %s was left behind by an interrupted deploy"
+    ["el próximo despliegue la retira:  orbit deploy %s"]="the next deploy removes it:  orbit deploy %s"
     ["Reinicio sin corte: la release nueva arranca en el puerto %s y la anterior sigue sirviendo"]="Zero-downtime restart: the new release starts on port %s while the previous one keeps serving"
     ["la release nueva no respondió al health check"]="the new release did not answer the health check"
     ["La release nueva no responde. La versión anterior no se ha parado y sigue sirviendo."]="The new release is not answering. The previous version was never stopped and keeps serving."
@@ -14878,6 +15103,8 @@ _i18n_en() {
     ["'%s' es estática, no tiene servicio. Usa 'orbit deploy'."]="'%s' is static, it has no service. Use 'orbit deploy'."
     ["'%s' no tiene ninguna release activa. Ejecuta:  orbit deploy %s"]="'%s' has no live release. Run:  orbit deploy %s"
     ["Aquí NODE_ENV=production, así que npm y pnpm se saltarán las devDependencies."]="NODE_ENV=production here, so npm and pnpm will skip devDependencies."
+    ["%s la fija Orbit en el build, en 'orbit exec' y al arrancar la app: el valor del .env se ignora."]="Orbit sets %s for the build, for 'orbit exec' and when starting the app: the value in .env is ignored."
+    ["Las herramientas tienen que estar en %s, que es lo que ve la unidad."]="Tools have to be in %s, which is what the unit sees."
     ["Para instalar y compilar usa 'orbit deploy %s'."]="To install and build use 'orbit deploy %s'."
     ["No he podido leer los ajustes de Django: nginx no servirá /static/."]="I could not read Django's settings: nginx will not serve /static/."
     ["Compruébalo con:  orbit exec %s '%s'"]="Check it with:  orbit exec %s '%s'"
