@@ -1721,4 +1721,40 @@ run cmd_rollback corte "../../../fuera/x" >"$TMP/rb1" 2>&1; r=$?
 check "rechaza una ruta"                   "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
 check "y current no se mueve"              "1" "$(readlink -f "$CBASE/current" | grep -c "^$CBASE/releases/")"
 
+section "Una app con proceso aprende al desplegar dónde están sus recursos"
+# A_ASSETS no se detecta al crear la app sino al desplegar, mirando lo que ha
+# dejado el build: así una app de antes de que existiera lo tiene en su
+# siguiente despliegue sin tocar nada. Y un build que ya no deja la carpeta
+# —un 'buildAssetsDir' propio— lo vacía: el vhost no puede interceptar un
+# prefijo cuyo disco no tiene nada.
+needs_svc() { [[ "$1" == "node" ]]; }
+journalctl() { :; }
+curl() { [[ "$*" == *http_code* ]] && printf 200; return 0; }
+NUX="$TMP/origin-nuxt"
+git init -q -b main "$NUX"
+printf '{"dependencies":{"nuxt":"^4.6.4"}}\n' > "$NUX/package.json"
+git -C "$NUX" add -A; git -C "$NUX" -c user.email=o@t -c user.name=O commit -qm nuxt
+mkapp vieja node 3996 vieja.test
+# Una configuración de antes: sin el campo.
+load_app vieja; A_REPO="$NUX"; A_BRANCH="main"; A_START="true"
+A_BUILD='mkdir -p .output/public/_nuxt && echo x > .output/public/_nuxt/e.js'
+save_app; sed -i '/^A_ASSETS=/d' "$(app_conf vieja)"
+run cmd_deploy vieja >"$TMP/pa1" 2>&1; r=$?
+[[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/pa1"
+check "despliega"                          "0" "$r"
+load_app vieja
+check "y apunta sus recursos"              '/_nuxt/:.output/public !/_nuxt/builds/' "$A_ASSETS"
+check "el vhost los sirve de disco"        "1" "$(grep -c '^    location /_nuxt/ {$' "$TMP/vhost-vieja.conf")"
+check "con la anterior detrás"             "1" "$(grep -c "root $TMP/apps/vieja/previous/.output/public;" "$TMP/vhost-vieja.conf")"
+check "y lo que falte, a la app"           "1" "$(grep -c '^    location @orbit_app {$' "$TMP/vhost-vieja.conf")"
+check "lo dice"                            "1" "$(grep -c 'nginx servirá los recursos de la app desde disco' "$TMP/pa1")"
+load_app vieja; A_BUILD='mkdir -p .output/public/static'; save_app
+run cmd_deploy vieja >"$TMP/pa2" 2>&1; r=$?
+check "sin la carpeta, despliega igual"    "0" "$r"
+load_app vieja
+check "y el campo se vacía"                "" "$A_ASSETS"
+check "el vhost ya no la intercepta"       "0" "$(grep -c 'location /_nuxt/' "$TMP/vhost-vieja.conf")"
+check "y lo dice"                          "1" "$(grep -c 'No encuentro en la release la carpeta de /_nuxt/' "$TMP/pa2")"
+unset -f needs_svc journalctl curl
+
 report

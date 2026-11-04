@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.4"
+ORBIT_VERSION="1.4.5"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -1397,6 +1397,7 @@ ORBIT_APP_FIELDS=(
   A_NAME A_REPO A_BRANCH A_DOMAIN A_ALIASES A_TYPE A_PKG A_BUILD
   A_START A_OUTDIR A_SPA A_PORT A_USER A_DOCROOT A_PYAPP A_APPDIR A_PYMGR A_PYFW
   A_MIGRATE A_STATIC_URL A_STATIC_ROOT A_MEDIA_URL A_MEDIA_ROOT
+  A_ASSETS
   A_REDIRECT A_REDIRECT_CODE A_AUTODEPLOY A_AUTOFAIL A_MAINT_AUTO A_QUEUE
   A_CHECKS A_WATCH_SEEN A_CI_SEEN
   A_PHP A_PNPM_ALLOW A_NODE_HEAP A_SHARED A_ENV_FILE A_ENV_SPEC
@@ -3468,8 +3469,11 @@ EOF
 # <quitar> es para las location con 'alias' (Next, los estáticos de Django):
 # en una named location no se puede usar 'alias', así que se reescribe la URL
 # sin el prefijo y se sirve con 'root'.
-_prev_location() { # _prev_location <nombre> <carpeta en la release> <prefijo a quitar> <expires> <Cache-Control>
-  local tag="$1" dir="$2" strip="$3" exp="$4" cc="$5" root
+#
+# <si falta> es adónde va lo que tampoco esté en la anterior: el 404 de nginx
+# por defecto, o '@orbit_app' en las apps con proceso (_proc_assets_block).
+_prev_location() { # _prev_location <nombre> <carpeta en la release> <prefijo a quitar> <expires> <Cache-Control> [si falta]
+  local tag="$1" dir="$2" strip="$3" exp="$4" cc="$5" miss="${6:-=404}" root
   root="$(app_previous "$A_NAME")"
   [[ -n "$dir" && "$dir" != "." ]] && root="$root/${dir%/}"
   printf '\n    location @orbit_prev_%s {\n        root %s;\n' "$tag" "$root"
@@ -3482,7 +3486,7 @@ cat <<EOF
         access_log off;
         add_header Cache-Control "$cc";
 $(_sec_headers)
-        try_files \$uri =404;
+        try_files \$uri $miss;
     }
 EOF
 }
@@ -3667,6 +3671,7 @@ EOF
 }
 
 _body_proxy() {
+  _proc_assets_block
 cat <<EOF
     location / {
         limit_req zone=orbit_general burst=80 nodelay;
@@ -3674,6 +3679,167 @@ $(_maint_guard)
 $(_proxy_block)
     }
 EOF
+}
+
+# ── los recursos de las apps con proceso ────────────────────────────────
+# Lo mismo que _prev_location hace para las webs estáticas y para Next, en las
+# apps que sirven ellas sus propios recursos: Nuxt, SvelteKit con adapter-node,
+# Astro con @astrojs/node, React Router / Remix y Qwik. Ahí todo iba al proceso,
+# y el proceso de la release N+1 no conoce los chunks de la N: el HTML que un
+# visitante tiene abierto pedía uno y recibía un 404.
+#
+# A_ASSETS dice qué prefijo de URL es de recursos con hash y desde qué carpeta
+# de la release se sirve, con la semántica de 'root' de nginx:
+#
+#   A_ASSETS='/_nuxt/:.output/public !/_nuxt/builds/'
+#     /_nuxt/x.js  ->  <release>/.output/public/_nuxt/x.js
+#     !/_nuxt/builds/  sigue yendo a la app (ver _proc_assets_of)
+#
+# 'root' y no 'alias' a propósito: la anterior se sirve desde una named
+# location, que no admite 'alias', y la salida de Next —un 'rewrite … break'
+# que quita el prefijo— aquí no vale, porque lo que no está en ninguna de las
+# dos va a la app, y proxy_pass manda la URI **ya reescrita**: medido, la app
+# recibía '/x.js' en vez de '/_nuxt/x.js'. Con 'root' la URI no se toca nunca.
+#
+# Y lo que no está en ninguna de las dos va a la app, no a un 404. Es lo que
+# hace que equivocarse aquí no rompa nada: un 'buildAssetsDir' propio, un
+# 'base' o un recurso que el framework genera en marcha llegan al proceso igual
+# que antes de que existiera esto. Lo peor que puede pasar es lo de siempre.
+#
+# Prefijo normal y no '^~': las negaciones del snippet de seguridad son
+# expresiones regulares, y una location '^~' les ganaría. Así un
+# '/_nuxt/.env' o un '/_astro/x.sql' se niegan igual que en cualquier otro
+# sitio del vhost, también si sólo existen en la anterior.
+_proc_assets_block() {
+  [[ -n "${A_ASSETS:-}" ]] || return 0
+  local cur root e pre dir tag any="no"
+  cur="$(app_current "$A_NAME")"
+  local -a parts
+  read -ra parts <<<"$A_ASSETS"
+  for e in "${parts[@]}"; do
+    pre="${e#!}"; pre="${pre%%:*}"
+    # Lo escrito a mano en la configuración pasa por aquí, y una ruta con un
+    # ';' o un espacio es una directiva de nginx nueva. Se descarta y se dice.
+    if [[ ! "$pre" =~ ^/[A-Za-z0-9._/-]+/$ || "$pre" == *..* ]]; then
+      warn "A_ASSETS: «%s» no es un prefijo de URL válido; se ignora." "$e" >&2
+      continue
+    fi
+    if [[ "$e" == '!'* ]]; then
+cat <<EOF
+
+    location $pre {
+        limit_req zone=orbit_general burst=80 nodelay;
+$(_maint_guard)
+$(_proxy_block)
+    }
+EOF
+      continue
+    fi
+    dir="${e#*:}"
+    if [[ "$e" != *:* ]] || ! _safe_relpath "$dir"; then
+      warn "A_ASSETS: «%s» no es una carpeta dentro de la release; se ignora." "$e" >&2
+      continue
+    fi
+    root="$cur"; [[ "$dir" != "." ]] && root="$cur/$dir"
+    tag="${pre#/}"; tag="${tag%/}"; tag="app_${tag//[^A-Za-z0-9]/_}"
+cat <<EOF
+
+    location $pre {
+        root $root;
+        expires 1y;
+        access_log off;
+        add_header Cache-Control "public, immutable";
+$(_sec_headers)
+        try_files \$uri @orbit_prev_$tag;
+    }
+EOF
+    _prev_location "$tag" "$dir" "" 1y "public, immutable" @orbit_app
+    any="yes"
+  done
+  [[ "$any" == "yes" ]] || return 0
+cat <<EOF
+
+    location @orbit_app {
+        limit_req zone=orbit_general burst=80 nodelay;
+$(_maint_guard)
+$(_proxy_block)
+    }
+EOF
+}
+
+# Qué prefijos son de recursos con hash, según el framework. Cada uno salió de
+# compilar un proyecto real recién creado con su herramienta oficial, mirar el
+# árbol que deja y las URL que pide su HTML, y comprobar con curl qué marca
+# como inmutable el propio servidor del framework —porque nginx sólo pone
+# 'immutable' donde ya lo pone él—:
+#
+#   Nuxt 4         /_nuxt/            .output/public   (nitro: 1 año, immutable)
+#   SvelteKit 3    /_app/immutable/   build/client     (adapter-node: ídem)
+#   Astro 7        /_astro/           dist/client      (@astrojs/node: ídem)
+#   React Router   /assets/           build/client     (react-router-serve: ídem)
+#   Qwik 1 y 2     /build/ /assets/   dist             (todos sus adaptadores de servidor)
+#
+# Lo que se queda fuera, y por qué:
+#   · /_nuxt/builds/ es de Nuxt pero NO es inmutable: latest.json sale con
+#     'max-age=1' y es como el cliente se entera de que hay un despliegue
+#     nuevo. Con un año de caché ningún navegador se enteraría jamás.
+#   · /_app/version.json de SvelteKit, por lo mismo: está fuera de immutable/.
+#   · Angular SSR: sus ficheros con hash van en la raíz (main-HASH.js), sin
+#     prefijo propio, y su servidor les pone un año sin 'immutable'. Cubrirlo
+#     sería una location por extensión delante de las rutas de la app.
+#   · Los otros adaptadores de SvelteKit y Astro: no se han compilado.
+#
+# El orden es el de detect_stack, y tiene que serlo: un package.json con dos de
+# ellos se despliega como el primero, y sus recursos son los del primero.
+_proc_assets_of() { # _proc_assets_of <carpeta de la app>  -> imprime A_ASSETS, relativo a la app
+  local d="$1" deps
+  [[ -f "$d/package.json" ]] || return 0
+  deps="$(_json_keys "$d/package.json" deps || true)"
+  if grep -qx 'next' <<<"$deps"; then
+    : # Next tiene su propia location (_body_next)
+  elif grep -qx 'nuxt' <<<"$deps"; then
+    printf '%s' '/_nuxt/:.output/public !/_nuxt/builds/'
+  elif grep -qx 'astro' <<<"$deps"; then
+    grep -qx '@astrojs/node' <<<"$deps" && printf '%s' '/_astro/:dist/client'
+  elif grep -qx '@sveltejs/kit' <<<"$deps"; then
+    grep -qx '@sveltejs/adapter-node' <<<"$deps" && printf '%s' '/_app/immutable/:build/client'
+  elif grep -qxE '@react-router/serve|@remix-run/serve' <<<"$deps"; then
+    printf '%s' '/assets/:build/client'
+  elif grep -qxE '@builder\.io/qwik-city|@builder\.io/qwik|@qwik\.dev/router|@qwik\.dev/core' <<<"$deps"; then
+    printf '%s' '/build/:dist /assets/:dist'
+  fi
+  return 0
+}
+
+# Se decide al desplegar, con la release ya compilada, y no al detectar: lo
+# que manda es lo que el build ha dejado, igual que con los estáticos de Django
+# (paso 4b). Así una app que ya existía lo tiene en su siguiente despliegue sin
+# tocar nada, y un prefijo cuya carpeta no está —un 'buildAssetsDir' propio, un
+# 'outDir' distinto— no se apunta: nginx no lo intercepta y sigue la app.
+_proc_assets_apply() { # _proc_assets_apply <release>
+  local rel="$1" spec="" e pre dir out="" lost="" was="${A_ASSETS:-}"
+  case "$A_TYPE" in
+    node|bun|deno) spec="$(_proc_assets_of "$(_app_root "$rel")")" ;;
+  esac
+  local -a parts
+  read -ra parts <<<"$spec"
+  for e in "${parts[@]}"; do
+    [[ "$e" == '!'* ]] && continue
+    pre="${e%%:*}"; dir="$(_app_sub "${e#*:}")"
+    if [[ -d "$rel/$dir$pre" ]]; then out="${out:+$out }$pre:$dir"
+    else lost="${lost:+$lost }$pre"; fi
+  done
+  # Las excepciones sólo significan algo dentro de un prefijo que se sirve.
+  if [[ -n "$out" ]]; then
+    for e in "${parts[@]}"; do [[ "$e" == '!'* ]] && out="$out $e"; done
+  fi
+  A_ASSETS="$out"
+  [[ -n "$lost" && -z "$out" ]] && info "No encuentro en la release la carpeta de %s: esos recursos los sigue sirviendo la app." "$lost"
+  [[ -n "$out" ]] && ok "nginx servirá los recursos de la app desde disco, y los de la release anterior también"
+  # render_nginx relee la configuración del disco: si no se guarda aquí, el
+  # vhost se generaría con lo de antes.
+  [[ "$A_ASSETS" == "$was" ]] || save_app
+  return 0
 }
 
 # ── mantenimiento ────────────────────────────────────────────────────────
@@ -6714,6 +6880,11 @@ cmd_deploy() {
   if [[ "$A_TYPE" == python && "$A_PYFW" == django ]]; then
     _django_apply_settings "$name" "$rel" "$shared/.env"
   fi
+  # 4b' · las apps con proceso que sirven sus recursos: qué carpeta ha dejado
+  # el build, para que nginx los sirva y caiga a la release anterior (§4.1).
+  # Para todos los tipos, y no sólo los que tienen: el que deja de tener se
+  # queda vacío, en vez de con las rutas de lo que fue.
+  _proc_assets_apply "$rel"
 
   # 4c · Go: un build que sale bien y no deja binario.
   #
@@ -15969,6 +16140,10 @@ _i18n_en() {
     ["No he podido leer los ajustes de Django: nginx no servirá /static/."]="I could not read Django's settings: nginx will not serve /static/."
     ["Compruébalo con:  orbit exec %s '%s'"]="Check it with:  orbit exec %s '%s'"
     ["nginx servirá %s desde %s"]="nginx will serve %s from %s"
+    ["nginx servirá los recursos de la app desde disco, y los de la release anterior también"]="nginx will serve the app's assets from disk, and the previous release's as well"
+    ["No encuentro en la release la carpeta de %s: esos recursos los sigue sirviendo la app."]="I cannot find the folder for %s in the release: the app keeps serving those assets."
+    ["A_ASSETS: «%s» no es un prefijo de URL válido; se ignora."]="A_ASSETS: «%s» is not a valid URL prefix; ignoring it."
+    ["A_ASSETS: «%s» no es una carpeta dentro de la release; se ignora."]="A_ASSETS: «%s» is not a folder inside the release; ignoring it."
     ["STATIC_ROOT no está definido: Django no puede recopilar los estáticos"]="STATIC_ROOT is not defined: Django cannot collect the static files"
     ["y con DEBUG=False el sitio saldrá sin CSS. Añade a settings.py:"]="and with DEBUG=False the site will come out with no CSS. Add to settings.py:"
     ["MEDIA_ROOT está dentro de la release: lo que suban tus usuarios"]="MEDIA_ROOT is inside the release: whatever your users upload will"

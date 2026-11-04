@@ -113,7 +113,7 @@ check "y lo dice"             "1" "$(grep -c 'todavía no tiene logs' "$TMP/l4")
 # ═════════════════════════════════════════════ el formato, con nginx real ══
 command -v nginx >/dev/null || { echo; echo "nginx no está: me salto la comprobación del formato."; report; }
 
-NG="$TMP/ng"; PORT=18092
+NG="$TMP/ng"; PORT=$((18092 + ${ORBIT_TEST_PORT_OFFSET:-0}))
 mkdir -p "$NG"/{snippets,vhosts,logs,tmp}
 cert_file() { echo "$NG/certs/$1.crt"; }
 : > "$NG/snippets/orbit-acme.conf"

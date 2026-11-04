@@ -125,6 +125,7 @@ Inspirado en Capistrano, adaptado a un solo servidor.
 | 3 | Symlink de `shared/.env` dentro de la release | Aborta. |
 | 4 | Ejecutar el comando de build como usuario `deploy` | Borra la release, aborta. **Producción intacta.** |
 | 4b | Django: preguntar a los ajustes dónde han quedado los estáticos | Avisa y sigue sin servirlos desde nginx. |
+| 4b′ | Apps con proceso: buscar en la release la carpeta de sus recursos con hash (§4.1) | Si no está, no se apunta y los sigue sirviendo la app. |
 | 5 | Mover el symlink `current` (operación atómica) | — |
 | 6 | Poner la página de mantenimiento, regenerar la unidad y reiniciar | El testigo se retira con un `trap`. |
 | 7 | Health check: `curl` a `127.0.0.1:PORT` durante 40 s | **Rollback automático** al symlink anterior. |
@@ -156,9 +157,37 @@ Si Orbit desaparece, son dos enlaces y una `named location`: principio 3.
 
 **Qué cae a la anterior, y qué no.** Sólo lo que casa con la location de los recursos — extensiones de CSS, JS, fuentes, imágenes, wasm y mapas. Nunca una ruta ni un `.html`: servir la página vieja de una ruta es peor que un 404, porque parece que el despliegue no ha ocurrido. Nunca nada que la activa niegue, y eso no hay que repetirlo en ningún sitio: las negaciones son `location` que nginx elige **antes** de llegar aquí —el snippet de seguridad y `_php_root_denies` van delante como expresiones regulares, que se evalúan en orden; las subidas (§18.7) y las carpetas PHP de fuera (§18.7c) son prefijos `^~`, que ganan a todas—. Así un `/.env`, un `/vendor/x.js` o un `/api/viejo.js` que sólo existan en la anterior se niegan igual que si estuvieran en la activa, y hay una prueba por cada uno. Nunca PHP: la location no tiene `fastcgi`, y un `.php` lo resuelve el bloque de php-fpm contra el docroot de la activa. Y nunca `/sw.js`: es una location exacta, y un service worker viejo es justo lo que no se quiere resucitar.
 
-**Dónde está cubierto.** Las webs estáticas (con `A_OUTDIR` y `A_APPDIR`, en una SPA también), el `/_next/static/` de Next y el `/static/` de Django cuando su carpeta está dentro de la release —el `ManifestStaticFilesStorage` pone hashes igual que un bundler—. Next y Django sirven por `alias`, que una `named location` no admite, así que ahí la anterior se sirve con `root` y un `rewrite … break` que quita el prefijo. Las subidas (`/media/`) no: viven en `shared/`, que es la misma en todas las releases.
+**Dónde está cubierto.** Las webs estáticas (con `A_OUTDIR` y `A_APPDIR`, en una SPA también), el `/_next/static/` de Next, los recursos de las apps con proceso (más abajo, desde 1.4.5) y el `/static/` de Django cuando su carpeta está dentro de la release —el `ManifestStaticFilesStorage` pone hashes igual que un bundler—. Next y Django sirven por `alias`, que una `named location` no admite, así que ahí la anterior se sirve con `root` y un `rewrite … break` que quita el prefijo. Las subidas (`/media/`) no: viven en `shared/`, que es la misma en todas las releases.
 
-**Lo que queda fuera: las apps con proceso que sirven sus propios recursos** —Nuxt, SvelteKit con adaptador de Node, Astro SSR, Remix/React Router—. Ahí nginx no sirve nada de disco: todo va al proceso, y el proceso de la release anterior ya no existe. Cubrirlas es posible —interceptar el 404 del proceso sólo en las URL de recursos y servirlo de la carpeta de cliente de la anterior—, pero exige saber dónde deja cada framework su carpeta de cliente (`.output/public`, `build/client`, `dist/client`…), y Orbit no lo guarda: la detección sólo apunta el comando de arranque. Es detección nueva, y en este proyecto la detección se da por buena compilando un proyecto real de cada stack (§7), no leyendo su documentación.
+**Las apps con proceso que sirven sus propios recursos (1.4.5)** —Nuxt, SvelteKit con adapter-node, Astro con `@astrojs/node`, React Router / Remix y Qwik—. Hasta aquí todo iba al proceso, y el proceso de la N+1 no conoce los chunks de la N. Ahora nginx sirve de disco el prefijo de recursos con hash de cada framework, desde su carpeta de cliente, con la anterior detrás:
+
+| Framework | Prefijo | Carpeta (con `A_APPDIR` delante si la hay) | Quién lo marca inmutable |
+|---|---|---|---|
+| Nuxt 4 | `/_nuxt/` (menos `/_nuxt/builds/`) | `.output/public` | nitro, `max-age=31536000, immutable` |
+| SvelteKit 3 + adapter-node | `/_app/immutable/` | `build/client` | el handler de adapter-node |
+| Astro 7 + `@astrojs/node` | `/_astro/` | `dist/client` | `serve-static.js` del adaptador |
+| React Router 8 / Remix | `/assets/` | `build/client` | `react-router-serve` / `remix-serve` |
+| Qwik 1 y 2 | `/build/` y `/assets/` | `dist` | los adaptadores de servidor (express, node-server, fastify, bun, deno) |
+
+Cada fila salió de **compilar un proyecto real recién creado** con la herramienta oficial de cada uno, mirar el árbol que deja y las URL que pide su HTML, y preguntarle con `curl` a su propio servidor qué cabeceras pone: nginx sólo pone `immutable` donde ya lo pone el framework. Y la prueba de que sirve para algo se hizo entera: compilar dos veces con un cambio en medio, dejar la primera como `previous`, arrancar el servidor de verdad de la segunda y pedirle por el vhost de Orbit un chunk de la primera. Directo al proceso, 404 en los cinco; por nginx, 200 en los cinco.
+
+Tres decisiones que no son evidentes:
+
+- **Lo que no está en ninguna de las dos va al proceso, no a un 404.** La `named location` de la anterior termina en `@orbit_app`, que es el mismo proxy de `location /`. Es lo que hace que equivocarse no rompa nada: un `base`, un `buildAssetsDir` propio o un recurso que el framework genera en marcha llegan a la app exactamente como antes de que existiera esto. Y con el proceso caído, los recursos de las dos releases siguen saliendo de disco; lo que falta es un 502, no un 404 que nadie ha decidido.
+- **`root` y no `alias`.** La anterior se sirve desde una `named location`, que no admite `alias`, y la salida de Next —un `rewrite … break` que quita el prefijo— aquí no vale: el fallo hacia la app pasaría por `proxy_pass` con la URI **ya reescrita**, y la app recibiría `/x.js` en vez de `/_nuxt/x.js`. Por eso `A_ASSETS` guarda la carpeta de la que cuelga el prefijo y no la del prefijo. Hay una prueba que pide un fichero que sólo tiene el proceso, y con la URI reescrita no lo encontraría.
+- **Un prefijo normal, no `^~`.** Las negaciones del snippet de seguridad son expresiones regulares, y un `^~` les ganaría: un `/_nuxt/.env` que sólo exista en la anterior tiene que dar 403 igual que en cualquier otro sitio del vhost.
+
+**`/_nuxt/builds/` se queda en el proceso.** Es de Nuxt pero no es inmutable: `latest.json` sale con `max-age=1` y es como el cliente se entera de que hay un despliegue nuevo. Con un año de caché no se enteraría ningún navegador. En `A_ASSETS` es una excepción con `!`, que genera una location que va al proxy. El `/_app/version.json` de SvelteKit cumple la misma función, pero ya está fuera de `immutable/`.
+
+**Se decide al desplegar, mirando la release compilada** (paso 4b′), igual que los estáticos de Django. La tabla dice qué prefijo corresponde a cada framework; la release dice si la carpeta está. Si no está —un `outDir` o un `buildAssetsDir` distinto— el prefijo no se apunta y se dice. De ahí salen dos cosas gratis: una app que ya existía lo tiene en su siguiente despliegue sin tocar nada, y una que deja de ser de proceso se queda con el campo vacío. `A_ASSETS` se puede leer con `cat`:
+
+```
+A_ASSETS='/_nuxt/:apps/web/.output/public !/_nuxt/builds/'
+```
+
+No es una clave del `orbit.json`, como no lo son las rutas de Django: es lo que el build ha dejado, no lo que el repositorio declara.
+
+**Lo que se queda fuera.** **Angular SSR**: sus ficheros con hash van en la raíz de `browser/` —`main-HASH.js`, `chunk-HASH.js`— sin prefijo propio, y su `server.ts` les pone un año **sin** `immutable`; cubrirlo sería una location por extensión delante de las rutas de la app. **Un `base` propio** (Astro, Vite, React Router) cambia la URL y no la carpeta: el prefijo de Orbit no casa con nada y todo va al proceso, como antes. **Los adaptadores no medidos** —SvelteKit con Bun, Astro con Vercel o Cloudflare— no se apuntan aunque compilen algo con la misma forma.
 
 **Una y no las cinco.** El HTML que puede estar abierto es el de la release de la que se acaba de salir; cada salto más es otro `stat` en cada 404 de verdad, por un caso —dos despliegues dentro de la misma visita— que se arregla recargando.
 
@@ -740,6 +769,7 @@ A_STATIC_URL=''
 A_STATIC_ROOT=''
 A_MEDIA_URL=''
 A_MEDIA_ROOT=''
+A_ASSETS=''                 # recursos con hash de una app con proceso (§4.1)
 A_CREATED='2026-08-05T04:12:30+00:00'
 A_LASTDEPLOY='2026-08-05T04:12:30+00:00 e62fe1a'
 ```
