@@ -87,6 +87,24 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.5] - 2026-11-04
+
+La protección de 1.4.4 llega a las apps con proceso que sirven sus propios recursos. Ver ARCHITECTURE §4.1.
+
+### Añadido — los chunks de la release anterior, también en Nuxt, SvelteKit, Astro SSR, React Router y Qwik
+
+Con estas apps todo iba al proceso, y el proceso de la release nueva no conoce los chunks de la anterior: el HTML que un visitante tenía abierto pedía uno con hash y recibía un 404. Ahora nginx sirve de disco el prefijo de recursos de cada framework —`/_nuxt/`, `/_app/immutable/` (SvelteKit con adapter-node), `/_astro/` (Astro con `@astrojs/node`), `/assets/` (React Router / Remix), `/build/` y `/assets/` (Qwik)— desde la carpeta de cliente de la activa, cae a `previous`, y **lo que no está en ninguna va al proceso con su URI intacta**: un `base` o un `buildAssetsDir` propio, o un recurso que el framework genera en marcha, siguen funcionando como antes. Con el proceso caído, los recursos de las dos releases siguen saliendo. Un año e `immutable` sólo donde lo pone el propio framework; `/_nuxt/builds/` —el `latest.json` con `max-age=1` con el que Nuxt detecta los despliegues— sigue en el proceso. Las negaciones (`.env`, ocultos) ganan igual que en el resto del vhost.
+
+Cada prefijo salió de compilar un proyecto real recién creado de cada framework (Nuxt 4.6, SvelteKit 3.1, Astro 7.4, React Router 8.5, Qwik 1.20), y la protección se comprobó entera: dos builds con un cambio en medio, el servidor real de la segunda detrás del vhost de Orbit, y el chunk de la primera pidiéndose por nginx — 404 directo al proceso, 200 por nginx, en los cinco. Angular SSR se queda fuera: sus ficheros con hash van en la raíz, sin prefijo.
+
+### Configuración — `A_ASSETS`
+
+El despliegue apunta lo que encuentra en la release compilada, como los estáticos de Django: `A_ASSETS='/_nuxt/:.output/public !/_nuxt/builds/'` (prefijo y carpeta de la que cuelga, con `A_APPDIR` delante en un monorepo; `!` es lo que se queda en el proceso). Una app que ya existía lo tiene en su siguiente despliegue; si la carpeta no está, no se apunta y se dice. Sale en `info --json` como `app.config.assets`. No es una clave del `orbit.json`.
+
+### Pruebas
+
+`detect_test` con los árboles de los seis proyectos reales (26 comprobaciones), `nginx_test` contra nginx de verdad (20) y `deploy_test` con el camino de una app de antes (10). Cada rama nueva se puso en rojo quitándola (24 mutaciones). Las suites que levantan nginx aceptan `ORBIT_TEST_HTTP_PORT`, `ORBIT_TEST_HTTPS_PORT` y `ORBIT_TEST_PORT_OFFSET`, para poder correr dos a la vez en la misma máquina.
+
 ## [1.4.4] - 2026-11-04
 
 Desplegar ya no rompe la página de quien está a media visita, y los errores tienen cara. Todo probado contra nginx de verdad en `nginx_test` —55 comprobaciones nuevas— y el movimiento de `previous` en `deploy_test`; cada arreglo se puso en rojo quitándolo. Ver ARCHITECTURE §4.1 y §8.0b.

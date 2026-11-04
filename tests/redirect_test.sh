@@ -145,7 +145,7 @@ command -v nginx >/dev/null || {
   report
 }
 
-NG="$TMP/ng"; PORT=18400
+NG="$TMP/ng"; PORT=$((18400 + ${ORBIT_TEST_PORT_OFFSET:-0}))
 mkdir -p "$NG"/{snippets,vhosts,logs,tmp}
 : > "$NG/snippets/orbit-acme.conf"
 : > "$NG/snippets/orbit-security.conf"
