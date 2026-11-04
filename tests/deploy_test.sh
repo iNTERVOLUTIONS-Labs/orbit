@@ -240,6 +240,18 @@ check "conserva KEEP_RELEASES" "2" "$(count_releases)"
 check "sirve la ultima" "version cinco" "$(cat "$BASE/current/index.html")"
 check "la activa no se poda" "1" "$([[ -d "$BASE/current/" ]] && echo 1 || echo 0)"
 
+# Tras un rollback a una release vieja, la poda por nombre se llevaba justo la
+# que servía antes del despliegue: la más vieja de todas. Es el destino natural
+# del siguiente 'orbit rollback', y desaparecía.
+VIEJA="$(releases_desc "$BASE" | tail -1)"
+run cmd_rollback web "$VIEJA" >/dev/null 2>&1
+check "rollback a la más vieja" "$VIEJA" "$(current_release)"
+sleep 1; publish "version tras rollback"
+run cmd_deploy web >/dev/null 2>&1
+check "la que servía antes sobrevive a la poda" "1" \
+  "$([[ -d "$BASE/releases/$VIEJA" ]] && echo 1 || echo 0)"
+check "y la nueva sirve" "version tras rollback" "$(cat "$BASE/current/index.html")"
+
 section "Dos despliegues en el mismo segundo"
 # Sin desambiguar, ambos escribirían en la misma carpeta y la release
 # "anterior" a la que volver sería la que acabamos de sobrescribir.
@@ -642,6 +654,10 @@ run cmd_deploy tienda >"$TMP/lar4" 2>&1; r=$?
 cp "$SYSCTL_LOG" "$TMP/sysctl-rb"
 check "con la web rota, aborta"    "1" "$r"
 check "y vuelve a la anterior"     "$BUENA" "$(basename "$(readlink -f "$LBASE/current")")"
+# La rota no se queda: ocuparía un hueco de KEEP_RELEASES y saldría en
+# 'orbit rollback' como destino. Se sabe cuál era por el objeto que no hay, así
+# que se cuenta: la más reciente tiene que seguir siendo la buena.
+check "y borra la release rota"    "$BUENA" "$(releases_desc "$LBASE" | head -1)"
 # Y php-fpm otra vez al volver atrás: su caché apunta ya a la release rota, así
 # que sin recargar la web se queda en 500 con el symlink bien puesto. Medido.
 check "y recarga php-fpm al volver" "2" "$(grep -c "^reload php${PHP_VER}-fpm$" "$TMP/sysctl-rb")"
@@ -888,6 +904,20 @@ check "en qué paso"       "code"   "$(jq -r '.failed_step' < "$TMP/j2")"
 check "stdout sigue limpio" "1"    "$(wc -l < "$TMP/j2")"
 load_app web; A_BRANCH="main"; save_app
 
+section "El consejo de un build fallido no ensucia el objeto"
+# _build_advise y _build_recover proponían los comandos para copiar con un
+# 'printf' a secas: con --json salían por stdout delante del objeto —y en
+# 'deploy --all --json', dentro de su "result"—, y jq ya no podía leerlo.
+sleep 1; publish "version sin hugo"
+load_app web; A_BUILD='echo "hugo: command not found" >&2; exit 127'; save_app
+run cmd_deploy web >"$TMP/j6" 2>"$TMP/j6err"; r=$?
+check "falla"                   "1"      "$r"
+check "stdout sigue siendo JSON" "object" "$(jq -r 'type' < "$TMP/j6" 2>/dev/null || echo NO)"
+check "una sola línea"          "1"      "$(wc -l < "$TMP/j6")"
+check "sin el comando en stdout" "0"     "$(grep -c 'apt-get install' "$TMP/j6")"
+check "que sí sale por stderr"  "1"      "$(grep -c 'apt-get install -y hugo' "$TMP/j6err")"
+load_app web; A_BUILD=""; save_app
+
 section "Sin nombre de app no se inventa nada"
 # 'pick_app' preguntaría por stdout, que es justo donde va el objeto — y al
 # otro lado no hay nadie que conteste.
@@ -953,6 +983,10 @@ check "falla"               "1"      "$r"
 check "stdout sigue siendo JSON" "object" "$(jq -r 'type' < "$TMP/js1" 2>/dev/null || echo NO)"
 check "una sola linea"      "1"      "$(wc -l < "$TMP/js1")"
 check "no dice rollback"    "false"  "$(jq -r '.rolled_back' < "$TMP/js1")"
+# Sin anterior, 'current' se queda en la que ha fallado: borrarla dejaría el
+# symlink colgando, así que ésa sí se queda.
+check "la del primer despliegue se queda" "1" \
+  "$([[ -d "$(readlink -f "$TMP/apps/nueva/current")" ]] && echo 1 || echo 0)"
 check "dice donde fallo"    "service" "$(jq -r '.failed_step' < "$TMP/js1")"
 check "y lo explica"        "1"      "$(jq -r '.error' < "$TMP/js1" | grep -c 'no había release anterior')"
 
@@ -963,8 +997,14 @@ run cmd_deploy nueva >/dev/null 2>&1
 check "la segunda vez si despliega" "1" "$([[ -L "$TMP/apps/nueva/current" ]] && echo 1 || echo 0)"
 curl() { return 1; }                # y ahora vuelve a no responder
 JSON="yes"; _ui_route
+NANTES="$(releases_desc "$TMP/apps/nueva" | wc -l)"
 run cmd_deploy nueva >"$TMP/js2" 2>/dev/null
 check "ahora si hay rollback" "true" "$(jq -r '.rolled_back' < "$TMP/js2")"
+# Tras volver a la anterior, la que no respondió sobra: antes se quedaba, y
+# unas cuantas seguidas llenaban KEEP_RELEASES hasta podar la última buena.
+check "y la que no respondió se borra" "$NANTES" "$(releases_desc "$TMP/apps/nueva" | wc -l)"
+check "sin tocar la que sirve" "1" \
+  "$([[ -d "$(readlink -f "$TMP/apps/nueva/current")" ]] && echo 1 || echo 0)"
 unset -f curl; unset -f needs_svc; unset -f journalctl; unset -f sleep
 JSON="no"; _ui_route
 
@@ -1060,8 +1100,10 @@ curl() { return 1; }        # el puente nunca responde
 : > "$SYSCTL_LOG"; : > "$SEQ"
 publish "solape dos"
 JSON="yes"; _ui_route
+NANTES="$(releases_desc "$TMP/apps/fluida" | wc -l)"
 run cmd_deploy fluida >"$TMP/ov1" 2>/dev/null; r=$?
 JSON="no"; _ui_route
+check "la release del puente fallido no se queda" "$NANTES" "$(releases_desc "$TMP/apps/fluida" | wc -l)"
 check "falla"                    "1" "$r"
 check "la canónica no se reinició" "0" "$(grep -c '^restart orbit-fluida$' "$SYSCTL_LOG")"
 check "ni se paró"               "0" "$(grep -c '^stop orbit-fluida$' "$SYSCTL_LOG")"
@@ -1217,6 +1259,38 @@ else
   git -C "$SORIGIN" commit -q --allow-empty -m "otra"
   run cmd_deploy conshared >"$TMP/sh3" 2>&1
   check "y la tercera vez ya no es nueva" "0" "$(grep -c 'ruta compartida nueva' "$TMP/sh3")"
+
+  section "Rutas compartidas que se solapan no borran datos"
+  # Con ["data", "data/db.sqlite"], la primera deja $rel/data apuntando a
+  # shared/data, y el 'rm -rf' de la segunda atravesaba ese enlace y borraba
+  # shared/data/db.sqlite —la base de datos de verdad—; después 'ln' dejaba un
+  # enlace que se apuntaba a sí mismo. Es el orden en que pasa en la vida
+  # real: la carpeta ya estaba en la configuración y el repo añade el fichero.
+  printf 'LA BASE DE DATOS\n' > "$SBASE/shared/data/db.sqlite"
+  load_app conshared; A_SHARED="logs data"; save_app
+  # Y un enlace del propio repositorio en mitad de una ruta compartida: el
+  # 'rm -rf' de su hoja acabaría donde él apunte.
+  mkdir -p "$TMP/fuera-del-repo"; printf 'no me borres\n' > "$TMP/fuera-del-repo/clave.txt"
+  ln -sfn "$TMP/fuera-del-repo" "$SORIGIN/atajo"
+  printf '{ "type": "static", "outdir": ".", "shared": ["data/db.sqlite", "atajo/clave.txt"] }\n' > "$SORIGIN/orbit.json"
+  git -C "$SORIGIN" add -A; git -C "$SORIGIN" commit -qm "shared solapado"
+  sleep 1
+  run cmd_deploy conshared >"$TMP/sh4" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/sh4"
+  check "despliega"                       "0" "$r"
+  check "la base de datos sigue ahí"      "LA BASE DE DATOS" "$(cat "$SBASE/shared/data/db.sqlite" 2>/dev/null)"
+  check "y es un fichero, no un enlace"   "0" "$([[ -L "$SBASE/shared/data/db.sqlite" ]] && echo 1 || echo 0)"
+  check "y se lee desde la release"       "LA BASE DE DATOS" "$(cat "$SBASE/current/data/db.sqlite" 2>/dev/null)"
+  check "avisa de la que sobra"           "1" "$(grep -c "me salto 'data/db.sqlite', ya está dentro de 'data'" "$TMP/sh4")"
+  # Que siga siendo un fichero, no sólo que se lea igual: el fallo lo
+  # sustituía por un enlace a una copia en shared/, que se lee igual.
+  check "lo de fuera del repo no se toca" "1" \
+    "$([[ -f "$TMP/fuera-del-repo/clave.txt" && ! -L "$TMP/fuera-del-repo/clave.txt" ]] && echo 1 || echo 0)"
+  check "y lo dice"                       "1" "$(grep -c "me salto 'atajo/clave.txt'" "$TMP/sh4")"
+  git -C "$SORIGIN" rm -q atajo
+  printf '{ "type": "static", "outdir": ".", "shared": ["data", "logs"] }\n' > "$SORIGIN/orbit.json"
+  git -C "$SORIGIN" commit -qam "sin atajo"
+  load_app conshared; A_SHARED="logs data"; save_app
 
   section "rollback recarga php-fpm, igual que el despliegue"
   # Sin la recarga, la caché de realpath de php-fpm sigue resolviendo 'current'

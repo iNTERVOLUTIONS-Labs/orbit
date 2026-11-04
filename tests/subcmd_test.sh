@@ -113,7 +113,7 @@ check "'--once' sigue valiendo" "deploy_all --auto" "$(run cmd_autodeploy --once
 check "y 'once' también"        "deploy_all --auto" "$(run cmd_autodeploy once 2>/dev/null)"
 run cmd_autodeploy cada 9 >/dev/null 2>&1; r=$?
 check "'cada 9' lee el minuto"  "0" "$r"
-check "y lo guarda"             "1" "$(grep -c '^AUTODEPLOY_EVERY="9"' "$TMP/etc/orbit.conf")"
+check "y lo guarda"             "1" "$(grep -c "^AUTODEPLOY_EVERY='9'" "$TMP/etc/orbit.conf")"
 run cmd_autodeploy arrancar >/dev/null 2>&1; r=$?
 check "subcomando inventado"    "1" "$r"
 
