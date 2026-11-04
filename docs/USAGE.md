@@ -444,6 +444,18 @@ journalctl -u orbit-queue -n 30
 
 `orbit doctor` también avisa del caso contrario, que se lee peor porque no hay nada rojo en ninguna parte: una app con `QUEUE_CONNECTION=database` y **nadie** que ejecute la cola.
 
+## Quien está a media visita no nota el despliegue
+
+Cuando despliegas, quien tenía la web abierta sigue con el HTML de la versión anterior, y ese HTML pide sus ficheros con hash (`/_astro/index.Ab12.js`, `/assets/app-9f8e.css`). Orbit los sigue sirviendo desde la release anterior mientras la activa no los tenga, así que su página no se rompe a medias. Sólo recursos —CSS, JS, fuentes, imágenes—, nunca una página. Funciona en las webs estáticas, en el `/_next/static/` de Next y en el `/static/` de Django.
+
+Una consecuencia: un fichero que quitas del repositorio sigue saliendo **un despliegue más**. Si lo quitas porque no debía estar publicado, despliega dos veces.
+
+## Páginas de error
+
+- **404**: si tu build deja un `404.html` (o `404/index.html`) —Astro, Hugo, Eleventy, Jekyll, VitePress, Docusaurus y `next export` lo hacen—, se sirve con código 404. En una SPA, las rutas siguen yendo a `index.html` y es tu router quien pinta el «no encontrado».
+- **502 y 504**: si tu app (o php-fpm) no contesta, el visitante ve `/srv/apps/<app>/shared/50x.html` en vez de la página de nginx. Se crea sola y es tuya: edítala como quieras. Los errores que devuelve tu propia app pasan tal cual.
+- **429**: quien pasa del límite de peticiones recibe un 429, no la página de mantenimiento.
+
 ## Página de mantenimiento
 
 ```bash
