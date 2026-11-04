@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.3.8"
+ORBIT_VERSION="1.3.9"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -329,6 +329,11 @@ DEPLOY_LOCK_WAIT="${DEPLOY_LOCK_WAIT:-900}"  # segundos que se espera al desplie
 # "no" deja de mirar el .env.example del repo al desplegar (ver _provision_env).
 # Un repo concreto lo apaga con "env": {"example": false} en su orbit.json.
 ENV_EXAMPLE="${ENV_EXAMPLE:-yes}"
+# Cuánto puede tardar el comando 'release' del orbit.json (migraciones) antes de
+# darlo por colgado. Se corta y el despliegue se para sin tocar producción.
+RELEASE_TIMEOUT="${RELEASE_TIMEOUT:-600}"
+# Dónde se escriben las unidades de las tareas 'cron' del orbit.json.
+CRON_UNIT_DIR="${CRON_UNIT_DIR:-/etc/systemd/system}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/orbit}"
 BACKUP_KEEP="${BACKUP_KEEP:-14}"          # días que se conservan las copias
 BACKUP_HOOK="${BACKUP_HOOK:-}"            # comando al que se le pasa cada copia recién hecha
@@ -977,13 +982,36 @@ _deploy_version() { # _deploy_version <orden>
 # autodespliegue— se escribe un punto por segundo y ya: el '\r' no borra nada
 # sin terminal y dejaría cuarenta líneas casi iguales tapando el resultado, que
 # es la misma trampa que ya documenta el spinner.
+# Vale cualquier respuesta que no sea un 5xx ni un «no contesta». Antes era
+# 'curl -f', que falla con cualquier 4xx: una API sin ruta en '/' o detrás de un
+# 401 —Express, FastAPI, un mux de Go— no se podía desplegar jamás, y con el
+# reinicio sin corte ni siquiera llegaba a tener vhost. _http_wait, el de las
+# apps PHP, ya lo hacía así; los dos dicen ahora lo mismo. Y la ruta es la que
+# declare el repo en "health" (A_HEALTH_PATH), que es lo que debería mirarse.
+_health_ok() { # _health_ok <puerto> [ruta]
+  local code
+  code="$(curl -sS -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$1${2:-/}" 2>/dev/null)" || true
+  case "${code:-000}" in 000|5*) return 1 ;; esac
+  return 0
+}
+
+# El plazo de un despliegue: el que declare el orbit.json, si es mayor. Sólo en
+# los health checks del despliegue: 'orbit info' o el vigilante preguntan con
+# 1-5 s si la app contesta, y con un "timeout": 90 se quedaban colgados minuto
+# y medio cada vez que estaba caída.
+_deploy_health_secs() { # _deploy_health_secs <por defecto>
+  local d="$1"
+  [[ "${A_HEALTH_TIMEOUT:-}" =~ ^[0-9]+$ ]] && (( A_HEALTH_TIMEOUT > d )) && d="$A_HEALTH_TIMEOUT"
+  printf '%s' "$d"
+}
+
 health_wait() { # health_wait <puerto> [segundos]
   local port="$1" secs="${2:-40}" i llenos vacios bar
   local ancho=24
-  printf "  ${CYA}·${R} %s " "$(t "Comprobando salud en 127.0.0.1:%s" "$port")" >&$UI_FD
+  printf "  ${CYA}·${R} %s " "$(t "Comprobando salud en 127.0.0.1:%s" "$port${A_HEALTH_PATH:-}")" >&$UI_FD
   _ui_tty && printf "\n" >&$UI_FD
   for (( i = 0; i < secs; i++ )); do
-    if curl -fsS -o /dev/null -m 3 "http://127.0.0.1:$port/" 2>/dev/null; then
+    if _health_ok "$port" "${A_HEALTH_PATH:-/}"; then
       _ui_tty && printf "\r\033[K" >&$UI_FD
       printf "\n" >&$UI_FD; return 0
     fi
@@ -1032,7 +1060,7 @@ _http_code() { # _http_code <dominio> [puerto]
   # servidor vivo al otro lado.
   code="$(curl -sS -o /dev/null -m 10 -w '%{http_code}' \
             -H "Host: $1" -H 'X-Forwarded-Proto: https' \
-            "http://127.0.0.1:${2:-$NGINX_HTTP_PORT}/" 2>/dev/null)" || true
+            "http://127.0.0.1:${2:-$NGINX_HTTP_PORT}${A_HEALTH_PATH:-/}" 2>/dev/null)" || true
   printf '%s' "${code:-000}"
 }
 
@@ -1111,7 +1139,7 @@ _j_list() { # _j_list <elemento…> -> ["a","b"]
 # Es una función y no una variable porque se traduce —la 'y' del final es una
 # palabra— y esta línea corre antes de que main haya cargado el catálogo: una
 # variable se quedaría con la traducción vacía de ese momento.
-_json_cmds_help() { t "list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"; }
+_json_cmds_help() { t "list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'env check', 'cron list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"; }
 
 # Qué comandos hablan JSON. Está aquí y no repartido por el router porque main
 # necesita la misma respuesta dos veces: para sacar --json de los argumentos y
@@ -1125,6 +1153,7 @@ _json_capable() {
     backup|copia) return 0 ;;
     logs|log) return 0 ;;
     queue|cola|colas) return 0 ;;
+    cron) return 0 ;;
     version|-v|--version) return 0 ;;
     github|gh) return 0 ;;
     *) return 1 ;;
@@ -1323,6 +1352,7 @@ ORBIT_APP_FIELDS=(
   A_MIGRATE A_STATIC_URL A_STATIC_ROOT A_MEDIA_URL A_MEDIA_ROOT
   A_REDIRECT A_REDIRECT_CODE A_AUTODEPLOY A_AUTOFAIL A_MAINT_AUTO A_QUEUE
   A_PHP A_PNPM_ALLOW A_NODE_HEAP A_SHARED A_ENV_FILE A_ENV_SPEC
+  A_HEALTH_PATH A_HEALTH_TIMEOUT A_LIMIT_MEM A_LIMIT_CPU
   A_CREATED A_LASTDEPLOY
 )
 
@@ -4164,7 +4194,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 ReadWritePaths=$APPS_DIR/$name /run/php
 LimitNOFILE=65535
-
+$(_unit_limits)
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -5128,7 +5158,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
   render_systemd_next "$name" "$nport" "$rel"
   info "Reinicio sin corte: la release nueva arranca en el puerto %s y la anterior sigue sirviendo" "$nport"
   systemctl start "$nsvc"
-  if ! health_wait "$nport" 40; then
+  if ! health_wait "$nport" "$(_deploy_health_secs 40)"; then
     DEP_ERR="$(t "la release nueva no respondió al health check")"
     err "La release nueva no responde. La versión anterior no se ha parado y sigue sirviendo."
     printf "\n%s\n" "$(t "{d}Últimas líneas del log:{r}")" >&$UI_FD
@@ -5181,7 +5211,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
   # La unidad canónica arranca la release nueva en su puerto de siempre. El
   # hueco de este arranque lo atiende el puente, que es todo el sentido de esto.
   systemctl restart "$(svc_name "$name")"
-  if health_wait "$A_PORT" 40; then
+  if health_wait "$A_PORT" "$(_deploy_health_secs 40)"; then
     render_nginx "$name" || true
     if [[ "$NGINX_RELOAD_OK" == "yes" ]]; then
       OVERLAP_LIVE=""
@@ -5259,6 +5289,280 @@ _repo_shared() { # _repo_shared <release>  -> una ruta por línea
       | sed "s|^|$A_APPDIR/|"
   fi
   return 0
+}
+
+# ═══════════════════════════════ lo que el repo declara para su despliegue ══
+# Como 'shared' y 'env', estas claves del orbit.json se leen de la release que
+# se está desplegando y no se congelan al crear la app: el repositorio manda, y
+# cambiarlas es un PR que se revisa con el código que las necesita.
+#
+#   "release":     "php artisan migrate --force"   antes de activar; si falla, nada tocado
+#   "post_deploy": "php artisan queue:restart"     después; si falla, se avisa
+#   "health":      "/up"  o  {"path": "/up", "timeout": 90}
+#   "limits":      {"memory": "512M", "cpu": "50%"}
+#   "cron":        [{"name": "limpieza", "every": "5m", "command": "…"},
+#                   {"name": "informe",  "schedule": "Mon *-*-* 07:00", "command": "…"}]
+#
+# Es lo que Heroku llama release phase, Fly 'release_command', Render
+# 'preDeployCommand' y 'healthCheckPath', y Dokku 'cron' en su app.json. Aquí
+# acaba en lo de siempre: un comando del usuario de la app, una unidad y un
+# temporizador de systemd que se leen con 'cat' y sobreviven a Orbit.
+DEP_RELEASE_CMD=""
+DEP_POST_CMD=""
+DEP_CRON=""      # nombre·cuándo·tipo·comando·timeout, uno por línea (US de separador)
+
+_read_repo_runtime() { # _read_repo_runtime <release>
+  local f="$1/orbit.json" v
+  DEP_RELEASE_CMD=""; DEP_POST_CMD=""; DEP_CRON=""
+  A_HEALTH_PATH=""; A_HEALTH_TIMEOUT=""; A_LIMIT_MEM=""; A_LIMIT_CPU=""
+  [[ -f "$f" ]] || return 0
+  command -v jq >/dev/null || return 0
+  jq -e . "$f" >/dev/null 2>&1 || return 0
+  DEP_RELEASE_CMD="$(jq -r 'if (.release | type) == "string" then .release else "" end' "$f" 2>/dev/null || true)"
+  DEP_POST_CMD="$(jq -r 'if (.post_deploy | type) == "string" then .post_deploy else "" end' "$f" 2>/dev/null || true)"
+  # Una orden de una línea: va a parar a un 'bash -c' y a una unidad de systemd,
+  # y un salto de línea ahí es una segunda orden que nadie ha leído en el PR.
+  local k
+  for k in DEP_RELEASE_CMD DEP_POST_CMD; do
+    if [[ "${!k}" == *$'\n'* ]]; then
+      warn "orbit.json: '%s' tiene varias líneas; únelas con '&&'. Me lo salto." \
+        "$([[ "$k" == DEP_RELEASE_CMD ]] && echo release || echo post_deploy)"
+      printf -v "$k" '%s' ""
+    fi
+  done
+
+  v="$(jq -r 'if (.health | type) == "string" then .health elif (.health | type) == "object" then (.health.path // "") else "" end' "$f" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then
+    # Una ruta de URL y nada más: acaba en una línea de curl.
+    if [[ "$v" =~ ^/[A-Za-z0-9._~/?=\&%+-]*$ ]]; then A_HEALTH_PATH="$v"
+    else warn "orbit.json: 'health' («%s») no es una ruta que empiece por '/'; uso '/'." "$v"; fi
+  fi
+  v="$(jq -r 'if (.health | type) == "object" then (.health.timeout // "" | tostring) else "" end' "$f" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 5 && v <= 900 )); then A_HEALTH_TIMEOUT="$v"
+    else warn "orbit.json: 'health.timeout' tiene que ser un número de segundos entre 5 y 900; lo ignoro."; fi
+  fi
+
+  v="$(jq -r '.limits.memory // "" | tostring' "$f" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then
+    if [[ "$v" =~ ^[0-9]+[KMGT]?$ ]]; then A_LIMIT_MEM="$v"
+    else warn "orbit.json: 'limits.memory' («%s») no es un tamaño como 512M o 2G; lo ignoro." "$v"; fi
+  fi
+  v="$(jq -r '.limits.cpu // "" | tostring' "$f" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then
+    if [[ "$v" =~ ^[0-9]{1,4}%$ ]]; then A_LIMIT_CPU="$v"
+    else warn "orbit.json: 'limits.cpu' («%s») no es un porcentaje como 50%% o 200%%; lo ignoro." "$v"; fi
+  fi
+
+  DEP_CRON="$(jq -r '
+    (if (.cron | type) == "array" then .cron else [] end)[] |
+    select(type == "object") |
+    [ (.name // "" | tostring),
+      (if .every then (.every | tostring) else (.schedule // "" | tostring) end),
+      (if .every then "every" else "calendar" end),
+      (.command // "" | tostring),
+      (.timeout // "" | tostring)
+    ] | map(gsub("[\u001f\r]"; " ")) | join("\u001f")' "$f" 2>/dev/null || true)"
+  return 0
+}
+
+# Las líneas de límites para una unidad de la app. MemoryMax y CPUQuota son de
+# systemd (cgroups v2): en un solo VPS, una fuga de memoria de una app ya no se
+# lleva por delante a las demás, sólo a ella —el OOM killer elige dentro de su
+# cgroup— y Restart=always la vuelve a levantar.
+_unit_limits() {
+  [[ -n "${A_LIMIT_MEM:-}" ]] && printf 'MemoryMax=%s\n' "$A_LIMIT_MEM"
+  [[ -n "${A_LIMIT_CPU:-}" ]] && printf 'CPUQuota=%s\n' "$A_LIMIT_CPU"
+  return 0
+}
+
+# Ejecuta un comando del repo dentro de una release, como el usuario de la app y
+# con su .env cargado. Es el mismo camino que 'orbit exec', sobre una release
+# que todavía no es 'current'.
+_run_release_cmd() { # _run_release_cmd <release> <comando>
+  sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-release \
+    "$(app_shared "$A_NAME")/.env" "${A_PORT:-}" "$(_app_root "$1")" "$(app_corepack "$A_NAME")" \
+    timeout --kill-after=10 "$RELEASE_TIMEOUT" bash -c "$2"
+}
+
+# ─────────────────────────────────────────────────────────────── cron ─────────
+# Una tarea del orbit.json es un .service de tipo oneshot más su .timer, con el
+# mismo usuario, el mismo .env y el mismo cajón que la unidad de la app. Corre
+# sobre 'current', así que tras un despliegue la siguiente pasada ya ejecuta el
+# código nuevo. Un oneshot no puede arrancar mientras sigue activo, de modo que
+# dos pasadas nunca se solapan, que es el fallo clásico del cron de toda la vida.
+_cron_base()  { echo "$CRON_UNIT_DIR/orbit-$1.cron-$2"; }
+_cron_units() { # _cron_units <app>  -> nombres de las tareas con unidad escrita
+  local f n
+  for f in "$CRON_UNIT_DIR/orbit-$1.cron-"*.timer; do
+    [[ -e "$f" ]] || continue
+    n="${f##*/orbit-"$1".cron-}"; printf '%s\n' "${n%.timer}"
+  done
+  return 0
+}
+
+# Lo que va dentro de un ExecStart: systemd interpreta '%', '$' y las comillas,
+# así que se escapan para que la orden llegue a bash tal y como está escrita.
+_unit_quote() {
+  local v="$1"
+  v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//%/%%}"; v="${v//\$/\$\$}"
+  printf '"%s"' "$v"
+}
+
+_cron_when() { # _cron_when <every|calendar> <valor>  -> líneas [Timer], o 1 si no vale
+  local kind="$1" val="$2" n u secs
+  if [[ "$kind" == "every" ]]; then
+    [[ "$val" =~ ^([0-9]+)(s|m|h|d)$ ]] || return 1
+    n="${BASH_REMATCH[1]}"; u="${BASH_REMATCH[2]}"
+    case "$u" in s) secs=$n ;; m) secs=$((n*60)) ;; h) secs=$((n*3600)) ;; d) secs=$((n*86400)) ;; esac
+    (( secs >= 60 )) || return 1
+    printf 'OnBootSec=%s\nOnUnitActiveSec=%s\n' "$secs" "$secs"
+    return 0
+  fi
+  [[ -n "$val" && "$val" != *$'\n'* ]] || return 1
+  # La sintaxis de OnCalendar la valida quien la va a usar. Sin systemd-analyze
+  # (contenedores, pruebas) se acepta lo que tenga forma razonable.
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze calendar "$val" >/dev/null 2>&1 || return 1
+  else
+    [[ "$val" =~ ^[A-Za-z0-9*:/,.~\ -]+$ ]] || return 1
+  fi
+  printf 'OnCalendar=%s\nPersistent=true\n' "$val"
+}
+
+_cron_sync() { # _cron_sync <app>  (con la app cargada y DEP_CRON leído)
+  local name="$1" cname when kind cmd tout lines changed="no" seen=" "
+  install -d "$CRON_UNIT_DIR"
+  while IFS=$'\x1f' read -r -u 3 cname when kind cmd tout; do
+    [[ -n "$cname$cmd" ]] || continue
+    if [[ ! "$cname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; then
+      warn "cron: «%s» no vale como nombre (minúsculas, números y '-'); me la salto." "$cname"; continue
+    fi
+    [[ "$seen" == *" $cname "* ]] && { warn "cron: «%s» está repetida; me quedo con la primera." "$cname"; continue; }
+    if [[ -z "$cmd" || "$cmd" == *$'\n'* ]]; then
+      warn "cron: «%s» necesita un 'command' de una línea; me la salto." "$cname"; continue
+    fi
+    if ! lines="$(_cron_when "$kind" "$when")"; then
+      warn "cron: «%s» no tiene un '%s' válido («%s»); me la salto." "$cname" \
+        "$([[ "$kind" == every ]] && echo every || echo schedule)" "$when"
+      continue
+    fi
+    [[ "$tout" =~ ^[0-9]+$ ]] || tout=3600
+    seen+="$cname "
+    local base; base="$(_cron_base "$name" "$cname")"
+    local svc_new tmr_new
+    svc_new="$(cat <<EOF
+[Unit]
+Description=Orbit · $name · cron $cname
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=$(app_user)
+Group=$(app_user)
+WorkingDirectory=$(_app_root "$(app_current "$name")")
+EnvironmentFile=-$(app_shared "$name")/.env
+Environment=NODE_ENV=production
+Environment=PATH=$UNIT_PATH
+Environment=HOME=$(app_home "$name")
+ExecStart=/bin/bash -c $(_unit_quote "$cmd")
+TimeoutStartSec=$tout
+SyslogIdentifier=orbit-$name.cron-$cname
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$APPS_DIR/$name /run/php
+$(_unit_limits)
+EOF
+)"
+    tmr_new="$(printf '[Unit]\nDescription=Orbit · %s · cron %s\n\n[Timer]\n%s\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n' "$name" "$cname" "$lines")"
+    if [[ "$(cat "$base.service" 2>/dev/null)" != "$svc_new" || "$(cat "$base.timer" 2>/dev/null)" != "$tmr_new" ]]; then
+      printf '%s\n' "$svc_new" > "$base.service"
+      printf '%s\n' "$tmr_new" > "$base.timer"
+      changed="yes"
+    fi
+  done 3<<< "$DEP_CRON"
+
+  # Las que ya no declara el repo se retiran: una tarea quitada del orbit.json
+  # que siguiera corriendo sería exactamente el estado oculto del principio 5.
+  local old gone=()
+  while IFS= read -r old; do
+    [[ -n "$old" && "$seen" != *" $old "* ]] && gone+=("$old")
+  done < <(_cron_units "$name")
+  for old in "${gone[@]}"; do
+    systemctl disable --now "orbit-$name.cron-$old.timer" >/dev/null 2>&1 || true
+    rm -f "$(_cron_base "$name" "$old").timer" "$(_cron_base "$name" "$old").service"
+    changed="yes"
+    info "cron: «%s» ya no está en el orbit.json; la retiro." "$old"
+  done
+
+  [[ "$changed" == "yes" ]] && systemctl daemon-reload
+  local n=0 c
+  for c in $seen; do
+    systemctl enable --now "orbit-$name.cron-$c.timer" >/dev/null 2>&1 \
+      || warn "cron: no he podido activar «%s». Míralo con: systemctl status orbit-%s.cron-%s.timer" "$c" "$name" "$c"
+    n=$((n+1))
+  done
+  (( n > 0 )) && ok "%s tarea(s) programada(s): %s" "$n" "$(echo $seen)"
+  return 0
+}
+
+_cron_remove_all() { # _cron_remove_all <app>
+  local c removed="no"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    systemctl disable --now "orbit-$1.cron-$c.timer" >/dev/null 2>&1 || true
+    rm -f "$(_cron_base "$1" "$c").timer" "$(_cron_base "$1" "$c").service"
+    removed="yes"
+  done < <(_cron_units "$1")
+  [[ "$removed" == "yes" ]] && systemctl daemon-reload
+  return 0
+}
+
+cmd_cron() { # orbit cron [list] <app> [--json] · orbit cron run <app> <tarea>
+  need_root cron
+  local sub="list"
+  case "${1:-}" in list|run) sub="$1"; shift ;; esac
+  local name="${1:-}"
+  [[ -n "$name" || "$JSON" != "yes" ]] || die "uso: orbit cron list <app> --json"
+  [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
+  load_app "$name"
+  if [[ "$sub" == "run" ]]; then
+    local c="${2:-}"
+    [[ -n "$c" && -f "$(_cron_base "$name" "$c").service" ]] \
+      || die "'%s' no tiene ninguna tarea «%s». Míralas con 'orbit cron %s'." "$name" "$c" "$name"
+    info "Ejecutando «%s»… (la salida queda en: journalctl -u orbit-%s.cron-%s)" "$c" "$name" "$c"
+    systemctl start "orbit-$name.cron-$c.service" || die "La tarea «%s» ha fallado. Mira: journalctl -u orbit-%s.cron-%s -n 50" "$c" "$name" "$c"
+    ok "Hecho"
+    return 0
+  fi
+  local -a tasks=(); mapfile -t tasks < <(_cron_units "$name")
+  if [[ "$JSON" == "yes" ]]; then
+    local out="" sep="" c last next res
+    for c in "${tasks[@]}"; do
+      [[ -n "$c" ]] || continue
+      res="$(systemctl show -p Result --value "orbit-$name.cron-$c.service" 2>/dev/null || true)"
+      last="$(systemctl show -p LastTriggerUSec --value "orbit-$name.cron-$c.timer" 2>/dev/null || true)"
+      next="$(systemctl show -p NextElapseUSecRealtime --value "orbit-$name.cron-$c.timer" 2>/dev/null || true)"
+      out+="$sep$(printf '{"name":%s,"last_run":%s,"next_run":%s,"result":%s}' "$(_j_str "$c")" \
+        "$([[ -n "$last" && "$last" != n/a ]] && _j_str "$last" || echo null)" \
+        "$([[ -n "$next" && "$next" != n/a ]] && _j_str "$next" || echo null)" \
+        "$([[ -n "$res" ]] && _j_str "$res" || echo null)")"
+      sep=","
+    done
+    printf '{"schema":%s,"app":%s,"tasks":[%s]}\n' "$JSON_SCHEMA" "$(_j_str "$name")" "$out"
+    return 0
+  fi
+  if (( ${#tasks[@]} == 0 )) || [[ -z "${tasks[0]}" ]]; then
+    info "'%s' no tiene tareas programadas. Se declaran en el orbit.json del repo, en \"cron\"." "$name"
+    return 0
+  fi
+  local c
+  for c in "${tasks[@]}"; do
+    printf "  ${B}%s${R}  ${D}%s${R}\n" "$c" "$(grep -E '^(OnCalendar|OnUnitActiveSec)=' "$(_cron_base "$name" "$c").timer" 2>/dev/null | head -1)"
+  done
+  info "Próximas pasadas:  systemctl list-timers 'orbit-%s.cron-*'" "$name"
 }
 
 # Valida y apunta un CLAVE=valor de --env/--env-file. Se valida aquí, al leer
@@ -5534,6 +5838,11 @@ cmd_deploy() {
     DEP_ERR="$(t "faltan variables obligatorias: %s" "$ENV_MISSING_REQ")"
     die "Faltan variables obligatorias (%s). Nada tocado: la versión anterior sigue en producción." "$ENV_MISSING_REQ"
   fi
+  _read_repo_runtime "$rel"
+  # render_nginx recarga la app desde disco y se llevaría por delante lo que se
+  # acaba de leer de la release (es lo que le pasaba a A_ENV_FILE). Se apunta
+  # aquí y se repone después de cada recarga.
+  local rt_hp="$A_HEALTH_PATH" rt_ht="$A_HEALTH_TIMEOUT" rt_lm="$A_LIMIT_MEM" rt_lc="$A_LIMIT_CPU"
 
   # 3b · sembrar shared/storage antes de sustituirlo
   #
@@ -5636,6 +5945,23 @@ cmd_deploy() {
     _laravel_post_build "$name" "$rel" "$shared"
   fi
 
+  # El 'release' del orbit.json: migraciones y compañía, sobre la release nueva
+  # y antes de que reciba una sola petición. Si falla, la release se borra y
+  # producción ni se entera, que es la diferencia con hacerlo a mano después.
+  #
+  # Ojo con lo que esto NO deshace: si la migración se aplica y luego la
+  # release no pasa el health check, el rollback vuelve al código anterior pero
+  # no a la base de datos anterior. Por eso las migraciones tienen que ser
+  # compatibles hacia atrás (añadir antes de quitar), igual que en cualquier
+  # plataforma con release phase. Ver docs/USAGE.md.
+  if [[ -n "$DEP_RELEASE_CMD" ]]; then
+    if ! spin "$(t "Release: %s" "${DEP_RELEASE_CMD:0:52}")" _run_release_cmd "$rel" "$DEP_RELEASE_CMD"; then
+      rm -rf "$rel"
+      DEP_ERR="$(t "el comando 'release' ha fallado")"
+      die "El comando 'release' ha fallado. Nada tocado: la versión anterior sigue en producción."
+    fi
+  fi
+
   # 5 · symlink atómico
   # El build ya ha terminado, con reintento incluido si lo hubo: lo que se
   # apunta es lo que de verdad se tardó en compilar, no el mejor de los casos.
@@ -5678,7 +6004,7 @@ cmd_deploy() {
       # Aquí sí hay hueco, y lo tapa la página de mantenimiento.
       _maint_deploy_on "$name"
       systemctl restart "$(svc_name "$name")"
-      if health_wait "$A_PORT" 40; then
+      if health_wait "$A_PORT" "$(_deploy_health_secs 40)"; then
         _maint_deploy_off
         ok "Servicio %s respondiendo" "$(svc_name "$name")"
       else
@@ -5739,6 +6065,7 @@ cmd_deploy() {
   _dprog service ok
   _dstep nginx
   render_nginx "$name" || { DEP_ERR="$(t "nginx rechazó la configuración")"; die "nginx rechazó la configuración"; }
+  A_HEALTH_PATH="$rt_hp"; A_HEALTH_TIMEOUT="$rt_ht"; A_LIMIT_MEM="$rt_lm"; A_LIMIT_CPU="$rt_lc"
   ok "nginx recargado"
 
   # 7b · salud de las apps sin unidad
@@ -5836,6 +6163,7 @@ cmd_deploy() {
   # Y las rutas compartidas que el repo añadió: quedan apuntadas para que la
   # próxima vez no sean «nuevas» y para que las vea quien lea la configuración.
   A_SHARED="$shared_all"
+  A_HEALTH_PATH="$rt_hp"; A_HEALTH_TIMEOUT="$rt_ht"; A_LIMIT_MEM="$rt_lm"; A_LIMIT_CPU="$rt_lc"
   A_LASTDEPLOY="$(date -Iseconds) $sha"; save_app
   logline "deploy $name $stamp $sha"
 
@@ -5882,6 +6210,21 @@ cmd_deploy() {
     if [[ -f "$shared/storage/framework/maintenance.php" ]]; then
       warn "Ojo: '%s' sigue en mantenimiento por Laravel y devuelve 503 a todo." "$name"
       warn "Levántala con:  orbit exec %s '%s'" "$name" "$(_app_cd 'php artisan up')"
+    fi
+  fi
+
+  # Las tareas programadas se sincronizan con la release que ya sirve, nunca
+  # antes: una tarea nueva no puede ejecutar código que todavía no está en
+  # producción, ni una quitada seguir corriendo contra el código que la quitó.
+  # Siempre, aunque el repo no declare ninguna: así se retiran las que había.
+  _cron_sync "$name"
+
+  # Y 'post_deploy', que ya no puede deshacer nada: si falla se avisa, pero la
+  # release está activa y sana, y echarla atrás por un 'queue:restart' que no
+  # ha ido sería peor que el problema.
+  if [[ -n "$DEP_POST_CMD" ]]; then
+    if ! spin "$(t "Después: %s" "${DEP_POST_CMD:0:52}")" _run_release_cmd "$rel" "$DEP_POST_CMD"; then
+      warn "El comando 'post_deploy' ha fallado; la release nueva sigue activa."
     fi
   fi
 
@@ -12191,6 +12534,9 @@ cmd_remove() {
     rm -f "$(svc_unit "$name")" "$(svc_next_unit "$name")"
     systemctl daemon-reload
   fi
+  # Las tareas programadas del orbit.json también son de la app: un temporizador
+  # huérfano seguiría lanzando órdenes contra una carpeta que ya no existe.
+  _cron_remove_all "$name"
   # El pool se va siempre que exista: un pool huérfano apuntando a un usuario
   # que ya no está deja a php-fpm negándose a arrancar, y con él TODAS las
   # apps PHP del servidor.
@@ -13316,8 +13662,11 @@ cat <<EOF
     queue enable|disable|run|status <app>
                             Process a Laravel queue on a timer
     queue every <min>       How often the queue is emptied
-    env get|set|unset|list <app> [KEY] [value]
+    cron [list|run] <app> [task]
+                            The scheduled tasks declared in orbit.json
+    env get|set|unset|list|check <app> [KEY] [value]
                             Environment variables from a script
+    deploy <app> --env K=V  Set a variable right before the build
     maintenance on|off|edit|status [app] ["reason"]
                             Serve a notice page with code 503
     clone <app> [new]       Duplicate an app to set up a staging site
@@ -13406,8 +13755,11 @@ cat <<EOF
     queue enable|disable|run|status <app>
                             Procesar la cola de un Laravel por temporizador
     queue every <min>       Cada cuánto se vacía la cola
-    env get|set|unset|list <app> [CLAVE] [valor]
+    cron [list|run] <app> [tarea]
+                            Las tareas programadas que declara el orbit.json
+    env get|set|unset|list|check <app> [CLAVE] [valor]
                             Variables de entorno desde un script
+    deploy <app> --env K=V  Poner una variable justo antes del build
     maintenance on|off|edit|status [app] ["motivo"]
                             Servir una página de aviso con código 503
     clone <app> [nuevo]     Duplicar una app para montar un staging
@@ -13523,7 +13875,7 @@ _i18n_en() {
     ["Pulsa ENTER para continuar…"]="Press ENTER to continue…"
     ["Este comando necesita root. Usa:  sudo orbit %s"]="This command needs root. Use:  sudo orbit %s"
     ["Comprobando salud en 127.0.0.1:%s"]="Checking health on 127.0.0.1:%s"
-    ["list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"]="list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' and 'github branches'"
+    ["list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'env check', 'cron list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' y 'github branches'"]="list, info, status, doctor, top, metrics, traffic, deploy, version, 'env list', 'env check', 'cron list', 'db list', 'redirect list', 'watch status', 'queue status', 'github status', 'github repos' and 'github branches'"
     ["«%s» es además el nombre de una app; para esa escribe:  orbit %s %s %s"]="«%s» is also an app name; for that one type:  orbit %s %s %s"
     ["  uso: orbit %s <%s>%s"]="  usage: orbit %s <%s>%s"
     ["orbit %s: no sé qué es «%s»."]="orbit %s: I don't know what «%s» is."
@@ -13541,6 +13893,30 @@ _i18n_en() {
     ["%s variable(s) generada(s) en %s"]="%s variable(s) generated in %s"
     ["%s variable(s) guardada(s) en %s"]="%s variable(s) saved in %s"
     ["Faltan por definir: %s"]="Still undefined: %s"
+    ["orbit.json: '%s' tiene varias líneas; únelas con '&&'. Me lo salto."]="orbit.json: '%s' spans several lines; join them with '&&'. Skipping it."
+    ["orbit.json: 'health' («%s») no es una ruta que empiece por '/'; uso '/'."]="orbit.json: 'health' («%s») is not a path starting with '/'; using '/'."
+    ["orbit.json: 'health.timeout' tiene que ser un número de segundos entre 5 y 900; lo ignoro."]="orbit.json: 'health.timeout' must be a number of seconds between 5 and 900; ignoring it."
+    ["orbit.json: 'limits.memory' («%s») no es un tamaño como 512M o 2G; lo ignoro."]="orbit.json: 'limits.memory' («%s») is not a size like 512M or 2G; ignoring it."
+    ["orbit.json: 'limits.cpu' («%s») no es un porcentaje como 50%% o 200%%; lo ignoro."]="orbit.json: 'limits.cpu' («%s») is not a percentage like 50%% or 200%%; ignoring it."
+    ["cron: «%s» no vale como nombre (minúsculas, números y '-'); me la salto."]="cron: «%s» is not a valid name (lowercase, digits and '-'); skipping it."
+    ["cron: «%s» está repetida; me quedo con la primera."]="cron: «%s» is repeated; keeping the first one."
+    ["cron: «%s» necesita un 'command' de una línea; me la salto."]="cron: «%s» needs a one-line 'command'; skipping it."
+    ["cron: «%s» no tiene un '%s' válido («%s»); me la salto."]="cron: «%s» has no valid '%s' («%s»); skipping it."
+    ["cron: «%s» ya no está en el orbit.json; la retiro."]="cron: «%s» is no longer in orbit.json; removing it."
+    ["cron: no he podido activar «%s». Míralo con: systemctl status orbit-%s.cron-%s.timer"]="cron: could not enable «%s». Check it with: systemctl status orbit-%s.cron-%s.timer"
+    ["%s tarea(s) programada(s): %s"]="%s scheduled task(s): %s"
+    ["uso: orbit cron list <app> --json"]="usage: orbit cron list <app> --json"
+    ["'%s' no tiene ninguna tarea «%s». Míralas con 'orbit cron %s'."]="'%s' has no task «%s». See them with 'orbit cron %s'."
+    ["Ejecutando «%s»… (la salida queda en: journalctl -u orbit-%s.cron-%s)"]="Running «%s»… (output goes to: journalctl -u orbit-%s.cron-%s)"
+    ["La tarea «%s» ha fallado. Mira: journalctl -u orbit-%s.cron-%s -n 50"]="Task «%s» failed. See: journalctl -u orbit-%s.cron-%s -n 50"
+    ["Hecho"]="Done"
+    ["'%s' no tiene tareas programadas. Se declaran en el orbit.json del repo, en \"cron\"."]="'%s' has no scheduled tasks. They are declared in the repo's orbit.json, under \"cron\"."
+    ["Próximas pasadas:  systemctl list-timers 'orbit-%s.cron-*'"]="Next runs:  systemctl list-timers 'orbit-%s.cron-*'"
+    ["Release: %s"]="Release: %s"
+    ["el comando 'release' ha fallado"]="the 'release' command failed"
+    ["El comando 'release' ha fallado. Nada tocado: la versión anterior sigue en producción."]="The 'release' command failed. Nothing touched: the previous version is still live."
+    ["Después: %s"]="After: %s"
+    ["El comando 'post_deploy' ha fallado; la release nueva sigue activa."]="The 'post_deploy' command failed; the new release stays live."
     ["%s es un enlace simbólico y no un fichero. No lo sigo: sustitúyelo por el fichero de verdad y vuelve a desplegar."]="%s is a symlink, not a file. Not following it: replace it with the real file and deploy again."
     ["El .env de '%s' (%s) no es un fichero normal. No lo toco."]="The .env of '%s' (%s) is not a regular file. Not touching it."
     ["El .env de '%s' (%s) pasa por un enlace simbólico. No lo toco: lo cambió alguien que no es Orbit."]="The .env of '%s' (%s) goes through a symlink. Not touching it: someone other than Orbit changed it."
@@ -14601,6 +14977,7 @@ main() {
       fi ;;
     autodeploy)     cmd_autodeploy "$@" ;;
     queue|cola|colas) cmd_queue "$@" ;;
+    cron)           cmd_cron "$@" ;;
     maintenance|mant) cmd_maintenance "$@" ;;
     clone|copy)     cmd_clone "$@" ;;
     rollback)       cmd_rollback "$@" ;;

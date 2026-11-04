@@ -308,7 +308,7 @@ section "El mensaje de rechazo nombra a todos los que sí hablan"
 # un tiempo nombraba cuatro de los nueve, así que quien probaba 'db list --json'
 # y leía la respuesta concluía que no existía. La prueba cruza las dos listas
 # para que no se vuelvan a separar.
-for c in list info status doctor top traffic deploy version env db redirect watch queue; do
+for c in list info status doctor top traffic deploy version env db redirect watch queue cron; do
   run _json_capable "$c"; r=$?
   check "«$c» habla JSON"  "0" "$r"
 done
@@ -316,7 +316,7 @@ done
 for c in list info status doctor top traffic deploy version; do
   check "el mensaje nombra $c" "1" "$(grep -c "\b$c\b" <<<"$(_json_cmds_help)")"
 done
-for c in env db redirect watch queue; do
+for c in env db redirect watch queue cron; do
   check "el mensaje nombra $c" "1" "$(grep -c "'$c " <<<"$(_json_cmds_help)")"
 done
 

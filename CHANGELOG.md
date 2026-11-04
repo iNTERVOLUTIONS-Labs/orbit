@@ -87,6 +87,22 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.3.9] - 2026-11-04
+
+### Añadido — despliegues con pasos, declarados en el repo
+
+Lo que hasta ahora se hacía a mano en el servidor después de desplegar —migrar, reiniciar la cola, montar un temporizador de systemd para el cron del portal— se declara en el `orbit.json` y viaja con el código. Sale de mirar qué tienen Heroku (release phase), Fly (`release_command`, `checks`), Render (`preDeployCommand`, `healthCheckPath`, cron jobs) y Dokku (`cron` en `app.json`), quedándose con lo que cabe sin un demonio residente.
+
+- **`release`**: un comando sobre la release nueva, después del build y **antes** de activarla, con su `.env` y como el usuario de la app. Si falla, la release se borra y producción no se toca. `RELEASE_TIMEOUT` (600 s) lo corta si se cuelga
+- **`post_deploy`**: con la release ya activa y sana. Si falla se avisa y la release se queda
+- **`health`**: ruta y plazo del health check (`"/up"` o `{"path","timeout"}`)
+- **`limits`**: `MemoryMax=` y `CPUQuota=` en la unidad de la app, para que una fuga de memoria no tumbe a las demás del VPS
+- **`cron`**: tareas con `every` o `schedule` (sintaxis `OnCalendar`) que acaban en un `.service` oneshot más su `.timer`, con el usuario, el `.env` y el cajón de la app. Se sincronizan tras activar, se retiran las que se quitan del repo, y `orbit remove` se las lleva. `orbit cron [list|run] <app>` las enseña y las lanza; `orbit cron list --json` da la última y la próxima pasada
+
+### Corregido — el health check fallaba con cualquier 4xx
+
+`health_wait` usaba `curl -f`, que falla con cualquier código ≥ 400. Una API sin ruta en `/` o detrás de un 401 —Express, FastAPI, un mux de Go— hacía rollback en cada despliegue, y con el reinicio sin corte ni siquiera llegaba a tener vhost. El de las apps PHP ya aceptaba un 404; ahora los dos dicen lo mismo: vale todo lo que no sea un 5xx ni un «no contesta».
+
 ## [1.3.8] - 2026-11-04
 
 ### Añadido — las variables que faltan se piden justo antes del despliegue

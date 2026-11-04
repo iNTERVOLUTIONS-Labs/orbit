@@ -84,7 +84,7 @@ check "publica contract"            "1" "$(sed -n 's/.*"contract":\([0-9]*\).*/\
 section "Los comandos que dicen hablar JSON, lo hablan"
 while read -r c; do
   case "$c" in
-    env|db|database|redirect|redir|watch|queue|cola|colas|deploy|up|backup|copia|logs|log) continue ;;
+    env|db|database|redirect|redir|watch|queue|cola|colas|cron|deploy|up|backup|copia|logs|log) continue ;;
     metricas|métricas|trafico|tráfico|ls|show|check|-v|--version) continue ;;
     # 'info' exige el nombre de la app con --json, y hace bien: un cliente no
     # puede contestar a un selector. Se prueba abajo, en su sección.
