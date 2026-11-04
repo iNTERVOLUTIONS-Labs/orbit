@@ -772,6 +772,9 @@ En el despliegue, para cada variable **que aún no tenga valor**:
 |---|---|
 | `"generate": "hex:24"` | La genera y sigue. No pregunta nada. También `base64:N` y `uuid`. |
 | `"prompt": "…"` | Pregunta una vez. Con `"secret": true` no se ve al teclearla. |
+| `"desc": "…"` (o `{}`) | También se pregunta, con la descripción (o el nombre) como etiqueta. |
+| `"default": "…"` | Intro lo acepta; sin nadie al teclado se pone solo. |
+| `"required": true` | Sin valor, **el despliegue se para antes del build** y producción no se toca. |
 
 **Nunca se pisa un valor que ya exista.** Un redespliegue no puede cambiarle la contraseña a nadie, y un valor que hayas puesto tú a mano con `orbit env set` manda sobre cualquier generación posterior. Basta con que la clave **exista**, aunque esté vacía: `orbit env set app CLAVE ''` es la forma de desactivar algo opcional, y volver a generársela en cada despliegue sería deshacer una decisión tuya.
 
@@ -779,7 +782,7 @@ En el despliegue, para cada variable **que aún no tenga valor**:
 
 `orbit env get/set/list/edit` operan sobre ese mismo fichero, no sobre otro.
 
-Y si no hay nadie al teclado —`--yes`, autodeploy, CI—, las que había que preguntar no bloquean el despliegue: se avisa de cuáles faltan con el comando exacto para ponerlas después.
+Y si no hay nadie al teclado —`--yes`, `--json`, autodeploy, CI—, las que tienen `default` se ponen y las demás se apuntan con el comando exacto para ponerlas después. Sólo paran el despliegue las marcadas `"required": true`: una app sin la contraseña de su base de datos no es un despliegue a medias, es una web caída, y es mejor que falle **antes** de tocar nada.
 
 ```
 ✓ 1 variable(s) generada(s) en api/.env
@@ -787,6 +790,42 @@ Y si no hay nadie al teclado —`--yes`, autodeploy, CI—, las que había que p
   orbit env set mi-web IV_SMTP_USER '<valor>'
   orbit env set mi-web IV_SMTP_PASS '<valor>'
 ```
+
+#### Darlas en el mismo despliegue
+
+```bash
+orbit deploy mi-web --env IV_SMTP_PASS='abcd efgh' --env OTRA=1   # repetible
+orbit deploy mi-web --env-file ./produccion.env                   # CLAVE=valor por línea
+```
+
+Se escriben en el fichero declarado **antes** del build y cuentan como puestas a mano: los despliegues siguientes no las tocan. Es la forma de despachar una variable obligatoria desde CI o desde Orbit Desktop. (`--env` deja el valor en el historial del shell y en `ps` mientras dura el despliegue; para un secreto, mejor `--env-file` o la pregunta.)
+
+#### El `.env.example` del repositorio
+
+Si el repo trae un `.env.example` —junto al fichero declarado, en la carpeta de la app o en la raíz—, el despliegue compara y ofrece rellenar lo que falte:
+
+```
+· api/.env.example trae 2 variable(s) que tu .env no tiene: MAIL_HOST STRIPE_SECRET
+  ¿Les das valor ahora? [S/n] (Intro deja el del ejemplo; vacío, la salta):
+  MAIL_HOST [smtp.mailgun.org]:
+  STRIPE_SECRET:
+```
+
+En las que parecen secretos (`*_KEY`, `*_SECRET`, `*PASS*`, `*TOKEN*`…) no se ofrece el valor del ejemplo, que suele ser un marcador, y no se ve lo que tecleas. Sin nadie delante sólo se avisa: un ejemplo trae también lo opcional, así que **nunca para un despliegue**; lo que sea obligatorio de verdad se declara en `vars` con `required`. `"env": {"example": false}` lo apaga para un repo, `"example": "config/env.sample"` le dice dónde está, y `ENV_EXAMPLE="no"` en `/etc/orbit/orbit.conf`, para todo el servidor.
+
+#### Ver qué falta: `orbit env check`
+
+```
+$ orbit env check mi-web
+  ✓ IV_SMTP_USER
+  ✗ IV_SMTP_PASS  obligatoria, sin valor
+  ! MAIL_HOST  en el .env.example, sin valor
+  ✗ Faltan 1 variable(s) obligatoria(s): el próximo despliegue se parará antes del build.
+```
+
+Mira lo que pide la release que está sirviendo, sale con 1 si falta una obligatoria y con `--json` da `{"ok":…,"vars":[{"key","set","required","source"}]}` —sin valores—. `orbit deploy --json` trae además `"env_missing"`: lo que sigue sin valor tras desplegar.
+
+Los valores son de una línea: con saltos de línea o una comilla simple se rechazan, venga de donde venga, porque un `.env` es una variable por línea y systemd y bash no escapan la comilla igual. Un JSON se guarda compacto; una clave PEM, con los saltos escritos como `\n`.
 
 `file` es opcional y por defecto vale `.env` en la raíz de `shared/`. Se apunta a otro sitio cuando la app espera leerlo ella misma: en el ejemplo, `api/.env` está también en `shared`, así que se enlaza dentro de la release y el PHP lo encuentra al lado de su código. Eso es a propósito y no un rodeo: nginx no pasa las variables de `shared/.env` a PHP por FastCGI, y hacer que las pasara metería la contraseña dentro de la configuración de nginx —más legible que un `.env` con permisos `0640`—.
 

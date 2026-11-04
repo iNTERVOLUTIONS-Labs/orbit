@@ -1244,4 +1244,84 @@ else
   wait "$LPID" 2>/dev/null
 fi
 
+section "Una variable obligatoria sin valor para el despliegue antes del build"
+if ! command -v jq >/dev/null; then
+  echo "  jq no está instalado: me salto las variables obligatorias."
+else
+  RORIGIN="$TMP/reqorigin"
+  git init -q -b main "$RORIGIN"
+  git -C "$RORIGIN" config user.email orbit@test
+  git -C "$RORIGIN" config user.name Orbit
+  printf 'hola\n' > "$RORIGIN/index.html"
+  printf '{ "type": "static", "outdir": "." }\n' > "$RORIGIN/orbit.json"
+  git -C "$RORIGIN" add -A; git -C "$RORIGIN" commit -qm "uno"
+  {
+    A_NAME="conreq"; A_REPO="$RORIGIN"; A_BRANCH="main"; A_DOMAIN="conreq.test"
+    A_ALIASES=""; A_TYPE="static"; A_PKG="pnpm"; A_BUILD="touch construido"; A_START=""
+    A_OUTDIR="."; A_SPA="no"; A_PORT=""; A_DOCROOT=""; A_PHP=""; A_SHARED=""
+    A_ENV_FILE=""; A_ENV_SPEC=""
+    A_CREATED="2026-01-01T00:00:00+00:00"; A_LASTDEPLOY=""
+  }
+  save_app
+  run cmd_deploy conreq >"$TMP/rq0" 2>&1; r=$?
+  check "primer despliegue, sin variables" "0" "$r"
+  RBASE="$TMP/apps/conreq"; ANTES="$(readlink "$RBASE/current")"
+  NREL="$(releases_desc "$RBASE" | wc -l)"
+  cat > "$RORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "env": { "vars": { "DB_PASS": { "prompt": "Contraseña", "secret": true, "required": true },
+                     "OPCIONAL": { "desc": "algo" } } } }
+JSON
+  git -C "$RORIGIN" commit -qam "pide una obligatoria"
+  sleep 1
+  ASSUME_YES="yes" run cmd_deploy conreq >"$TMP/rq1" 2>&1; r=$?
+  check "sin nadie que la dé, falla"       "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  check "diciendo cuál"                    "1" "$(grep -c 'Faltan variables obligatorias (DB_PASS)' "$TMP/rq1")"
+  check "producción no se toca"            "$ANTES" "$(readlink "$RBASE/current")"
+  check "ni queda una release a medias"    "$NREL" "$(releases_desc "$RBASE" | wc -l)"
+  check "y el build ni se ejecuta"         "0" "$(grep -c 'Compilando' "$TMP/rq1")"
+
+  JSON="yes"; _ui_route
+  ASSUME_YES="yes" run cmd_deploy conreq >"$TMP/rq1.json" 2>/dev/null
+  JSON="no"; _ui_route
+  check "con --json, el error es JSON"     "1" "$(jq -e '.ok == false and (.error | test("DB_PASS"))' "$TMP/rq1.json" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+  sleep 1
+  ASSUME_YES="yes" run cmd_deploy conreq --env DB_PASS=s3creto >"$TMP/rq2" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/rq2"
+  check "con --env, despliega"             "0" "$r"
+  check "y la variable queda guardada"     "s3creto" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
+  check "la opcional sólo se avisa"        "1" "$(grep -c 'Faltan por definir: OPCIONAL' "$TMP/rq2")"
+
+  sleep 1
+  git -C "$RORIGIN" commit -q --allow-empty -m "otra"
+  JSON="yes"; _ui_route
+  ASSUME_YES="yes" run cmd_deploy conreq >"$TMP/rq3.json" 2>/dev/null
+  JSON="no"; _ui_route
+  check "--json dice qué sigue faltando"   '["OPCIONAL"]' "$(jq -c '.env_missing' "$TMP/rq3.json" 2>/dev/null)"
+
+  run cmd_deploy conreq --env 'MAL-NOMBRE=x' >"$TMP/rq4" 2>&1; r=$?
+  check "un --env con mal nombre se rechaza" "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  printf 'DB_PASS="otro"\n# comentario\nexport NUEVA=1\n' > "$TMP/vars.env"
+  sleep 1
+  ASSUME_YES="yes" run cmd_deploy conreq --env-file "$TMP/vars.env" >"$TMP/rq5" 2>&1; r=$?
+  check "--env-file despliega"             "0" "$r"
+  check "y pisa con lo que trae"           "otro" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
+  check "incluida una con export"          "1" "$(_env_read "$RBASE/shared/.env" NUEVA)"
+
+  section "orbit env check"
+  run cmd_env check conreq >"$TMP/ck1" 2>&1; r=$?
+  check "con todo puesto, sale bien"       "0" "$r"
+  JSON="yes"; _ui_route
+  run cmd_env check conreq >"$TMP/ck1.json" 2>/dev/null
+  JSON="no"; _ui_route
+  check "el JSON lo cuenta"                "true" "$(jq -r '.ok' "$TMP/ck1.json" 2>/dev/null)"
+  check "con la obligatoria marcada"       "true" "$(jq -r '.vars[] | select(.key=="DB_PASS") | .required' "$TMP/ck1.json" 2>/dev/null)"
+  check "y la opcional sin valor"          "false" "$(jq -r '.vars[] | select(.key=="OPCIONAL") | .set' "$TMP/ck1.json" 2>/dev/null)"
+  _env_write "$RBASE/shared/.env" DB_PASS
+  run cmd_env check conreq >"$TMP/ck2" 2>&1; r=$?
+  check "sin la obligatoria, falla"        "1" "$r"
+  check "y avisa del próximo despliegue"   "1" "$(grep -c 'se parará antes del build' "$TMP/ck2")"
+fi
+
 report
