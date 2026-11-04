@@ -2,8 +2,9 @@
 # Pruebas del vhost generado, con nginx de verdad.
 #   bash tests/nginx_test.sh
 #
-# Levanta un nginx aislado bajo un directorio temporal (puertos 18080/18443),
-# así que no toca /etc/nginx ni el nginx del sistema. Si no hay binario de
+# Levanta un nginx aislado bajo un directorio temporal (puertos 18080/18443
+# por defecto; ORBIT_TEST_HTTP_PORT y ORBIT_TEST_HTTPS_PORT los cambian), así
+# que no toca /etc/nginx ni el nginx del sistema. Si no hay binario de
 # nginx, la prueba se salta con aviso en vez de fallar.
 # shellcheck disable=SC2034  # estas pruebas asignan variables (A_*, PORT_BASE,
 # KEEP_RELEASES…) que lee el 'orbit' cargado por lib.sh, no este fichero.
@@ -19,8 +20,8 @@ command -v nginx >/dev/null || {
 }
 
 NG="$TMP/ng"
-HTTP_PORT=18080
-HTTPS_PORT=18443
+HTTP_PORT="${ORBIT_TEST_HTTP_PORT:-18080}"
+HTTPS_PORT="${ORBIT_TEST_HTTPS_PORT:-18443}"
 mkdir -p "$NG"/{snippets,vhosts,logs,certs,tmp}
 
 # Las pruebas apuntan los certificados a su propio directorio: así se ejercita
@@ -113,7 +114,7 @@ issue_cert concert.test
 issue_cert spa.test
 
 # app con proceso detrás: un servidor de verdad en el puerto interno
-BACKPORT=18099
+BACKPORT=$((18099 + ${ORBIT_TEST_PORT_OFFSET:-0}))
 mkdir -p "$TMP/back"
 printf 'respuesta del backend\n' > "$TMP/back/index.html"
 python3 -m http.server "$BACKPORT" --bind 127.0.0.1 --directory "$TMP/back" >/dev/null 2>&1 &
@@ -554,6 +555,42 @@ ln -sfn "$HOLD" "$TMP/apps/hibrida/previous"
 mkapp caida node 1 "caida.test"
 _errpage_ensure caida
 mkapp caidasin node 1 "caidasin.test"
+
+# Las apps con proceso que sirven sus propios recursos (§4.1). Nuxt, en un
+# monorepo para que la carpeta lleve A_APPDIR delante, con el proceso de
+# verdad detrás: el backend de python, que sirve $TMP/back. Lo que sólo tiene
+# el proceso es lo que demuestra que un recurso que no está en disco le llega
+# **con su URI**: si nginx la reescribiera, el backend no lo encontraría.
+PNA="$TMP/apps/procnuxt/releases/A"; PNB="$TMP/apps/procnuxt/releases/B"
+PNP="apps/web/.output/public"
+mkdir -p "$PNA/$PNP/_nuxt/builds" "$PNB/$PNP/_nuxt/builds" "$TMP/back/_nuxt/builds"
+printf 'nuxt chunk A\n'              > "$PNA/$PNP/_nuxt/a1.js"
+printf 'nuxt chunk B\n'              > "$PNB/$PNP/_nuxt/b2.js"
+printf 'estilo A\n'                  > "$PNA/$PNP/_nuxt/comun.css"
+printf 'estilo B\n'                  > "$PNB/$PNP/_nuxt/comun.css"
+printf 'latest del disco\n'          > "$PNA/$PNP/_nuxt/builds/latest.json"
+printf 'latest del disco\n'          > "$PNB/$PNP/_nuxt/builds/latest.json"
+# Lo que está en la anterior y no puede salir: ocultos, secretos, una página.
+printf 'FUGA oculto\n'               > "$PNA/$PNP/_nuxt/.oculto.js"
+printf 'SECRETO=FUGA\n'              > "$PNA/$PNP/_nuxt/viejo.env"
+printf 'pagina vieja FUGA\n'         > "$PNA/$PNP/vieja.html"
+printf 'del proceso\n'               > "$TMP/back/_nuxt/solo-app.js"
+printf 'latest del proceso\n'        > "$TMP/back/_nuxt/builds/latest.json"
+ln -sfn "$PNB" "$TMP/apps/procnuxt/current"
+ln -sfn "$PNA" "$TMP/apps/procnuxt/previous"
+mkapp procnuxt node "$BACKPORT" "procnuxt.test"
+A_APPDIR="apps/web"; A_ASSETS="/_nuxt/:$PNP !/_nuxt/builds/"; save_app
+# Qwik, con dos prefijos y el proceso caído: nadie escucha en el puerto 1.
+PQA="$TMP/apps/procqwik/releases/A"; PQB="$TMP/apps/procqwik/releases/B"
+mkdir -p "$PQA/dist/build" "$PQA/dist/assets" "$PQB/dist/build" "$PQB/dist/assets"
+printf 'qwik A\n'                    > "$PQA/dist/build/q-a.js"
+printf 'qwik B\n'                    > "$PQB/dist/build/q-b.js"
+printf 'grafo A\n'                   > "$PQA/dist/assets/g-a.json"
+ln -sfn "$PQB" "$TMP/apps/procqwik/current"
+ln -sfn "$PQA" "$TMP/apps/procqwik/previous"
+mkapp procqwik node 1 "procqwik.test"
+A_ASSETS='/build/:dist /assets/:dist'; save_app
+for app in procnuxt procqwik; do install_vhost "$app"; done
 
 for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp \
            skew spaskew nextapp caida caidasin; do install_vhost "$app"; done
@@ -1264,6 +1301,40 @@ check "apiweb: dentro de api/, no"   "404" "$(H -H 'Host: apiweb.test' "$SKU/api
 check "hibrida: vendor/ de la anterior, no" "404" "$(H -H 'Host: hibrida.test' "$SKU/vendor/viejo.js")"
 check "hibrida: un .php de la anterior, no" "404" "$(H -H 'Host: hibrida.test' "$SKU/viejo.php")"
 check "hibrida: ni se ejecuta"       "0" "$(BODY -H 'Host: hibrida.test' "$SKU/viejo.php" | grep -c 'EJECUTADO')"
+
+# Las apps con proceso: lo mismo, y lo que no está en ninguna va a la app.
+PN=(-H 'Host: procnuxt.test')
+check "proceso: chunk de la anterior" "nuxt chunk A" "$(BODY "${PN[@]}" "$SKU/_nuxt/a1.js")"
+check "proceso: el de la activa"     "nuxt chunk B" "$(BODY "${PN[@]}" "$SKU/_nuxt/b2.js")"
+check "proceso: los dos, la activa"  "estilo B"     "$(BODY "${PN[@]}" "$SKU/_nuxt/comun.css")"
+PNH="$(curl -sI --noproxy '*' -m 5 "${PN[@]}" "$SKU/_nuxt/a1.js")"
+check "proceso: inmutable"           "1" "$(grep -ci '^cache-control: public, immutable' <<<"$PNH")"
+check "proceso: con nosniff"         "1" "$(grep -ci '^x-content-type-options: nosniff' <<<"$PNH")"
+# La activa tiene su propia location, y su add_header anula los del server.
+PNH="$(curl -sI --noproxy '*' -m 5 "${PN[@]}" "$SKU/_nuxt/b2.js")"
+check "proceso: la activa, inmutable" "1" "$(grep -ci '^cache-control: public, immutable' <<<"$PNH")"
+check "proceso: y con nosniff"       "1" "$(grep -ci '^x-content-type-options: nosniff' <<<"$PNH")"
+# En ninguna de las dos: a la app, con la URI tal cual. Un 'buildAssetsDir'
+# propio o un recurso que el framework genera en marcha llegan igual que antes.
+check "proceso: si no está, a la app" "del proceso" "$(BODY "${PN[@]}" "$SKU/_nuxt/solo-app.js")"
+check "proceso: y su 404 es el de la app" "1"   "$(BODY "${PN[@]}" "$SKU/_nuxt/nada.js" | grep -c 'Error code: 404')"
+# latest.json es de Nuxt pero no es inmutable: así se entera el navegador de
+# que hay un despliegue nuevo. Lo contesta el proceso, con sus cabeceras.
+check "proceso: builds/, a la app"   "latest del proceso" "$(BODY "${PN[@]}" "$SKU/_nuxt/builds/latest.json")"
+check "proceso: y sin un año de caché" "0" \
+  "$(curl -sI --noproxy '*' -m 5 "${PN[@]}" "$SKU/_nuxt/builds/latest.json" | grep -ci immutable)"
+check "proceso: las rutas, a la app" "respuesta del backend" "$(BODY "${PN[@]}" "$SKU/")"
+check "proceso: una página vieja, no" "0"       "$(BODY "${PN[@]}" "$SKU/vieja.html" | grep -c FUGA)"
+check "proceso: oculto de la anterior" "403"    "$(H "${PN[@]}" "$SKU/_nuxt/.oculto.js")"
+check "proceso: .env de la anterior" "403"      "$(H "${PN[@]}" "$SKU/_nuxt/viejo.env")"
+# Con el proceso caído los recursos siguen saliendo, de las dos; lo que no
+# está es un 502 —ha ido a la app—, no un 404 que nadie ha decidido.
+PQ=(-H 'Host: procqwik.test')
+check "caída: /build/ de la anterior" "qwik A"  "$(BODY "${PQ[@]}" "$SKU/build/q-a.js")"
+check "caída: /build/ de la activa"  "qwik B"   "$(BODY "${PQ[@]}" "$SKU/build/q-b.js")"
+check "caída: el segundo prefijo"    "grafo A"  "$(BODY "${PQ[@]}" "$SKU/assets/g-a.json")"
+check "caída: lo que no está, 502"   "502"      "$(H "${PQ[@]}" "$SKU/build/nada.js")"
+check "caída: y la portada, 502"     "502"      "$(H "${PQ[@]}" "$SKU/")"
 
 # Y cuando la poda se lleva la anterior, el enlace queda colgando y el recurso
 # es un 404 normal: nada que limpiar en nginx.

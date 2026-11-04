@@ -221,7 +221,7 @@ command -v nginx >/dev/null || {
   report
 }
 
-NG="$TMP/ng"; PORT=18700
+NG="$TMP/ng"; PORT=$((18700 + ${ORBIT_TEST_PORT_OFFSET:-0}))
 mkdir -p "$NG"/{snippets,vhosts,logs,tmp,acme/.well-known/acme-challenge}
 printf 'token-de-certbot\n' > "$NG/acme/.well-known/acme-challenge/prueba"
 cat > "$NG/snippets/orbit-acme.conf" <<EOF
