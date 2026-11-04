@@ -152,7 +152,7 @@ render_nginx() { nginx_vhost "$1" > "$TMP/vhost-$1.conf"; }
 # no 502»— no se puede comprobar leyendo el vhost: hay que pedírselo a nginx.
 command -v nginx >/dev/null || { echo; echo "nginx no está: me salto la parte servida."; report; }
 
-NG="$TMP/ng"; PORT=18091
+NG="$TMP/ng"; PORT=$((18091 + ${ORBIT_TEST_PORT_OFFSET:-0}))
 mkdir -p "$NG"/{snippets,vhosts,logs,tmp,acme}
 cert_file() { echo "$NG/certs/$1.crt"; }
 cert_key()  { echo "$NG/certs/$1.key"; }

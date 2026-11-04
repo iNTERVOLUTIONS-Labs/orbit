@@ -1300,6 +1300,118 @@ check "genérico"          "flask" "$A_PYFW"
 detect_stack "$FX/django"; A_PYFW=""; detect_stack "$FX/plain"
 check "estático sin framework" "" "$A_PYFW"
 
+section "Los recursos con hash de las apps con proceso (§4.1)"
+# Los árboles son los que dejó compilar un proyecto real de cada uno, recién
+# creado con su herramienta oficial (create-nuxt, sv, create-astro con 'astro
+# add node', create-react-router, create-qwik con 'qwik add express' y el CLI
+# de Angular con --ssr): el package.json tal cual —sin los scripts que no
+# vienen al caso— y los ficheros de salida con sus nombres de verdad. Lo que se
+# afirma es lo que haría el despliegue: detectar, y después mirar la release
+# compilada.
+PA="$TMP/fx/procassets"
+_pa_tree() { # _pa_tree <dir> <package.json> <ficheros…>
+  local d="$1" pj="$2" f
+  shift 2
+  mkdir -p "$d"; printf '%s\n' "$pj" > "$d/package.json"
+  for f in "$@"; do mkdir -p "$d/$(dirname "$f")"; : > "$d/$f"; done
+}
+_pa() { # _pa <release> [tipo a la fuerza]  -> A_ASSETS como lo dejaría el despliegue
+  detect_stack "$1" >/dev/null 2>&1
+  [[ -n "${2:-}" ]] && A_TYPE="$2"
+  A_NAME="pa"; A_ASSETS=""
+  _proc_assets_apply "$1" >/dev/null 2>&1
+  printf '%s' "$A_ASSETS"
+}
+_pa_tree "$PA/nuxt" '{"scripts":{"build":"nuxt build","postinstall":"nuxt prepare"},"dependencies":{"nuxt":"^4.6.4","vue":"^3.5.44","vue-router":"^5.4.0"}}' \
+  nuxt.config.ts .output/server/index.mjs .output/public/favicon.ico \
+  .output/public/_nuxt/C7MYJjpX.js .output/public/_nuxt/entry.5pmmX_Ge.css .output/public/_nuxt/builds/latest.json
+_pa_tree "$PA/sk" '{"scripts":{"build":"vite build"},"devDependencies":{"@sveltejs/adapter-node":"^6.0.0","@sveltejs/kit":"^3.0.0","@sveltejs/vite-plugin-svelte":"^7.2.0","svelte":"^5.57.2","vite":"^8.3.0"}}' \
+  vite.config.ts build/index.js build/handler.js \
+  build/client/_app/immutable/entry/start.8S-jdUN6.js build/client/_app/version.json
+_pa_tree "$PA/astro" '{"scripts":{"build":"astro build"},"dependencies":{"@astrojs/node":"^11.1.9","astro":"^7.4.5"}}' \
+  astro.config.mjs dist/server/entry.mjs dist/client/favicon.svg dist/client/_astro/ssr.B9vmjEP2.css
+_pa_tree "$PA/rr" '{"scripts":{"build":"react-router build","start":"react-router-serve ./build/server/index.js"},"dependencies":{"@react-router/node":"^8.5.1","@react-router/serve":"^8.5.1","react":"^19.2.8","react-dom":"^19.2.8","react-router":"^8.5.1"},"devDependencies":{"@react-router/dev":"^8.5.1","vite":"^8.0.3"}}' \
+  build/server/index.js build/client/favicon.ico build/client/assets/root-CtQuFGQ3.css
+printf 'export default {\n  ssr: true,\n} satisfies Config;\n' > "$PA/rr/react-router.config.ts"
+_pa_tree "$PA/qwik" '{"scripts":{"build":"qwik build","serve":"node server/entry.express","start":"vite --open --mode ssr"},"dependencies":{"express":"4.22.0"},"devDependencies":{"@builder.io/qwik":"^1.20.3","@builder.io/qwik-city":"^1.20.3","vite":"7.3.1"}}' \
+  adapters/express/vite.config.ts server/entry.express.js dist/404.html \
+  dist/build/q-SockEqD2.js dist/assets/CZSFNKwK-bundle-graph.json
+_pa_tree "$PA/ng" '{"scripts":{"build":"ng build","serve:ssr:ng":"node dist/ng/server/server.mjs"},"dependencies":{"@angular/core":"^22.2.0","@angular/ssr":"^22.2.5","express":"^5.1.0"},"devDependencies":{"@angular/build":"^22.2.5"}}' \
+  dist/ng/server/server.mjs dist/ng/browser/main-7DC3NUIC.js dist/ng/browser/index.csr.html
+printf '{"projects":{"ng":{"architect":{"build":{"builder":"@angular/build:application"}}}}}\n' > "$PA/ng/angular.json"
+
+# Primero, que las versiones de ahora se siguen reconociendo como lo que son:
+# SvelteKit 3 lleva el adaptador en las devDependencies y la configuración en
+# vite.config.ts, y React Router va por la 8.
+for fw in nuxt sk astro rr qwik; do
+  detect_stack "$PA/$fw" >/dev/null 2>&1
+  check "$fw: app con proceso" "node" "$A_TYPE"
+done
+check "nuxt"                 '/_nuxt/:.output/public !/_nuxt/builds/' "$(_pa "$PA/nuxt")"
+check "sveltekit"            '/_app/immutable/:build/client'          "$(_pa "$PA/sk")"
+check "astro"                '/_astro/:dist/client'                   "$(_pa "$PA/astro")"
+check "react router"         '/assets/:build/client'                  "$(_pa "$PA/rr")"
+check "qwik, los dos"        '/build/:dist /assets/:dist'             "$(_pa "$PA/qwik")"
+# Angular deja sus ficheros con hash en la raíz, sin prefijo: no hay nada que
+# interceptar sin ponerse delante de las rutas de la app.
+check "angular ssr, no"      ''                                       "$(_pa "$PA/ng")"
+# Se guarda: render_nginx relee la configuración del disco.
+_pa "$PA/nuxt" >/dev/null; A_ASSETS="otra cosa"; load_app pa
+check "y queda guardado"     '/_nuxt/:.output/public !/_nuxt/builds/' "$A_ASSETS"
+
+# Lo que no se apunta. Un 'buildAssetsDir' propio deja la carpeta en otro
+# sitio: sin ella, nada —ni la excepción suelta— y los recursos siguen yendo a
+# la app, que es lo de siempre.
+_pa_tree "$PA/nuxtpropio" '{"dependencies":{"nuxt":"^4.6.4"}}' .output/server/index.mjs .output/public/static/C7MYJjpX.js
+check "nuxt sin su carpeta"  ''                                       "$(_pa "$PA/nuxtpropio")"
+_pa_tree "$PA/qwikmedio" '{"scripts":{"serve":"node server/entry.express"},"devDependencies":{"@builder.io/qwik-city":"^1.20.3"}}' \
+  adapters/express/vite.config.ts dist/build/q-SockEqD2.js
+check "qwik, sólo el que está" '/build/:dist'                         "$(_pa "$PA/qwikmedio")"
+# Otro adaptador no es el que se ha compilado.
+_pa_tree "$PA/skauto" '{"devDependencies":{"@sveltejs/adapter-auto":"^7","@sveltejs/kit":"^3.0.0"}}' build/client/_app/immutable/x.js
+check "sveltekit adapter-auto" ''                                     "$(_pa "$PA/skauto")"
+# Un Astro estático ya los tiene por _body_static; y uno con el adaptador de
+# otra plataforma sale con proceso (detect_stack), pero ése no es el que se ha
+# medido.
+_pa_tree "$PA/astrost" '{"dependencies":{"astro":"^7.4.5"}}' dist/client/_astro/x.css
+check "astro estático"       ''                                       "$(_pa "$PA/astrost")"
+_pa_tree "$PA/astrovercel" '{"dependencies":{"astro":"^7.4.5","@astrojs/vercel":"9"}}' dist/client/_astro/x.css
+check "astro con vercel"     ''                                       "$(_pa "$PA/astrovercel")"
+# Next tiene su location propia, aunque traiga algo con la misma forma y el
+# orbit.json lo haya declarado 'node' (un servidor propio).
+_pa_tree "$PA/nextpa" '{"dependencies":{"next":"15","@react-router/serve":"8"}}' build/client/assets/x.js
+check "next, la suya"        ''                                       "$(_pa "$PA/nextpa" node)"
+# Si la app deja de ser de proceso, el campo se vacía: con las rutas de lo que
+# fue, el vhost interceptaría un prefijo que ya no es de nadie.
+detect_stack "$PA/rr" >/dev/null 2>&1; A_TYPE="python"; A_ASSETS='/assets/:build/client'
+_proc_assets_apply "$PA/rr" >/dev/null 2>&1
+check "otro tipo, se vacía"  ''                                       "$A_ASSETS"
+load_app pa
+check "también en el disco"  ''                                       "$A_ASSETS"
+
+# Fuera de la raíz: la carpeta va con la subcarpeta delante, como toda ruta
+# que se guarda (relativa a la raíz de la release). Por los dos caminos: el
+# paquete de un workspace y la subcarpeta de 'orbit new --appdir'.
+mkdir -p "$PA/mono/apps"
+printf '{"private":true,"workspaces":["apps/*"],"devDependencies":{"turbo":"2"}}\n' > "$PA/mono/package.json"
+cp -r "$PA/nuxt" "$PA/mono/apps/web"
+check "nuxt en un workspace" '/_nuxt/:apps/web/.output/public !/_nuxt/builds/' "$(_pa "$PA/mono")"
+mkdir -p "$PA/sub"; cp -r "$PA/sk" "$PA/sub/front"
+detect_stack "$PA/sub" front >/dev/null 2>&1; A_ASSETS=""
+_proc_assets_apply "$PA/sub" >/dev/null 2>&1
+check "sveltekit con --appdir" '/_app/immutable/:front/build/client'  "$A_ASSETS"
+
+# Lo que llega escrito a mano a la configuración no puede colar una directiva
+# de nginx: un ';' en el prefijo o una carpeta fuera de la release se ignoran,
+# y se dice. Lo bueno de al lado sigue saliendo.
+mkapp pamano node 3009 pamano.test
+A_ASSETS='/a;b/:dist /x/:../../etc /ok/:dist'
+PAB="$(_proc_assets_block 2>"$TMP/pa.err")"
+check "a mano: sólo lo válido" "1" "$(grep -c '^    location /' <<<"$PAB")"
+check "y es el bueno"          "1" "$(grep -c '^    location /ok/ {$' <<<"$PAB")"
+check "lo dice, por stderr"    "2" "$(grep -c 'A_ASSETS: «' "$TMP/pa.err")"
+check "y nada fuera"           "0" "$(grep -c '\.\./\.\./etc\|a;b' <<<"$PAB")"
+
 section "Serialización de configuración"
 # Literales ${...} y comillas simples: la trampa que motivó _q().
 {
