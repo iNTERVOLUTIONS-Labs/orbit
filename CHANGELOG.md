@@ -87,6 +87,42 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.1] - 2026-11-04
+
+Una auditoría del camino de despliegue, leída con la lista de trampas de CLAUDE.md delante. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código).
+
+### Corregido — `orbit new` daba por bueno un primer despliegue roto a mitad
+
+El primer despliegue iba en `if ! ( cmd_deploy … )`, y dentro de la condición de un `if` bash apaga errexit para todo el subshell. Con rsync fallando al sacar la release, el despliegue seguía, `current` apuntaba a una carpeta vacía y el asistente terminaba en verde. Ahora usa la forma entera (`set +e; ( set -Eeuo pipefail; … ); rc=$?; set -e`).
+
+### Corregido — `orbit restore --all --deploy` se paraba en la primera app que fallaba
+
+Cada despliegue corría en el mismo shell con un `||`: errexit apagado dentro, y el primer `die` terminaba el proceso entero. Las apps de detrás no se desplegaban, el recuento de fallos no llegaba a imprimirse y sólo el último despliegue dejaba su línea en las métricas (la trampa EXIT se instalaba una vez). Ahora cada uno va en su subshell, como en `deploy --all`, y al final se dice cuántos han fallado.
+
+### Corregido — el consejo de un build fallido rompía `--json`
+
+`_build_advise` y `_build_recover` proponían los comandos para copiar (`sudo apt-get install -y hugo`, `pnpm store prune`…) con un `printf` a secas, por stdout: con `--json` iban delante del objeto, y en `deploy --all --json` dentro de su `"result"`. La redirección va ahora en la definición de las dos funciones, así que la siguiente línea que se añada tampoco puede romper el contrato.
+
+### Corregido — dos entradas `shared` anidadas borraban datos
+
+Con `"shared": ["data", "data/db.sqlite"]`, la primera dejaba `data` enlazada a `shared/data` y el `rm -rf` de la segunda atravesaba ese enlace y **borraba `shared/data/db.sqlite`**; luego `ln` dejaba un enlace que se apuntaba a sí mismo. Una entrada dentro de otra se salta ahora con un aviso, sea cual sea el orden, y tampoco se enlaza una ruta cuya carpeta salga de la release por un enlace del propio repositorio.
+
+### Corregido — las releases fallidas se quedaban, y la poda podía llevarse la buena
+
+Los `die` del build ya borraban la release, pero los finales de después —health check fallido con vuelta a la anterior, puente del reinicio sin corte que no responde, nginx que rechaza la configuración— salían con `exit 1` y la dejaban, igual que un build interrumpido. Ocupaban huecos de `KEEP_RELEASES`, salían en `orbit rollback` como destino, y como la poda va por nombre, tras un rollback a una release vieja el despliegue siguiente se llevaba justo la que servía antes. Ahora la trampa de salida borra la release que no ha llegado a servirse (nunca la que sirve `current`, ni con el puente atendiendo), y la poda no toca nunca la activa ni la anterior.
+
+### Corregido — un `PORT` o un `HOST` en el `.env` mandaban sobre la unidad
+
+En systemd `EnvironmentFile=` gana a `Environment=` —comprobado con `systemd-run`—, al revés de lo que suponía el código y hasta una prueba. Un `PORT=3000` copiado del portátil dejaba la app escuchando donde el health check no miraba (rollback en cada despliegue), y un `HOST=0.0.0.0` la abría a internet sin nginx. `ExecStart` fija ahora `PORT`, `HOST` y `NODE_ENV` con `/usr/bin/env` (el PID sigue siendo el de la app) y dobla los `$` del comando, porque systemd expandía él mismo los `${PORT}` de Python y Deno con el valor del `.env`. `orbit env set` avisa si tocas una de las tres.
+
+### Seguridad — `orbit.conf` ejecutaba lo que le escribieran
+
+`_conf_set` metía el valor entre comillas dobles en un fichero que root carga con `source` en cada ejecución, temporizadores incluidos: `--email 'ops$(id -un)@x.com'` se ejecutaba en cada `orbit` posterior. Y pasaba por `sed`, así que `a&b@x.com` corrompía la línea. Ahora va con comillas simples (`_q`) y la línea se sustituye en bash. `orbit ssl` dejó de usar su propio `sed` para el correo, y `_restore_conf` entiende los dos formatos —y los comentarios del instalador— sin cargar la copia con `source`.
+
+### Seguridad — el token de Telegram y las URL de webhook salían en `ps`
+
+Iban como argumento de curl, que sólo tapa el de `--user`: cualquier usuario del servidor —también las apps aisladas— los veía mientras duraba la llamada. Ahora van por la configuración de curl en stdin (`-K -`), y la URL y el usuario del relé SMTP por `-K <(…)`.
+
 ## [1.4.0] - 2026-11-04
 
 Cinco agujeros de una auditoría del vhost, todos reproducidos con nginx y php-fpm de verdad antes de tocar nada, y todos con su prueba en `nginx_test` —58 comprobaciones nuevas en rojo sin el arreglo—. Ver ARCHITECTURE §18.7c.

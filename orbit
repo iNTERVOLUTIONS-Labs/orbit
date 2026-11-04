@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.0"
+ORBIT_VERSION="1.4.1"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -1415,14 +1415,48 @@ _q() { local s=${1-}; s=${s//\'/\'\\\'\'}; printf "'%s'" "$s"; }
 
 # Escribe una clave en la configuración global. Si no existe todavía la añade:
 # una instalación anterior no tiene las claves que se hayan inventado después.
+#
+# El valor va entre comillas simples con _q, y la línea se sustituye en bash y
+# no con sed. Las dos cosas son por lo mismo: root carga este fichero con
+# 'source' en cada ejecución, temporizadores incluidos. Entre comillas dobles,
+# un '--email "ops$(id -un)@x.com"' quedaba escrito como código y se ejecutaba
+# en cada 'orbit' que viniera detrás; y metido en la sustitución de sed, un '&'
+# o un '|' del valor rompían la línea —«a&b@x.com» se escribía con la clave
+# vieja dentro—. Se reescribe entero en la misma redirección, como save_app.
 _conf_set() { # _conf_set <clave> <valor>
-  local key="$1" val="$2"
-  if grep -qE "^[[:space:]]*$key=" "$CONF_FILE"; then
-    sed -i "s|^[[:space:]]*$key=.*|$key=\"$val\"|" "$CONF_FILE"
-  else
-    printf '%s="%s"\n' "$key" "$val" >> "$CONF_FILE"
+  local key="$1" val="$2" line out="" found="no" new
+  new="$key=$(_q "$val")"
+  if [[ -f "$CONF_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*"$key"= ]]; then
+        out+="$new"$'\n'; found="yes"
+      else
+        out+="$line"$'\n'
+      fi
+    done < "$CONF_FILE"
   fi
+  [[ "$found" == "yes" ]] || out+="$new"$'\n'
+  printf '%s' "$out" > "$CONF_FILE"
   printf -v "$key" '%s' "$val"
+}
+
+# El valor de una línea CLAVE=valor de un orbit.conf, sin sus comillas: dobles
+# como las escribía Orbit antes, simples —con su '\'' — como las escribe ahora,
+# o ninguna. Y sin el comentario que el instalador pone detrás de algunas
+# ('QUEUE_EVERY="1"   # cada cuántos minutos…'). Se lee como texto y nunca con
+# 'source': el fichero viene de una copia, y cargarlo sería ejecutar lo que
+# traiga.
+_conf_unquote() { # _conf_unquote <valor tal cual>
+  local v="$1"
+  local re_s="^'(([^']|'\\\\'')*)'[[:space:]]*(#.*)?$" re_d='^"([^"]*)"[[:space:]]*(#.*)?$'
+  if [[ "$v" =~ $re_s ]]; then
+    v="${BASH_REMATCH[1]}"; v="${v//\'\\\'\'/\'}"
+  elif [[ "$v" =~ $re_d ]]; then
+    v="${BASH_REMATCH[1]}"
+  else
+    v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}"
+  fi
+  printf '%s' "$v"
 }
 
 # El fichero se abre una vez y las 31 líneas se arman en memoria. Antes eran 31
@@ -4396,6 +4430,21 @@ _systemd_unit_body() { # _systemd_unit_body <svc> <workdir> <puerto> <denodir>
   # además el valor por defecto de systemd, así que lo raro sigue siendo lo que
   # ya había.
   local kill_sig="SIGINT"; [[ "$A_TYPE" == "go" ]] && kill_sig="SIGTERM"
+  # PORT, HOST y NODE_ENV se fijan otra vez en la propia orden, y no basta con
+  # las líneas Environment= de abajo: en systemd **EnvironmentFile gana a
+  # Environment=**, sin importar el orden en el fichero. Comprobado con
+  # systemd-run: un PORT=8080 en el .env se imponía al Environment=PORT=3005.
+  # Y muchos .env traen PORT=3000 de la máquina de quien los escribió, así que
+  # la app escuchaba donde nadie le preguntaba, el health check fallaba y cada
+  # despliegue acababa en rollback; un HOST=0.0.0.0 la dejaba abierta a
+  # internet sin pasar por nginx. '/usr/bin/env' hace exec de bash y bash del
+  # último comando, así que el PID principal sigue siendo el de la app.
+  #
+  # Y los '$' se doblan: systemd expande él mismo los '${PORT}' de ExecStart
+  # —también entre comillas— con su entorno, el del .env, antes de que la
+  # orden llegue a ejecutarse. Con '$$' le llega a bash el '${PORT}' literal y
+  # lo expande del entorno que acabamos de fijar.
+  local start="${A_START//\$/\$\$}"
   cat <<EOF
 [Unit]
 Description=Orbit · $A_NAME ($A_TYPE)
@@ -4416,7 +4465,7 @@ Environment=PATH=$UNIT_PATH
 # y el HOME que systemd deduce de User= no se podría ni abrir. Ver app_home().
 Environment=HOME=$(app_home "$name")
 Environment=COREPACK_HOME=$(app_corepack "$name")
-${denodir}ExecStart=/bin/bash -c '$A_START'
+${denodir}ExecStart=/usr/bin/env PORT=$port HOST=127.0.0.1 NODE_ENV=production /bin/bash -c '$start'
 Restart=always
 RestartSec=3
 KillSignal=$kill_sig
@@ -4886,6 +4935,12 @@ _build_prepare() { # _build_prepare <release>
 # Las firmas están comprobadas contra las herramientas de verdad —pnpm 11.20,
 # npm 10.9 y yarn 4.5— y no copiadas de memoria. Un patrón que no encaja no
 # rompe nada, pero tampoco sirve de nada, que es peor porque no se nota.
+# Toda la salida de la función va a la presentación, y por eso la redirección
+# está en la definición y no en cada línea. Los comandos que se proponen para
+# copiar —'sudo apt-get install -y hugo' y compañía— salían con un 'printf' a
+# secas, o sea por stdout: con --json se colaban delante del objeto, y en
+# 'deploy --all --json' acababan dentro de su "result". Puesta aquí, la
+# siguiente línea que alguien añada tampoco puede romper el contrato.
 _build_advise() { # _build_advise <log>
   local log="${1:-}" inst lock add
   [[ -n "$log" && -r "$log" ]] || return 0
@@ -5086,10 +5141,11 @@ _build_advise() { # _build_advise <log>
     return 0
   fi
   return 0
-}
+} >&"$UI_FD"
 
 # Mira por qué ha fallado el build y arregla lo que sepa. 0 si merece la pena
 # reintentar. Necesita la app cargada, y guarda lo aprendido antes de volver.
+# La misma redirección que _build_advise, y por lo mismo.
 _build_recover() { # _build_recover <app> <release> <log>
   local name="$1" rel="$2" log="${3:-}" applied="no" p
   [[ "$BUILD_RECOVERY" == "yes" ]] || return 1
@@ -5163,7 +5219,7 @@ _build_recover() { # _build_recover <app> <release> <log>
   logline "recover $name ${A_PNPM_ALLOW:+pnpm-allow='$A_PNPM_ALLOW'} ${A_NODE_HEAP:+heap=$A_NODE_HEAP}${DRIFT_ADD:+ lockfile-dev='${DRIFT_ADD[*]}'}"
   notify info "$(t "El build de %s ha fallado y se ha reintentado solo tras arreglarlo." "$name")"
   return 0
-}
+} >&"$UI_FD"
 
 # ═══════════════════════════════════════════════════════ deploy ═══════════
 # ═══════════════════════════════ el despliegue, para una máquina ══════════
@@ -5185,6 +5241,9 @@ _build_recover() { # _build_recover <app> <release> <log>
 # sólo cambia el formato de esa misma información, de frases a sucesos.
 DEP_EMITTED="no" DEP_OK="no" DEP_REL="" DEP_PREV="" DEP_SHA="" DEP_SUBJ=""
 DEP_REF="" DEP_ROLLBACK="no" DEP_RECOVER="no" DEP_T0=0 DEP_ERR="" DEP_STEP=""
+# La carpeta de la release en curso, entera, para que la trampa de salida pueda
+# llevársela si el despliegue no llega a buen puerto (ver _deploy_on_exit).
+DEP_RELDIR=""
 # El build, cronometrado aparte del despliegue entero. Es el número que le
 # interesa a alguien: el resto —clonar, mover un symlink, recargar nginx— es
 # más o menos constante, y lo que crece con el proyecto es compilar.
@@ -5315,8 +5374,33 @@ _deploy_on_exit() {
   # El testigo del objeto lo pone _deploy_json_trap, así que el apunte va antes:
   # necesita saber si salió bien, y eso lo fija el código de salida.
   (( rc != 0 )) && DEP_OK="no"
+  _deploy_drop_failed
   _metrics_record
   _deploy_json_trap "$rc"
+  return 0
+}
+
+# Una release que no ha llegado a servirse no se queda. Los 'die' del build ya
+# la borraban, pero los finales de después —el health check que falla y vuelve
+# a la anterior, el puente que no responde, nginx que rechaza la
+# configuración— salían con 'exit 1' y la dejaban, igual que un build
+# interrumpido con Ctrl-C. Ahí se quedaba ocupando uno de los KEEP_RELEASES
+# huecos, salía en 'orbit rollback' como destino válido, y como la poda va por
+# nombre, unas cuantas seguidas bastaban para llevarse la última buena.
+#
+# La condición es «no es la que sirve 'current'», y no «ha fallado»: tras el
+# rollback 'current' apunta a la anterior y ésta se puede borrar, pero en el
+# primer despliegue —sin anterior a la que volver— 'current' se queda en la
+# rota y borrarla dejaría el symlink colgando. Y nunca con el puente sirviendo:
+# en ese final la release nueva es lo único verificado que atiende la web.
+_deploy_drop_failed() {
+  [[ "$DEP_OK" != "yes" && -n "$DEP_RELDIR" && -d "$DEP_RELDIR" ]] || return 0
+  [[ "$OVERLAP_LIVE" != "yes" ]] || return 0
+  # Sólo dentro de releases/: es un 'rm -rf' en una trampa de salida.
+  [[ "$(basename "$(dirname "$DEP_RELDIR")")" == "releases" ]] || return 0
+  local cur; cur="$(readlink -f "$(dirname "$(dirname "$DEP_RELDIR")")/current" 2>/dev/null || true)"
+  [[ "$cur" != "$(readlink -f "$DEP_RELDIR")" ]] || return 0
+  rm -rf "$DEP_RELDIR" 2>/dev/null || true
   return 0
 }
 
@@ -5872,7 +5956,7 @@ cmd_deploy() {
 
   DEP_T0=$SECONDS; DEP_EMITTED="no"; DEP_OK="no"; DEP_REL=""; DEP_PREV=""
   DEP_SHA=""; DEP_SUBJ=""; DEP_REF="$ref"; DEP_ROLLBACK="no"; DEP_RECOVER="no"
-  DEP_ERR=""; DEP_STEP=""
+  DEP_ERR=""; DEP_STEP=""; DEP_RELDIR=""
   # Un solo manejador de salida para todo el despliegue, y siempre, no sólo
   # con --json: 'trap X EXIT' sustituye en vez de encadenar, así que dos sitios
   # poniendo el suyo significa que uno de los dos no corre. Costó un bug —
@@ -5916,7 +6000,7 @@ cmd_deploy() {
   stamp="$(basename "$rel")"
 
   title "Desplegando {b}%s{r}{mag} · %s" "$A_NAME" "$A_DOMAIN"
-  DEP_REL="$stamp"
+  DEP_REL="$stamp"; DEP_RELDIR="$rel"
   # La base es del fetcher: dentro vive la caché de git, que deploy escribe
   # en cada fetch. Releases y shared son del builder — el usuario de la app.
   install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$base"
@@ -6030,13 +6114,34 @@ cmd_deploy() {
     info "orbit.json declara una ruta compartida nueva: %s" "$sp_new"
   done < <(_repo_shared "$rel")
   if [[ -n "$shared_all" ]]; then
-    local sp origen
+    local sp origen sp_o sp_in relreal odir
+    relreal="$(readlink -f "$rel")"
     for sp in $shared_all; do
       # El nombre acaba en rutas y en el vhost: nada de '..' ni de rutas
       # absolutas, que sacarían el enlace fuera del directorio de la app.
       case "$sp" in /*|*..*) warn "shared: me salto '%s', no es una ruta dentro del repo." "$sp"; continue ;; esac
       [[ "$sp" =~ ^[A-Za-z0-9._/-]+$ ]] || { warn "shared: me salto '%s', tiene caracteres raros." "$sp"; continue; }
+      # Una ruta dentro de otra que ya se comparte no se enlaza: ya está
+      # compartida, con su carpeta. Y enlazarla destruía datos. Con
+      # ["data", "data/db.sqlite"], la primera deja $rel/data apuntando a
+      # shared/data, y el 'rm -rf $rel/data/db.sqlite' de la segunda atraviesa
+      # ese enlace y borra **shared/data/db.sqlite**, la base de datos de
+      # verdad; luego 'ln' deja un enlace que se apunta a sí mismo. Se decide por
+      # el nombre, y no por el orden, para que dé igual cómo venga la lista.
+      sp_in=""
+      for sp_o in $shared_all; do
+        sp_o="${sp_o%/}"
+        [[ -n "$sp_o" && "$sp" == "$sp_o/"* ]] && { sp_in="$sp_o"; break; }
+      done
+      [[ -z "$sp_in" ]] || { warn "shared: me salto '%s', ya está dentro de '%s', que se comparte entera." "$sp" "$sp_in"; continue; }
       origen="$rel/$sp"
+      # Y la red de debajo: la carpeta donde va el enlace tiene que seguir
+      # dentro de la release una vez resueltos los enlaces. Un enlace del
+      # propio repositorio en mitad de la ruta llevaría el 'rm -rf' de abajo a
+      # donde él apunte —shared/ incluido—.
+      odir="$(readlink -m "$(dirname "$origen")")"
+      [[ "$odir" == "$relreal" || "$odir" == "$relreal/"* ]] \
+        || { warn "shared: me salto '%s', su carpeta sale de la release por un enlace." "$sp"; continue; }
       if [[ ! -e "$shared/$sp" ]]; then
         install -d -o "$(app_user)" -g "$(app_user)" "$shared/$(dirname "$sp")"
         if [[ -e "$origen" && ! -L "$origen" ]]; then
@@ -6387,11 +6492,20 @@ cmd_deploy() {
   fi
 
   # 8 · limpieza
-  local old
+  #
+  # La poda va por nombre, que es por fecha, y eso no basta para saber qué se
+  # puede borrar: tras un 'orbit rollback' a una release vieja, la que servía
+  # justo antes de este despliegue —el destino natural del siguiente rollback—
+  # puede estar más allá de KEEP_RELEASES. Ésa y la activa no se tocan nunca.
+  local old o oreal keep_cur keep_prev
+  keep_cur="$(readlink -f "$base/current" 2>/dev/null || true)"
+  keep_prev="${prev:+$(readlink -f "$prev" 2>/dev/null || true)}"
   mapfile -t old < <(releases_desc "$base" | tail -n +$((KEEP_RELEASES+1)))
-  local o
   for o in "${old[@]:-}"; do
-    [[ -n "$o" && "$base/releases/$o" != "$rel" ]] && rm -rf "$base/releases/$o"
+    [[ -n "$o" && "$base/releases/$o" != "$rel" ]] || continue
+    oreal="$(readlink -f "$base/releases/$o")"
+    [[ "$oreal" == "$keep_cur" || "$oreal" == "$keep_prev" ]] && continue
+    rm -rf "$base/releases/$o"
   done
 
   # El fichero de entorno que declara la release activa se guarda aquí, y no
@@ -7938,7 +8052,18 @@ cmd_new() {
   # qué estado queda todo. La app se deja registrada a propósito: está en
   # nginx, tiene su puerto y su .env, y el arreglo es un 'orbit deploy' cuando
   # el repositorio esté bien. Deshacerlo obligaría a repetir el asistente entero.
-  if ! ( cmd_deploy "$name" ); then
+  #
+  # Y con la forma entera de ARCHITECTURE §10, no con 'if ! ( … )': dentro de
+  # la condición de un 'if' bash apaga errexit para todo el subshell, así que
+  # un rsync que fallaba al sacar la release seguía adelante, el symlink
+  # apuntaba a una carpeta vacía y el asistente terminaba en verde. Medido
+  # rompiendo rsync a propósito.
+  local deploy_rc
+  set +e
+  ( set -Eeuo pipefail; cmd_deploy "$name" )
+  deploy_rc=$?
+  set -e
+  if (( deploy_rc != 0 )); then
     _new_undeployed "$name" "$want_db"
     return 1
   fi
@@ -8205,8 +8330,9 @@ cmd_ssl() {
   if [[ -z "${LETSENCRYPT_EMAIL:-}" ]]; then
     local mail; ask mail "Email para avisos de Let's Encrypt" ""
     [[ -z "$mail" ]] && die "Let's Encrypt necesita un email"
-    sed -i "s|^LETSENCRYPT_EMAIL=.*|LETSENCRYPT_EMAIL=\"$mail\"|" "$CONF_FILE"
-    LETSENCRYPT_EMAIL="$mail"
+    # Por _conf_set y no con sed: el correo lo teclea alguien y acaba en un
+    # fichero que root carga con 'source'.
+    _conf_set LETSENCRYPT_EMAIL "$mail"
   fi
 
   local domains=(-d "$A_DOMAIN"); local a
@@ -9319,8 +9445,7 @@ _restore_conf() { # _restore_conf <orbit.conf de la copia>
   [[ -r "$src" ]] || return 0
   while IFS='=' read -r k v; do
     [[ "$k" =~ ^($_ORBIT_CONF_RESTORE)$ ]] || continue
-    v="${v%\"}"; v="${v#\"}"
-    _conf_set "$k" "$v"
+    _conf_set "$k" "$(_conf_unquote "$v")"
     n=$((n + 1))
   done < <(grep -E '^[A-Z_]+=' "$src" 2>/dev/null)
   (( n )) && ok "Preferencias restauradas de orbit.conf (%s claves)" "$n"
@@ -9457,10 +9582,29 @@ _restore_all() { # _restore_all <directorio> <yes> <deploy>
   # que no se hace por sorpresa: o lo pides con --deploy, o se te dan los
   # comandos ya escritos.
   if [[ "$deploy" == "yes" ]]; then
+    # Cada despliegue en su subshell y con la forma entera de ARCHITECTURE §10,
+    # igual que cmd_deploy_all. Con 'cmd_deploy "$n" || …' en este mismo shell
+    # pasaban tres cosas: errexit apagado dentro del despliegue; el primer 'die'
+    # terminaba el proceso entero, así que las apps de detrás no se desplegaban
+    # y el recuento de fallos no llegaba a imprimirse; y la trampa EXIT —que
+    # apunta la métrica— se instalaba una sola vez, de modo que sólo el último
+    # despliegue dejaba su línea en el histórico.
+    local dfallos=0 drc
     for n in $(printf '%s\n' "${!ultima[@]}" | sort); do
       hr 66
-      cmd_deploy "$n" || { err "El despliegue de «%s» ha fallado" "$n"; fallos=$((fallos + 1)); }
+      set +e
+      ( set -Eeuo pipefail; cmd_deploy "$n" )
+      drc=$?
+      set -e
+      (( drc == 0 )) || { err "El despliegue de «%s» ha fallado" "$n"; dfallos=$((dfallos + 1)); }
     done
+    hr 66
+    if (( dfallos )); then
+      err "%s de %s despliegues han fallado. Repite cada uno con 'orbit deploy <app>'." "$dfallos" "${#ultima[@]}"
+    else
+      ok "Desplegadas las %s apps" "${#ultima[@]}"
+    fi
+    fallos=$((fallos + dfallos))
   else
     echo
     info "Falta traer el código. Cuando GitHub esté conectado ('orbit github'):"
@@ -10506,23 +10650,38 @@ _notify_rank() { case "$1" in info) echo 0 ;; warn) echo 1 ;; crit) echo 2 ;; *)
 # el código de curl. Estaban los tres en línea dentro de notify() con un
 # '|| true' pegado a cada uno, y eso es lo que hacía imposible decir **cuál**
 # había fallado — que es justo lo que hay que saber de un canal de avisos.
+#
+# Las URL con secreto van a curl por su fichero de configuración, por stdin
+# ('-K -'), y no como argumento. La URL de Telegram **lleva el token del bot**,
+# y la de un webhook de Discord es en sí misma la credencial: escritas en la
+# línea de órdenes las ve cualquier usuario del servidor con un 'ps' —o
+# leyendo /proc/<pid>/cmdline— mientras dura la llamada, y curl sólo tapa el
+# argumento de --user, no las URL. Las apps corren con su propio usuario
+# (§5.3): una con un fallo podía quedarse con el bot de avisos.
+_curl_cfg() { # _curl_cfg <opción> <valor>  -> la línea 'opción = "…"' de un -K
+  local cv="$2"; cv="${cv//\\/\\\\}"; cv="${cv//\"/\\\"}"
+  printf '%s = "%s"\n' "$1" "$cv"
+}
+
 _notify_ch_telegram() { # <nivel> <texto> <mensaje>
-  curl -fsS -m 10 -o /dev/null -X POST \
-    "https://api.telegram.org/bot${NOTIFY_TELEGRAM_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${NOTIFY_TELEGRAM_CHAT}" \
-    --data-urlencode "text=$2"
+  _curl_cfg url "https://api.telegram.org/bot${NOTIFY_TELEGRAM_TOKEN}/sendMessage" \
+    | curl -K - -fsS -m 10 -o /dev/null -X POST \
+        --data-urlencode "chat_id=${NOTIFY_TELEGRAM_CHAT}" \
+        --data-urlencode "text=$2"
 }
 
 _notify_ch_discord() {
-  curl -fsS -m 10 -o /dev/null -H 'Content-Type: application/json' \
-    -d "$(jq -cRn --arg c "$2" '{content:$c}')" "$NOTIFY_DISCORD"
+  _curl_cfg url "$NOTIFY_DISCORD" \
+    | curl -K - -fsS -m 10 -o /dev/null -H 'Content-Type: application/json' \
+        -d "$(jq -cRn --arg c "$2" '{content:$c}')"
 }
 
 _notify_ch_webhook() {
-  curl -fsS -m 10 -o /dev/null -H 'Content-Type: application/json' \
-    -d "$(jq -cRn --arg l "$1" --arg h "$(hostname -s 2>/dev/null || echo servidor)" \
-          --arg m "$3" --arg t "$(date -Iseconds)" \
-          '{level:$l,host:$h,message:$m,time:$t}')" "$NOTIFY_WEBHOOK"
+  _curl_cfg url "$NOTIFY_WEBHOOK" \
+    | curl -K - -fsS -m 10 -o /dev/null -H 'Content-Type: application/json' \
+        -d "$(jq -cRn --arg l "$1" --arg h "$(hostname -s 2>/dev/null || echo servidor)" \
+              --arg m "$3" --arg t "$(date -Iseconds)" \
+              '{level:$l,host:$h,message:$m,time:$t}')"
 }
 
 # El correo va por un **relé** y no por un MTA local, y ésa es toda la razón por
@@ -10533,21 +10692,29 @@ _notify_ch_webhook() {
 # empresa— y Orbit sólo habla SMTP con él, con curl, que ya es dependencia y lo
 # sabe hacer desde hace veinte años. Cero dependencias nuevas (principio 6) y
 # nada residente (principio 2).
+#
+# La URL y el usuario van aparte, en _notify_mail_cfg, por lo mismo que las URL
+# de los otros canales: una URL smtp:// puede llevar la contraseña dentro, y
+# curl tapa el argumento de --user pero sólo después de arrancar.
 _notify_mail_args() { # _notify_mail_args -> los argumentos de curl, uno por línea
-  printf '%s\n' -fsS -m 20 -o /dev/null --url "$NOTIFY_SMTP_URL" \
+  printf '%s\n' -fsS -m 20 -o /dev/null \
     --mail-from "${NOTIFY_MAIL_FROM:-$NOTIFY_MAIL_TO}"
   local d
   # Varios destinatarios separados por coma o espacio: un aviso que sólo puede
   # ir a una persona se pierde en cuanto esa persona está de vacaciones.
   for d in ${NOTIFY_MAIL_TO//,/ }; do printf '%s\n' --mail-rcpt "$d"; done
   if [[ -n "${NOTIFY_SMTP_USER:-}" ]]; then
-    printf '%s\n' --user "${NOTIFY_SMTP_USER}:${NOTIFY_SMTP_PASS:-}"
     # Con contraseña se exige TLS y no se negocia: un AUTH sin cifrar entrega
     # la contraseña del correo a cualquiera que mire la red. Sin contraseña no
     # se exige, porque ese caso es un relé en la propia máquina o en la red
     # local, donde no hay TLS que pedir y exigirlo sólo impediría usarlo.
     [[ "$NOTIFY_SMTP_URL" == smtps://* ]] || printf '%s\n' --ssl-reqd
   fi
+}
+
+_notify_mail_cfg() { # _notify_mail_cfg -> lo secreto, como fichero de -K
+  _curl_cfg url "$NOTIFY_SMTP_URL"
+  [[ -z "${NOTIFY_SMTP_USER:-}" ]] || _curl_cfg user "${NOTIFY_SMTP_USER}:${NOTIFY_SMTP_PASS:-}"
 }
 
 _notify_ch_mail() { # <nivel> <texto> <mensaje>
@@ -10563,7 +10730,7 @@ _notify_ch_mail() { # <nivel> <texto> <mensaje>
     printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n\n'
     printf '%s\n' "$3"
     printf '\n-- \n%s · %s\n' "$host" "$(date -Iseconds)"
-  } | curl "${args[@]}" --upload-file -
+  } | curl -K <(_notify_mail_cfg) "${args[@]}" --upload-file -
 }
 
 # Los canales que están configurados, uno por línea y en orden fijo.
@@ -12630,6 +12797,16 @@ cmd_env() {
       local had="no"; _env_has "$f" "$key" && had="si"
       _env_write "$f" "$key" "$val"
       [[ "$had" == "si" ]] && ok "%s actualizada en %s" "$key" "$name" || ok "%s añadida a %s" "$key" "$name"
+      # Se guarda igual —el build sí la ve—, pero el proceso no: la unidad las
+      # fija en la orden de arranque por encima del .env (ver
+      # _systemd_unit_body). Decirlo ahorra buscar por qué no cambia nada.
+      case "$key" in
+        PORT|HOST|NODE_ENV)
+          if needs_svc "$A_TYPE"; then
+            warn "%s la pone Orbit al arrancar la app y el valor del .env no le llega al proceso." "$key"
+            info "Escucha en 127.0.0.1:%s, detrás de nginx. Para cambiar el puerto:  orbit port %s <puerto>" "$A_PORT" "$name"
+          fi ;;
+      esac
       if [[ "$restart" == "yes" ]] && needs_svc "$A_TYPE"; then
         systemctl restart "$(svc_name "$name")"; ok "«%s» reiniciada" "$name"
       else
@@ -15002,6 +15179,12 @@ _i18n_en() {
     ["instálalo desde go.dev/dl y añade /usr/local/go/bin al PATH"]="install it from go.dev/dl and add /usr/local/go/bin to the PATH"
     ["shared: me salto '%s', no es una ruta dentro del repo."]="shared: skipping '%s', it is not a path inside the repo."
     ["shared: me salto '%s', tiene caracteres raros."]="shared: skipping '%s', it has odd characters in it."
+    ["shared: me salto '%s', ya está dentro de '%s', que se comparte entera."]="shared: skipping '%s', it is already inside '%s', which is shared as a whole."
+    ["shared: me salto '%s', su carpeta sale de la release por un enlace."]="shared: skipping '%s', its folder leaves the release through a symlink."
+    ["%s de %s despliegues han fallado. Repite cada uno con 'orbit deploy <app>'."]="%s of %s deploys failed. Retry each one with 'orbit deploy <app>'."
+    ["Desplegadas las %s apps"]="All %s apps deployed"
+    ["%s la pone Orbit al arrancar la app y el valor del .env no le llega al proceso."]="Orbit sets %s when it starts the app, so the value in .env never reaches the process."
+    ["Escucha en 127.0.0.1:%s, detrás de nginx. Para cambiar el puerto:  orbit port %s <puerto>"]="It listens on 127.0.0.1:%s, behind nginx. To change the port:  orbit port %s <port>"
     ["No he podido recargar php%s-fpm: puede seguir sirviendo la versión anterior."]="I could not reload php%s-fpm: it may keep serving the previous version."
     ["En mantenimiento: me salto la comprobación de salud."]="In maintenance: I am skipping the health check."
     ["La web responde (HTTP %s)"]="The site answers (HTTP %s)"

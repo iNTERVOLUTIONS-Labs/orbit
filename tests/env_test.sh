@@ -31,6 +31,18 @@ run cmd_env unset web CLAVE >"$TMP/u" 2>&1; r=$?
 check "quitar dos veces" "0" "$r"
 check "y lo dice"        "1" "$(grep -c 'no estaba definida' "$TMP/u")"
 
+section "PORT, HOST y NODE_ENV los pone Orbit"
+# La unidad los fija en la orden de arranque, por encima del .env (ver
+# systemd_test). Guardarlos en silencio dejaba a alguien esperando un cambio
+# que no iba a llegar.
+run cmd_env set web PORT 3000 >"$TMP/pt" 2>&1; r=$?
+check "se guarda igual"   "0" "$r"
+check "pero avisa"        "1" "$(grep -c 'PORT la pone Orbit' "$TMP/pt")"
+check "y dice cómo"       "1" "$(grep -c 'orbit port web' "$TMP/pt")"
+run cmd_env set web OTRA 1 >"$TMP/pt2" 2>&1
+check "otra clave, sin aviso" "0" "$(grep -c 'la pone Orbit' "$TMP/pt2")"
+run cmd_env unset web PORT >/dev/null 2>&1; run cmd_env unset web OTRA >/dev/null 2>&1
+
 section "Valores difíciles"
 # El bug que costó _q(): con comillas dobles, bash expande $ al cargar el
 # fichero y la contraseña llega truncada.

@@ -209,7 +209,7 @@ EnvironmentFile=-/srv/apps/<app>/shared/.env
 Environment=NODE_ENV=production PORT=3001 HOST=127.0.0.1
 Environment=HOME=/srv/apps/<app>/shared/home
 Environment=COREPACK_HOME=/srv/apps/<app>/shared/home/.cache/node/corepack
-ExecStart=/bin/bash -c '<comando de arranque>'
+ExecStart=/usr/bin/env PORT=3001 HOST=127.0.0.1 NODE_ENV=production /bin/bash -c '<comando de arranque>'
 Restart=always
 
 NoNewPrivileges=true
@@ -224,6 +224,8 @@ LimitNOFILE=65535
 ```
 
 `ProtectSystem=strict` monta todo el sistema de ficheros en solo lectura salvo las rutas de `ReadWritePaths`. Una app comprometida no puede escribir fuera de su propio directorio.
+
+**`PORT`, `HOST` y `NODE_ENV` van dos veces, y la que cuenta es la de `ExecStart`.** En systemd `EnvironmentFile=` **gana** a `Environment=`, se escriban en el orden que se escriban —comprobado con `systemd-run`: un `PORT=8080` del `.env` se imponía al `Environment=PORT=3005`—. Durante mucho tiempo se creyó lo contrario y hasta había una prueba que comprobaba el orden de las líneas, como si decidiera algo. Con un `.env` que traía `PORT=3000` la app escuchaba donde el health check no miraba y cada despliegue acababa en rollback; con `HOST=0.0.0.0`, la app quedaba abierta sin nginx delante. `/usr/bin/env` hace `exec` de bash y bash del último comando, así que el PID principal sigue siendo el de la app. Y los `$` del comando se doblan (`$${PORT}`), porque systemd expande `${PORT}` en `ExecStart` **él mismo**, entre comillas incluido, con su entorno —el del `.env`—, antes de ejecutar nada.
 
 ### 5.1 El HOME del servicio, y por qué no es `/home/deploy`
 

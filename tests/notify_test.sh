@@ -44,23 +44,59 @@ NOTIFY_MAIL_TO="uno@b.test, dos@b.test"
 NOTIFY_MAIL_FROM="orbit@servidor.test"
 NOTIFY_SMTP_USER=""; NOTIFY_SMTP_PASS=""
 ARGS="$(_notify_mail_args | tr '\n' ' ')"
-check "el servidor"        "1" "$(grep -c -- '--url smtp://127.0.0.1:2525' <<<"$ARGS")"
+# El servidor y el usuario van por el fichero de configuración de curl, no por
+# la línea de órdenes: ver la sección de 'ps' más abajo.
+check "el servidor, por -K" "1" "$(_notify_mail_cfg | grep -c '^url = "smtp://127.0.0.1:2525"$')"
+check "y no en argv"        "0" "$(grep -c -- 'smtp://' <<<"$ARGS")"
 check "el remitente"       "1" "$(grep -c -- '--mail-from orbit@servidor.test' <<<"$ARGS")"
 # Un aviso que sólo puede ir a una persona se pierde en cuanto esa persona está
 # de vacaciones.
 check "los dos destinos"   "2" "$(grep -o -- '--mail-rcpt' <<<"$ARGS" | wc -l)"
-check "sin usuario, sin --user" "0" "$(grep -c -- '--user' <<<"$ARGS")"
+check "sin usuario, sin --user" "0" "$(_notify_mail_cfg | grep -c '^user = ')"
 check "y sin exigir TLS"        "0" "$(grep -c -- '--ssl-reqd' <<<"$ARGS")"
 # Con contraseña sí se exige, y no se negocia: un AUTH sin cifrar entrega la
 # contraseña del correo a cualquiera que mire la red.
 NOTIFY_SMTP_USER="yo"; NOTIFY_SMTP_PASS="secreta"
 ARGS="$(_notify_mail_args | tr '\n' ' ')"
-check "con usuario, --user"     "1" "$(grep -c -- '--user yo:secreta' <<<"$ARGS")"
+check "con usuario, --user"     "1" "$(_notify_mail_cfg | grep -c '^user = "yo:secreta"$')"
+check "pero no en argv"         "0" "$(grep -c -- 'secreta' <<<"$ARGS")"
 check "y TLS obligatorio"       "1" "$(grep -c -- '--ssl-reqd' <<<"$ARGS")"
 # Salvo que la URL ya sea cifrada de origen, donde pedirlo otra vez sobra.
 NOTIFY_SMTP_URL="smtps://correo.test:465"
 ARGS="$(_notify_mail_args | tr '\n' ' ')"
 check "con smtps no hace falta" "0" "$(grep -c -- '--ssl-reqd' <<<"$ARGS")"
+
+section "Los secretos no salen en la línea de órdenes"
+# La URL de Telegram lleva el token del bot y la de un webhook de Discord es la
+# credencial entera. Pasadas como argumento las veía cualquiera con un 'ps'
+# mientras curl estaba en marcha. El doble apunta argv y stdin por separado:
+# lo que importa es dónde está cada cosa, no que la llamada se haga.
+curl() {
+  printf '%s\n' "$*" >> "$TMP/curl.argv"
+  [[ " $* " == *" -K - "* ]] && cat >> "$TMP/curl.cfg"
+  return 0
+}
+: > "$TMP/curl.argv"; : > "$TMP/curl.cfg"
+NOTIFY_TELEGRAM_TOKEN="123:TOKEN-SECRETO"; NOTIFY_TELEGRAM_CHAT="42"
+run _notify_ch_telegram crit "texto" "mensaje"
+check "el token no va en argv"   "0" "$(grep -c 'TOKEN-SECRETO' "$TMP/curl.argv")"
+check "va por -K, en stdin"      "1" \
+  "$(grep -c '^url = "https://api.telegram.org/bot123:TOKEN-SECRETO/sendMessage"$' "$TMP/curl.cfg")"
+: > "$TMP/curl.argv"; : > "$TMP/curl.cfg"
+NOTIFY_DISCORD='https://discord.test/api/webhooks/1/SECRETO"\x'
+run _notify_ch_discord warn "texto" "mensaje"
+check "discord, tampoco en argv" "0" "$(grep -c 'SECRETO' "$TMP/curl.argv")"
+# Las comillas y las barras se escapan: una URL con '"' no puede cerrar la
+# cadena y meterle a curl otra opción detrás.
+check "y escapada para curl"     "1" \
+  "$(grep -cF 'url = "https://discord.test/api/webhooks/1/SECRETO\"\\x"' "$TMP/curl.cfg")"
+: > "$TMP/curl.argv"; : > "$TMP/curl.cfg"
+NOTIFY_WEBHOOK="https://hooks.test/SECRETO-WH"
+run _notify_ch_webhook warn "texto" "mensaje"
+check "webhook, tampoco en argv" "0" "$(grep -c 'SECRETO-WH' "$TMP/curl.argv")"
+check "y sí en la configuración" "1" "$(grep -c 'SECRETO-WH' "$TMP/curl.cfg")"
+unset -f curl
+NOTIFY_TELEGRAM_TOKEN=""; NOTIFY_TELEGRAM_CHAT=""; NOTIFY_DISCORD=""; NOTIFY_WEBHOOK=""
 
 # --- el servidor SMTP de mentira -------------------------------------------
 if ! command -v python3 >/dev/null; then
