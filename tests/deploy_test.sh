@@ -1609,7 +1609,7 @@ section "El health check acepta un 4xx, como el de PHP"
 # desplegar nunca.
 unset -f curl
 HC="$TMP/hc.code"; HP="$TMP/hc.port"; printf '404' > "$HC"
-_srv_start "$HC" "$HP"
+_srv_start "$HC" "$HP"; HCPID=$!
 for _ in $(seq 50); do [[ -s "$HP" ]] && break; sleep 0.1; done
 HPORT="$(cat "$HP")"
 A_HEALTH_PATH=""
@@ -1619,6 +1619,9 @@ check "un 401 también"     "0" "$(_health_ok "$HPORT" /; echo $?)"
 printf '502' > "$HC"
 check "un 502 no"          "1" "$(_health_ok "$HPORT" /; echo $?)"
 check "nadie escuchando, no" "1" "$(_health_ok 1 /; echo $?)"
+# Sin esto el servidor sobrevivía a la tanda: uno más por cada 'make test', en
+# cualquier máquina donde se lanzara, hasta que alguien los contó.
+kill "$HCPID" 2>/dev/null; wait "$HCPID" 2>/dev/null
 
 section "Lo que la app deja en shared/ y releases/ no lo sigue root"
 # shared/ y releases/ son del usuario de la app, enlaces incluidos. Root los

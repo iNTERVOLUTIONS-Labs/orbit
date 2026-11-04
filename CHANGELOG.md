@@ -87,6 +87,37 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.6] - 2026-11-04
+
+Los dos últimos pendientes de observabilidad y de Orbit Desktop: métricas para Prometheus sin abrir un puerto, y usar `orbit` sin entrar como root sin fingir que eso es menos que root. Dos suites nuevas —`prom_test` (108 comprobaciones, 110 con `promtool` en el `PATH`) y `admin_test` (111)— y cada rama nueva puesta en rojo quitándola, una a una. Ver ARCHITECTURE §18.10b y §9.1.
+
+### Añadido — `orbit metrics prom enable|disable|status` y `orbit metrics --prom`
+
+Sin exportador, que sería un proceso escuchando en un puerto: Orbit escribe `orbit.prom` en la carpeta del colector de ficheros de `node_exporter` y él lo publica. La carpeta por defecto, `/var/lib/prometheus/node-exporter`, es la que trae compilada el paquete de Ubuntu —comprobado en los `.deb` de noble y de la siguiente, no supuesto—; si no existe, `enable` se niega en vez de crearla. Orbit no instala `node_exporter`.
+
+Lo refresca **la pasada de `orbit watch`**, que ya ha preguntado a cada app si contesta: `orbit_app_up` es su «arriba», no otra medida, y no cuesta ni un `curl` más. Por eso **sin vigilante no hay fichero** —`watch disable` lo retira y `enable` sin vigilante no lo deja escrito—: una foto vieja con `up 1` se lee en Grafana como el estado de ahora. Si no se puede escribir, se avisa una vez y la vigilancia sigue. Escritura atómica (temporal y `mv`), porque un fichero a medias invalida todo el colector en el `/metrics` de `node_exporter`.
+
+Diecisiete familias con prefijo `orbit_`: versión, temporizadores, `up`, reinicios de systemd, mantenimiento, congelación, autodespliegue, cuándo se activó la release, el último despliegue (cuándo, si salió bien, cuánto tardó, cuánto el build), el último correcto, los despliegues del histórico por resultado y la caducidad de cada certificado. Fechas y no edades; `orbit_app_deploys` es un gauge porque la poda del histórico lo hace bajar. El coste no crece con las apps —un `systemctl show` para todas— y los certificados no se abren dos veces por pasada. Nada del `.env`, ni la URL del repositorio, ni la rama. Lo acepta `promtool check metrics` (3.15.1), sin avisos de estilo; `promtool` no es dependencia, así que la suite lleva además su propia comprobación del formato línea a línea.
+
+### Añadido — `orbit admin add|remove|list <usuario>`
+
+El grupo `orbit-admin` y `/etc/sudoers.d/orbit-admin`: `%orbit-admin ALL=(root) NOPASSWD: /usr/local/bin/orbit`. **Equivale a root, y se dice cada vez que se añade a alguien**: Orbit hace como root lo que se le pide —`orbit restore` de una copia preparada a mano carga como root su configuración—. Sin contraseña porque Orbit Desktop habla por SSH sin terminal. La regla se valida con `visudo` en un temporal que sudo ignora **antes** de crear el grupo o tocar nada, y se pone con un `mv`; sin `visudo` no se instala. Se niega a quien no existe, a root, a las cuentas de sistema, al usuario de despliegue y a los de las apps. Idempotente.
+
+### Seguridad — lo que Orbit deja de creerse al elevarse
+
+- **El entorno de quien llama.** Con `EUID` 0 y `SUDO_UID` de otro, Orbit lee `/proc/self/environ` y, si sobra algo, se vuelve a ejecutar con `env -i` y sólo la identidad, `ORBIT_LANG`, `NO_COLOR`, `UI_GLYPHS`, el tamaño del terminal y la configuración regional sin `/`; `PATH`, `HOME` y la umask se fijan. Por `/proc` y no por las variables de bash porque lo que no tiene nombre de variable (`a.b=1`) bash no lo importa pero sí lo pasa a los hijos. Hasta ahora lo hacía el `env_reset` de sudo, que es del sudoers de cada máquina y no de Orbit. Quien escribía `sudo BACKUP_DIR=/x orbit …` lo nota: los ajustes van en `orbit.conf`.
+- **`#!/bin/bash -p` en vez de `#!/usr/bin/env bash`**: el intérprete se resolvía con el `PATH` que pasara sudo, antes de la primera línea; y sin `-p` bash importa funciones del entorno antes de la primera línea, así que un `BASH_FUNC_set%%` se ejecutaba en el propio `set -Eeuo pipefail`. La primera versión de la limpieza las borraba con `unset -f` desde dentro, y una función exportada llamada `unset` se la saltaba: lo encontró la revisión, ejecutándolo.
+- **La auto-elevación usa la ruta real**: invocado como `dv`, la regla no casaba y sudo pedía contraseña.
+- **El registro dice quién**: cada línea de `orbit.log` pedida por sudo lleva `[usuario]`. Con varias personas actuando como root, «root» no le dice nada a quien lo lea.
+- **`orbit doctor`** comprueba que el binario, sus carpetas, `/etc/orbit` y lo que root carga de ahí con `.` —`notify.conf` incluido— sólo los pueda cambiar root, y que la regla de `orbit-admin` sea de root con `0440`, válida y apunte a este binario. Y avisa si las métricas de Prometheus están encendidas y no se refrescan.
+- **La carpeta de las métricas tiene que ser sólo de root.** Entre el `mktemp` y el `mv` hay un `chmod` y una redirección que siguen enlaces: en una carpeta del usuario de `node_exporter` —que es como la crean algunos roles de Ansible—, ese usuario podía hacer que root pusiera `0644` a `/etc/shadow`. Se comprueba al encender, en cada pasada y en `doctor`.
+
+### Pruebas
+
+`tests/nginx_test.sh` toma los puertos de `ORBIT_TEST_HTTP_PORT` y `ORBIT_TEST_HTTPS_PORT` (por defecto 18080 y 18443), para que dos tandas puedan correr a la vez en la misma máquina.
+
+Y `deploy_test` dejaba vivo el servidor HTTP del health check de los 4xx: no guardaba su PID, así que cada `make test` sumaba un proceso `python3` huérfano. En la máquina donde se desarrolla había medio centenar.
+
 ## [1.4.5] - 2026-11-04
 
 La protección de 1.4.4 llega a las apps con proceso que sirven sus propios recursos. Ver ARCHITECTURE §4.1.

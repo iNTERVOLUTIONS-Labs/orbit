@@ -1,6 +1,6 @@
 # Orbit · guía de desarrollo
 
-Plataforma de despliegue en **Bash** para un VPS de Ubuntu 24.04 —y desde la v1.3.0 también Debian 12, con las decisiones probadas pero sin instalar todavía en una máquina Debian de verdad—: nginx + systemd + PostgreSQL + php-fpm. Un solo script (`orbit`, ~13.500 líneas, de las que ~960 son el catálogo de traducción), un instalador (`install.sh`), 32 suites de pruebas.
+Plataforma de despliegue en **Bash** para un VPS de Ubuntu 24.04 —y desde la v1.3.0 también Debian 12, con las decisiones probadas pero sin instalar todavía en una máquina Debian de verdad—: nginx + systemd + PostgreSQL + php-fpm. Un solo script (`orbit`, ~17.500 líneas, de las que ~1.200 son el catálogo de traducción), un instalador (`install.sh`), 37 suites de pruebas.
 
 Lee `docs/ARCHITECTURE.md` antes de tocar nada serio: dice **por qué** está hecho así, y casi todas las decisiones raras tienen un bug detrás. `docs/WORKFLOW.md` es la versión larga de este fichero.
 
@@ -21,7 +21,7 @@ Corolario que ya se ha decidido dos veces: **el GUI no puede vivir en el servido
 ## Cómo se trabaja aquí
 
 ```bash
-make test     # las 32 suites + shellcheck. Tiene que salir en verde antes de commitear
+make test     # las 37 suites + shellcheck. Tiene que salir en verde antes de commitear
 make lint     # shellcheck -S warning
 ```
 
