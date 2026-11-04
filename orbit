@@ -995,12 +995,19 @@ _health_ok() { # _health_ok <puerto> [ruta]
   return 0
 }
 
+# El plazo de un despliegue: el que declare el orbit.json, si es mayor. Sólo en
+# los health checks del despliegue: 'orbit info' o el vigilante preguntan con
+# 1-5 s si la app contesta, y con un "timeout": 90 se quedaban colgados minuto
+# y medio cada vez que estaba caída.
+_deploy_health_secs() { # _deploy_health_secs <por defecto>
+  local d="$1"
+  [[ "${A_HEALTH_TIMEOUT:-}" =~ ^[0-9]+$ ]] && (( A_HEALTH_TIMEOUT > d )) && d="$A_HEALTH_TIMEOUT"
+  printf '%s' "$d"
+}
+
 health_wait() { # health_wait <puerto> [segundos]
   local port="$1" secs="${2:-40}" i llenos vacios bar
   local ancho=24
-  # Un plazo declarado en el orbit.json manda sobre el de quien llama: el que
-  # sabe cuánto tarda en arrancar la app es su repositorio.
-  [[ "${A_HEALTH_TIMEOUT:-}" =~ ^[0-9]+$ ]] && (( A_HEALTH_TIMEOUT > secs )) && secs="$A_HEALTH_TIMEOUT"
   printf "  ${CYA}·${R} %s " "$(t "Comprobando salud en 127.0.0.1:%s" "$port${A_HEALTH_PATH:-}")" >&$UI_FD
   _ui_tty && printf "\n" >&$UI_FD
   for (( i = 0; i < secs; i++ )); do
@@ -5151,7 +5158,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
   render_systemd_next "$name" "$nport" "$rel"
   info "Reinicio sin corte: la release nueva arranca en el puerto %s y la anterior sigue sirviendo" "$nport"
   systemctl start "$nsvc"
-  if ! health_wait "$nport" 40; then
+  if ! health_wait "$nport" "$(_deploy_health_secs 40)"; then
     DEP_ERR="$(t "la release nueva no respondió al health check")"
     err "La release nueva no responde. La versión anterior no se ha parado y sigue sirviendo."
     printf "\n%s\n" "$(t "{d}Últimas líneas del log:{r}")" >&$UI_FD
@@ -5204,7 +5211,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
   # La unidad canónica arranca la release nueva en su puerto de siempre. El
   # hueco de este arranque lo atiende el puente, que es todo el sentido de esto.
   systemctl restart "$(svc_name "$name")"
-  if health_wait "$A_PORT" 40; then
+  if health_wait "$A_PORT" "$(_deploy_health_secs 40)"; then
     render_nginx "$name" || true
     if [[ "$NGINX_RELOAD_OK" == "yes" ]]; then
       OVERLAP_LIVE=""
@@ -5997,7 +6004,7 @@ cmd_deploy() {
       # Aquí sí hay hueco, y lo tapa la página de mantenimiento.
       _maint_deploy_on "$name"
       systemctl restart "$(svc_name "$name")"
-      if health_wait "$A_PORT" 40; then
+      if health_wait "$A_PORT" "$(_deploy_health_secs 40)"; then
         _maint_deploy_off
         ok "Servicio %s respondiendo" "$(svc_name "$name")"
       else
