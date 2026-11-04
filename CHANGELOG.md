@@ -87,6 +87,26 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.4] - 2026-11-04
+
+Desplegar ya no rompe la página de quien está a media visita, y los errores tienen cara. Todo probado contra nginx de verdad en `nginx_test` —55 comprobaciones nuevas— y el movimiento de `previous` en `deploy_test`; cada arreglo se puso en rojo quitándolo. Ver ARCHITECTURE §4.1 y §8.0b.
+
+### Añadido — los recursos de la release anterior siguen sirviéndose
+
+Quien cargó el HTML de una release lo sigue teniendo abierto tras el despliegue, y ese HTML pide sus chunks con hash: en cuanto `current` se movía, el siguiente `import()` o la siguiente ruta de la SPA daba 404 y la página se rompía a medias. Ahora hay un enlace `previous` junto a `current`, y la location de los recursos termina en él antes de dar 404. Sólo recursos (CSS, JS, fuentes, imágenes, wasm, mapas), nunca una ruta ni un `.html`; nada que la activa niegue (`.env`, ocultos, `vendor/`, `api/`, subidas: esas location ganan antes); nunca PHP; nunca `/sw.js`. Cubre las webs estáticas, el `/_next/static/` de Next y el `/static/` de Django. `previous` es la que servía antes del despliegue; tras `orbit rollback`, la release de la que se huye; y un rollback automático lo deja como estaba. La poda no la toca. Las apps con proceso que sirven sus propios recursos (Nuxt, SvelteKit con Node, Astro SSR) quedan para después: Orbit no guarda dónde deja cada framework su carpeta de cliente.
+
+### Añadido — el 404 de la web y la página de «la app no contesta»
+
+El `404.html` (o `404/index.html`) del build se sirve con código 404 desde una location interna; antes el error volvía a entrar por `location /`, y en una SPA sin `404.html` **un `.js` que faltaba se contestaba con el `index.html` entero**. En una SPA las rutas siguen siendo del router del cliente. Con el proceso o php-fpm caídos, en vez del «502 Bad Gateway» de nginx sale `shared/50x.html`, que se escribe una vez, es tuya y va sin caché; y si la borras, sale la de nginx **con el mismo código**.
+
+### Corregido — pasar del límite de peticiones daba la página de mantenimiento, o un 404
+
+`limit_req` contesta 503 por defecto, y el 503 del vhost es el del mantenimiento: quien pasaba de 40 r/s recibía «estamos publicando una actualización» con `Retry-After: 120`, o un 404 si la app no había estado nunca en mantenimiento. Ahora es un 429.
+
+### Corregido — el mantenimiento puesto a mano sin página tiraba la web en 404
+
+`touch shared/maintenance.on` sin `maintenance.html` convertía el 503 en un 404 para todo el sitio. La página se busca ahora con `try_files … =503`.
+
 ## [1.4.3] - 2026-11-04
 
 Tres puertas para que el autodespliegue y `deploy --all` **no** desplieguen una app que sí tiene commits nuevos: lo que otras herramientas llaman `deploy:lock` (Capistrano, Deployer), *ignored build step* o *watch paths* (Vercel, Render) y *wait for CI* (Render, Railway). Sin demonios ni webhooks: todo ocurre en la misma pasada del temporizador. Ver ARCHITECTURE §4.

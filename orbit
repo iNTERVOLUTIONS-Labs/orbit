@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.3"
+ORBIT_VERSION="1.4.4"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -1507,6 +1507,38 @@ _app_config_json() {
 app_dir()      { echo "$APPS_DIR/$1"; }
 app_current()  { echo "$APPS_DIR/$1/current"; }
 app_shared()   { echo "$APPS_DIR/$1/shared"; }
+# La release que servía justo antes de la activa. nginx la consulta cuando un
+# recurso con hash no está en la activa (ver _prev_asset_fallback): es la única
+# cuyo HTML puede seguir abierto en un navegador que lo cargó antes del cambio.
+app_previous() { echo "$APPS_DIR/$1/previous"; }
+
+# Antes de mover 'current', 'previous' pasa a ser lo que 'current' servía. Va
+# ANTES y no después a propósito: en el orden contrario hay un instante en que
+# 'current' ya es la nueva y 'previous' todavía la de hace dos, y un chunk de la
+# que se acaba de ir daría 404 justo en el momento que esto existe para cubrir.
+# Con este orden lo peor es que 'previous' y 'current' coincidan un instante,
+# que no rompe nada.
+#
+# Lo que había antes se guarda en PREVIOUS_WAS por si hay que deshacer: un
+# despliegue que vuelve atrás tiene que dejar 'previous' como lo encontró, no
+# apuntando a la release rota que la trampa de salida está a punto de borrar.
+PREVIOUS_WAS=""
+_previous_mark() { # _previous_mark <dir de la app>
+  local base="$1" cur
+  PREVIOUS_WAS="$(readlink "$base/previous" 2>/dev/null || true)"
+  cur="$(readlink "$base/current" 2>/dev/null || true)"
+  # Sin 'current', o con 'current' colgando, no hay nada que conservar.
+  [[ -n "$cur" && -d "$base/current/" ]] || return 0
+  ln -sfn "$cur" "$base/previous"
+  chown -h "$(app_user):$(app_user)" "$base/previous" 2>/dev/null || true
+}
+
+# El deshacer de lo anterior, para los rollbacks automáticos del despliegue.
+_previous_restore() { # _previous_restore <dir de la app>
+  local base="$1"
+  if [[ -n "$PREVIOUS_WAS" ]]; then ln -sfn "$PREVIOUS_WAS" "$base/previous"
+  else rm -f "$base/previous"; fi
+}
 
 # La app puede no vivir en la raíz del repositorio: A_APPDIR dice dónde. Eso
 # aparece de dos formas distintas y cada una tiene su función, porque la
@@ -3401,6 +3433,160 @@ cat <<EOF
 EOF
 }
 
+# ── la release anterior, para los recursos ──────────────────────────────
+# Un visitante carga el HTML de la release N, que pide '/_astro/index.Ab12.js';
+# se despliega la N+1 y el symlink se mueve. El HTML que tiene abierto sigue
+# siendo el de N, y el siguiente chunk que cargue a demanda —una ruta nueva,
+# un import dinámico, una fuente que pide el CSS— ya no existe: 404, y la
+# página se rompe a medias en el navegador de alguien que no ha hecho nada. Es
+# lo que en otras plataformas se llama «skew protection».
+#
+# La respuesta es plain nginx: si un recurso no está en la activa, se busca en
+# la que servía justo antes (el enlace 'previous', ver _previous_mark), y sólo
+# si tampoco está ahí es un 404. Una y no las cinco que se conservan: el HTML
+# que puede estar abierto es el de la release de la que se acaba de salir, y
+# cada salto más es otro 'stat' en cada 404 de verdad por un caso —dos
+# despliegues dentro de la misma visita— que se arregla recargando.
+#
+# Lo que NO cae a la anterior, y por qué el reparto es éste:
+#   · sólo lo que casa con la location de los recursos (extensiones de CSS,
+#     JS, fuentes, imágenes, wasm, mapas). Una ruta o un .html nunca: servir la
+#     página vieja de una ruta es peor que un 404, porque parece que el
+#     despliegue no ha ocurrido;
+#   · nada que niegue la activa: las negaciones son 'location' que nginx elige
+#     ANTES de llegar aquí —el snippet de seguridad y _php_root_denies van
+#     delante como expresiones regulares, y las subidas y las carpetas PHP de
+#     fuera son prefijos '^~', que ganan a todas—, así que un '/.env' o un
+#     '/vendor/x.js' que sólo exista en la anterior se niegan igual;
+#   · nunca PHP: esta location no tiene fastcgi, sirve ficheros y nada más;
+#   · '/sw.js' tampoco, porque es una location exacta: un service worker
+#     viejo es justo lo que no se quiere resucitar.
+#
+# Cuando un recurso no está en ninguna de las dos el 404 sale de aquí, y
+# error_page lo manda a la página de la activa (_notfound_location).
+#
+# <quitar> es para las location con 'alias' (Next, los estáticos de Django):
+# en una named location no se puede usar 'alias', así que se reescribe la URL
+# sin el prefijo y se sirve con 'root'.
+_prev_location() { # _prev_location <nombre> <carpeta en la release> <prefijo a quitar> <expires> <Cache-Control>
+  local tag="$1" dir="$2" strip="$3" exp="$4" cc="$5" root
+  root="$(app_previous "$A_NAME")"
+  [[ -n "$dir" && "$dir" != "." ]] && root="$root/${dir%/}"
+  printf '\n    location @orbit_prev_%s {\n        root %s;\n' "$tag" "$root"
+  if [[ -n "$strip" ]]; then
+    printf '        rewrite "^%s(.*)$" /$1 break;\n' \
+      "$(printf '%s' "$strip" | sed 's/[][\\^$.|?*+(){}]/\\&/g')"
+  fi
+cat <<EOF
+        expires $exp;
+        access_log off;
+        add_header Cache-Control "$cc";
+$(_sec_headers)
+        try_files \$uri =404;
+    }
+EOF
+}
+
+# La página de «no existe» de la web, si el build trae una. Astro, Hugo,
+# Eleventy, Jekyll, VitePress, Docusaurus o un 'next export' dejan un 404.html
+# en la raíz; algunos con formato de carpetas, 404/index.html. Se sirve con
+# 404, no con 200: un 200 le diría a un buscador que esa URL existe.
+#
+# Va a una location exacta e interna, y no a '/404.html' como antes. Con la URI
+# a secas, el error volvía a entrar por 'location /' —con su guarda de
+# mantenimiento y, en una SPA, su fallback—: en una SPA sin 404.html, un .js
+# que faltaba se contestaba con el index.html entero y un 404 encima.
+#
+# En una SPA las rutas siguen siendo del router del cliente: una ruta que no
+# existe recibe index.html con 200 y es la app quien pinta su «no encontrado»,
+# porque el servidor no sabe qué rutas existen. El 404.html sólo lo ve quien
+# pide un FICHERO que no está (un chunk, un .php que no se ejecuta).
+#
+# Si no hay ninguna de las dos, el =404 da la página de nginx con el mismo
+# código: recursive_error_pages está apagado, así que no hay bucle posible.
+_notfound_location() {
+cat <<'EOF'
+
+    error_page 404 /__orbit_404;
+    location = /__orbit_404 {
+        internal;
+        try_files /404.html /404/index.html =404;
+    }
+EOF
+}
+
+# ── la página de «la app no contesta» ───────────────────────────────────
+# Con el proceso caído, nginx contesta un 502 con su página por defecto: «502
+# Bad Gateway» y la versión de nginx. Es la peor cara posible para el
+# visitante y no le dice si volver. Ésta es como la de mantenimiento: vive en
+# shared/ —fuera de las releases, para que exista justo cuando todo lo demás
+# está roto—, se escribe una vez y es tuya.
+err_page() { echo "$APPS_DIR/$1/shared/50x.html"; }
+
+_errpage_ensure() { # _errpage_ensure <app>
+  local f; f="$(err_page "$1")"
+  [[ -f "$f" ]] && return 0
+  install -d -o "$(app_user)" -g "$(app_user)" "$APPS_DIR/$1/shared"
+  cat > "$f" <<EOF
+<!doctype html>
+<html lang="$ORBIT_LANG_CODE">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$(t "Esta página no responde ahora mismo")</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: #fafafa; color: #1a1a1a; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } }
+  main { max-width: 32rem; padding: 2rem; text-align: center; }
+  h1 { font-size: 1.6rem; margin: 0 0 .75rem; }
+  p { margin: 0; opacity: .75; }
+</style>
+<main>
+  <h1>$(t "Esta página no responde ahora mismo")</h1>
+  <p>$(t "El fallo es nuestro, no tuyo. Prueba de nuevo en unos segundos.")</p>
+</main>
+EOF
+  chown "$(app_user):$(app_user)" "$f" 2>/dev/null || true
+  chmod 0644 "$f"
+}
+
+# Sólo los errores que genera nginx: sin 'proxy_intercept_errors' ni
+# 'fastcgi_intercept_errors', un 500 o un 503 que devuelva la app pasan tal
+# cual, con su cuerpo —el JSON de error de una API no puede convertirse en una
+# página HTML—. 502 y 504 son los de «no hay nadie al otro lado» y «no ha
+# contestado a tiempo».
+#
+# Una location por código, con 'try_files … =<código>' detrás: si alguien borra
+# la página, sale la de nginx con el MISMO código. Con un 'rewrite' a secas,
+# como la de mantenimiento, el fichero que falta convertía el 502 en un 404 —
+# medido—, y un monitor que vigila los 5xx dejaría de ver la caída.
+#
+# Y los límites de peticiones contestan 429. Por defecto nginx contesta 503, y
+# el 503 de este vhost es el del mantenimiento: quien pasaba del limit_req
+# recibía «Volvemos enseguida, estamos publicando una actualización» con un
+# Retry-After de dos minutos —o un 404, si la app no había estado nunca en
+# mantenimiento y la página no existía—. Medido las dos cosas. 429 es lo que
+# significa «vas demasiado deprisa», y no pasa por ninguna página.
+_errpage_location() {
+  local code
+  printf '\n    limit_req_status 429;\n    limit_conn_status 429;\n'
+  for code in 502 504; do
+cat <<EOF
+
+    error_page $code /__orbit_$code;
+    location = /__orbit_$code {
+        internal;
+        root $APPS_DIR/$A_NAME/shared;
+        add_header Cache-Control "no-store" always;
+$(_sec_headers)
+        try_files /50x.html =$code;
+    }
+EOF
+  done
+}
+
 _body_static() {
   local root; root="$(app_current "$A_NAME")"
   [[ "$A_OUTDIR" != "." && -n "$A_OUTDIR" ]] && root="$root/$A_OUTDIR"
@@ -3437,8 +3623,9 @@ $( [[ "$A_SPA" == "yes" ]] && printf '
         access_log off;
         add_header Cache-Control "public, immutable";
 $(_sec_headers)
-        try_files \$uri =404;
+        try_files \$uri @orbit_prev_assets;
     }
+$(_prev_location assets "$A_OUTDIR" "" 1y "public, immutable")
 
     location = /sw.js {
         expires off;
@@ -3446,8 +3633,7 @@ $(_sec_headers)
 $(_sec_headers)
     }
 $( if [[ "$A_PHP" == "yes" ]]; then _php_location; else _php_deny; fi )
-
-    error_page 404 /404.html;
+$(_notfound_location)
 EOF
 }
 
@@ -3464,7 +3650,9 @@ cat <<EOF
         access_log off;
         add_header Cache-Control "public, immutable";
 $(_sec_headers)
+        try_files \$uri @orbit_prev_next;
     }
+$(_prev_location next "$(_app_sub .next/static)" /_next/static/ 1y "public, immutable")
 
     location /_next/image {
 $(_proxy_block)
@@ -3541,6 +3729,13 @@ EOF
 # 'location @nombre' que reescribiera todo, la subpetición que genera la SSI
 # para leer el motivo volvía a caer en ese mismo rewrite y la página se incluía
 # a sí misma en bucle hasta agotar el límite de recursión. Comprobado.
+#
+# Y la página se busca con 'try_files … =503' y no con un 'rewrite' a secas:
+# con el rewrite, una página que no existe —el testigo puesto a mano, que es lo
+# que el principio 3 promete que se puede hacer— convertía el 503 en un 404
+# para todo el sitio. Con esto sale la página de nginx, con el 503 y el
+# Retry-After. La SSI no cambia: el motivo se sigue pidiendo a la location
+# exacta de abajo.
 _maint_location() {
 cat <<EOF
 
@@ -3549,12 +3744,12 @@ cat <<EOF
         internal;
         root $APPS_DIR/$A_NAME/shared;
         ssi on;
-        rewrite ^ /maintenance.html break;
         # 503 con Retry-After es la señal correcta para los buscadores: dice
         # "vuelve luego" en vez de "esta página ya no existe".
         add_header Retry-After 120 always;
         add_header Cache-Control "no-store" always;
 $(_sec_headers)
+        try_files /maintenance.html =503;
     }
     location = /maintenance.reason {
         internal;
@@ -3633,13 +3828,23 @@ EOF
 
 # Un directorio servido desde disco bajo un prefijo de URL. Si la URL es
 # absoluta (un CDN) no hay nada que servir aquí y no se emite nada.
-_alias_location() { # _alias_location <url> <ruta> <raíz de la release> <expires>
-  local url="$1" path="$2" root="$3" exp="$4" target
+#
+# Con <nombre>, lo que no esté en la release activa se busca en la anterior
+# (_prev_location): el ManifestStaticFilesStorage de Django pone un hash en
+# cada nombre, igual que un bundler, y el HTML que un visitante tiene abierto
+# pide los de la release de la que se acaba de salir. Sólo si la carpeta está
+# DENTRO de la release —una ruta absoluta es de fuera y no cambia al
+# desplegar— y si la URL es de las que se pueden escribir en una expresión
+# regular sin comillas raras.
+_alias_location() { # _alias_location <url> <ruta> <raíz de la release> <expires> [nombre]
+  local url="$1" path="$2" root="$3" exp="$4" tag="${5:-}" target fb=""
   [[ -n "$url" && -n "$path" ]] || return 0
   [[ "$url" == /* ]] || return 0
   [[ "$url" == */ ]] || url="$url/"
   if [[ "$path" == /* ]]; then target="$path"; else target="$root/$path"; fi
   [[ "$target" == */ ]] || target="$target/"
+  [[ -n "$tag" && "$path" != /* && "$url" =~ ^/[A-Za-z0-9._/-]+/$ ]] || tag=""
+  [[ -n "$tag" ]] && fb=$'\n'"        try_files \$uri @orbit_prev_$tag;"
 cat <<EOF
 
     location $url {
@@ -3647,9 +3852,10 @@ cat <<EOF
         expires $exp;
         access_log off;
         add_header Cache-Control "public";
-$(_sec_headers)
+$(_sec_headers)$fb
     }
 EOF
+  [[ -z "$tag" ]] || _prev_location "$tag" "$path" "$url" "$exp" "public"
 }
 
 # Python con estáticos declarados (Django, sobre todo). Con DEBUG=False Django
@@ -3658,7 +3864,8 @@ EOF
 # memoria y latencia por algo que nginx hace mejor.
 _body_python() {
   local root; root="$(app_current "$A_NAME")"
-  _alias_location "$A_STATIC_URL" "$A_STATIC_ROOT" "$root" "1y"
+  _alias_location "$A_STATIC_URL" "$A_STATIC_ROOT" "$root" "1y" static
+  # Las subidas no: viven en shared/, que es la misma en todas las releases.
   _alias_location "$A_MEDIA_URL"  "$A_MEDIA_ROOT"  "$root" "30d"
   _body_proxy
 }
@@ -4204,7 +4411,8 @@ nginx_vhost() {
   esac
 
   [[ "$A_TYPE" == "redirect" ]] || body="$body
-$(_maint_location)"
+$(_maint_location)
+$(_errpage_location)"
 
   # Las redirecciones van delante: en nginx un 'location =' o un 'location ~'
   # tienen prioridad sobre el 'location /' del cuerpo, pero emitirlas primero
@@ -4335,6 +4543,13 @@ render_nginx() {
   # nginx_vhost tiene que correr en esta shell —deja cargada la app—.
   nginx_vhost "$name" > "$f.new"
   mv -f "$f.new" "$f"
+  # La página de «la app no contesta» tiene que existir antes de que nginx la
+  # necesite, y éste es el único sitio por el que pasan todos los vhosts: el
+  # despliegue, 'orbit nginx-rebuild', 'port', 'restore' y doctor. Si falta, la
+  # location da la de nginx con el mismo código, así que esto es la cara
+  # bonita y no la red de seguridad —y por eso no puede tumbar el despliegue
+  # si no se puede escribir—. Una app que sólo redirige no tiene shared/.
+  [[ "$A_TYPE" == "redirect" ]] || _errpage_ensure "$name" || true
   # Aquí y no dentro de nginx_vhost: esa función escribe el vhost por stdout y
   # un warn allí acabaría dentro del fichero de configuración. Las variables
   # A_* siguen cargadas porque nginx_vhost no corre en un subshell.
@@ -5470,6 +5685,11 @@ _deploy_drop_failed() {
   [[ "$(basename "$(dirname "$DEP_RELDIR")")" == "releases" ]] || return 0
   local cur; cur="$(readlink -f "$(dirname "$(dirname "$DEP_RELDIR")")/current" 2>/dev/null || true)"
   [[ "$cur" != "$(readlink -f "$DEP_RELDIR")" ]] || return 0
+  # Ni la que nginx consulta para los recursos de la release anterior: los
+  # rollbacks automáticos devuelven 'previous' a lo que era, así que esto no
+  # debería pasar nunca — y si pasa, borrarla es un 404 donde no lo había.
+  local old; old="$(readlink -f "$(dirname "$(dirname "$DEP_RELDIR")")/previous" 2>/dev/null || true)"
+  [[ "$old" != "$(readlink -f "$DEP_RELDIR")" ]] || return 0
   rm -rf "$DEP_RELDIR" 2>/dev/null || true
   return 0
 }
@@ -5573,6 +5793,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
   # moverlo antes del health check (revisión del PR #9): nginx sirve los
   # recursos a través de 'current', y el HTML viejo pidiendo chunks con hash
   # de la release nueva era 404 durante toda la espera.
+  _previous_mark "$base"
   ln -sfn "$rel" "$base/current"
   chown -h "$(app_user):$(app_user)" "$base/current"
   ok "Release %s activada" "$stamp"
@@ -5586,7 +5807,7 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
     # puente se va, el symlink vuelve, y producción queda como estaba.
     NGINX_PORT_OVERRIDE=""
     _overlap_cleanup "$name"; OVERLAP_APP=""
-    [[ -n "$prev" && -d "$prev" ]] && { ln -sfn "$prev" "$base/current"; DEP_ROLLBACK="yes"; }
+    [[ -n "$prev" && -d "$prev" ]] && { ln -sfn "$prev" "$base/current"; _previous_restore "$base"; DEP_ROLLBACK="yes"; }
     DEP_ERR="$(t "nginx no aceptó o no recargó la configuración del puente")"
     die "nginx no aceptó o no recargó la configuración del puente"
   fi
@@ -6560,6 +6781,7 @@ cmd_deploy() {
     # verificado, donde la ventana queda en lo que tarda una recarga.
     info "El symlink espera a que la release nueva demuestre estar viva"
   else
+    _previous_mark "$base"
     ln -sfn "$rel" "$base/current"
     chown -h "$(app_user):$(app_user)" "$base/current"
     ok "Release %s activada" "$stamp"
@@ -6587,6 +6809,7 @@ cmd_deploy() {
         err "La app no responde. Rollback automático…"
         if [[ -n "$prev" && -d "$prev" ]]; then
           ln -sfn "$prev" "$base/current"
+          _previous_restore "$base"
           systemctl restart "$(svc_name "$name")"
           # Sólo aquí: en el primer despliegue de una app no hay release
           # anterior y 'current' se queda apuntando a la que acaba de fallar.
@@ -6694,6 +6917,7 @@ cmd_deploy() {
       if [[ -n "$prev" && -d "$prev" ]]; then
         ln -sfn "$prev" "$base/current"
         chown -h "$(app_user):$(app_user)" "$base/current"
+        _previous_restore "$base"
         # El vhost puede haber cambiado con la release nueva —las carpetas
         # escribibles se calculan de su docroot—, así que se regenera para la
         # que vuelve. Si nginx lo rechazara, el symlink ya está bien puesto y
@@ -6737,14 +6961,18 @@ cmd_deploy() {
   # puede borrar: tras un 'orbit rollback' a una release vieja, la que servía
   # justo antes de este despliegue —el destino natural del siguiente rollback—
   # puede estar más allá de KEEP_RELEASES. Ésa y la activa no se tocan nunca.
-  local old o oreal keep_cur keep_prev
+  # Y tampoco a la que apunta 'previous': nginx le pide los recursos que ya no
+  # están en la activa, y aquí debería ser la misma que 'prev' — se comprueba
+  # aparte para que esa garantía no dependa de que dos variables coincidan.
+  local old o oreal keep_cur keep_prev keep_old
   keep_cur="$(readlink -f "$base/current" 2>/dev/null || true)"
   keep_prev="${prev:+$(readlink -f "$prev" 2>/dev/null || true)}"
+  keep_old="$(readlink -f "$base/previous" 2>/dev/null || true)"
   mapfile -t old < <(releases_desc "$base" | tail -n +$((KEEP_RELEASES+1)))
   for o in "${old[@]:-}"; do
     [[ -n "$o" && "$base/releases/$o" != "$rel" ]] || continue
     oreal="$(readlink -f "$base/releases/$o")"
-    [[ "$oreal" == "$keep_cur" || "$oreal" == "$keep_prev" ]] && continue
+    [[ "$oreal" == "$keep_cur" || "$oreal" == "$keep_prev" || "$oreal" == "$keep_old" ]] && continue
     rm -rf "$base/releases/$o"
   done
 
@@ -8263,6 +8491,10 @@ cmd_rollback() {
     target="$(choose 'Volver a la release' "${rels[@]}")"
     [[ -z "$target" ]] && return 0
   fi
+  # 'previous' pasa a ser la release de la que se huye, y no la de antes de
+  # ella: los navegadores que tienen abierto su HTML son los que van a pedir sus
+  # recursos, y esos ya no están en la activa.
+  _previous_mark "$base"
   ln -sfn "$base/releases/$target" "$base/current"
   chown -h "$(app_user):$(app_user)" "$base/current" 2>/dev/null || true
   needs_svc "$A_TYPE" && systemctl restart "$(svc_name "$name")"
@@ -15937,6 +16169,8 @@ _i18n_en() {
     ["Tu página no tiene el hueco del motivo, así que no se mostrará."]="Your page has no slot for the reason, so it will not be shown."
     ["Añádele esta línea donde quieras que salga:"]="Add this line wherever you want it to appear:"
     ["El vhost de esta app aún no conoce el mantenimiento. Aplícalo con:  orbit nginx-rebuild"]="This app's vhost does not know about maintenance yet. Apply it with:  orbit nginx-rebuild"
+    ["Esta página no responde ahora mismo"]="This page is not responding right now"
+    ["El fallo es nuestro, no tuyo. Prueba de nuevo en unos segundos."]="The problem is on our side, not yours. Try again in a few seconds."
     ["«%s» no estaba en mantenimiento"]="«%s» was not in maintenance"
     ["«%s» vuelve a servir con normalidad"]="«%s» is serving normally again"
     ["Guardada. Se sirve tal cual, sin recargar nginx."]="Saved. It is served as is, without reloading nginx."

@@ -109,8 +109,11 @@ Inspirado en Capistrano, adaptado a un solo servidor.
 │   └── ...                   se conservan las 5 últimas
 ├── shared/
 │   ├── .env                  sobrevive a los despliegues
-│   └── storage/              opcional, para uploads
-└── current -> releases/20260805-041230
+│   ├── storage/              opcional, para uploads
+│   ├── maintenance.html      la página de mantenimiento (§8.0), tuya
+│   └── 50x.html              la de «la app no contesta» (§8.0b), tuya
+├── current  -> releases/20260805-041230
+└── previous -> releases/20260804-235018   la que servía antes (§4.1)
 ```
 
 ### Secuencia de un despliegue
@@ -130,6 +133,46 @@ Inspirado en Capistrano, adaptado a un solo servidor.
 | 10 | Django: comprobar migraciones pendientes y **avisar sin aplicarlas** | Solo avisa. |
 
 El punto crítico es el paso 4. Un build puede tardar dos minutos y consumir toda la RAM, y durante ese tiempo la web anterior sigue sirviendo con normalidad.
+
+### 4.1 La release anterior sigue contestando por sus recursos (1.4.4)
+
+Mover `current` es atómico para el servidor y no para el visitante. Quien cargó el HTML de la release N lo sigue teniendo abierto después del despliegue, y ese HTML pide sus recursos **por nombre con hash**: `/_astro/index.Ab12.js`, `/assets/app-9f8e.css`, `/_next/static/chunks/…`. En cuanto `current` apunta a N+1, el siguiente chunk que su navegador carga a demanda —una ruta nueva de la SPA, un `import()`, la fuente que pide el CSS— **no existe**: 404, y la página se rompe a medias delante de alguien que no ha hecho nada. Es lo que otras plataformas llaman *skew protection*, y con releases inmutables pasa en cada despliegue.
+
+La respuesta es nginx plano. Junto a `current` hay un segundo enlace, **`previous`**, que apunta a la release que servía justo antes, y la location de los recursos termina en ella en vez de en un 404:
+
+```nginx
+location ~* \.(?:css|js|mjs|woff2?|…|wasm|map)$ {
+    …
+    try_files $uri @orbit_prev_assets;
+}
+location @orbit_prev_assets {
+    root /srv/apps/<app>/previous/<A_OUTDIR>;
+    expires 1y;  add_header Cache-Control "public, immutable";  …
+    try_files $uri =404;
+}
+```
+
+Si Orbit desaparece, son dos enlaces y una `named location`: principio 3.
+
+**Qué cae a la anterior, y qué no.** Sólo lo que casa con la location de los recursos — extensiones de CSS, JS, fuentes, imágenes, wasm y mapas. Nunca una ruta ni un `.html`: servir la página vieja de una ruta es peor que un 404, porque parece que el despliegue no ha ocurrido. Nunca nada que la activa niegue, y eso no hay que repetirlo en ningún sitio: las negaciones son `location` que nginx elige **antes** de llegar aquí —el snippet de seguridad y `_php_root_denies` van delante como expresiones regulares, que se evalúan en orden; las subidas (§18.7) y las carpetas PHP de fuera (§18.7c) son prefijos `^~`, que ganan a todas—. Así un `/.env`, un `/vendor/x.js` o un `/api/viejo.js` que sólo existan en la anterior se niegan igual que si estuvieran en la activa, y hay una prueba por cada uno. Nunca PHP: la location no tiene `fastcgi`, y un `.php` lo resuelve el bloque de php-fpm contra el docroot de la activa. Y nunca `/sw.js`: es una location exacta, y un service worker viejo es justo lo que no se quiere resucitar.
+
+**Dónde está cubierto.** Las webs estáticas (con `A_OUTDIR` y `A_APPDIR`, en una SPA también), el `/_next/static/` de Next y el `/static/` de Django cuando su carpeta está dentro de la release —el `ManifestStaticFilesStorage` pone hashes igual que un bundler—. Next y Django sirven por `alias`, que una `named location` no admite, así que ahí la anterior se sirve con `root` y un `rewrite … break` que quita el prefijo. Las subidas (`/media/`) no: viven en `shared/`, que es la misma en todas las releases.
+
+**Lo que queda fuera: las apps con proceso que sirven sus propios recursos** —Nuxt, SvelteKit con adaptador de Node, Astro SSR, Remix/React Router—. Ahí nginx no sirve nada de disco: todo va al proceso, y el proceso de la release anterior ya no existe. Cubrirlas es posible —interceptar el 404 del proceso sólo en las URL de recursos y servirlo de la carpeta de cliente de la anterior—, pero exige saber dónde deja cada framework su carpeta de cliente (`.output/public`, `build/client`, `dist/client`…), y Orbit no lo guarda: la detección sólo apunta el comando de arranque. Es detección nueva, y en este proyecto la detección se da por buena compilando un proyecto real de cada stack (§7), no leyendo su documentación.
+
+**Una y no las cinco.** El HTML que puede estar abierto es el de la release de la que se acaba de salir; cada salto más es otro `stat` en cada 404 de verdad, por un caso —dos despliegues dentro de la misma visita— que se arregla recargando.
+
+**Cómo se mueve `previous`.** Una regla: cada vez que `current` cambia de X a Y, `previous` pasa a ser X, y **antes** de mover `current` —en el orden contrario hay un instante en que `current` ya es la nueva y `previous` la de hace dos, que es justo el instante que esto cubre—. De ahí salen los tres casos:
+
+- **Despliegue**: `previous` es la que servía. En el reinicio sin corte (§5.2) se marca donde se mueve el symlink, con el puente ya verificado; si el puente no responde, no se mueve ninguno de los dos.
+- **`orbit rollback`**: `previous` es la release **de la que se huye**, no la de antes de ella. Los navegadores con HTML abierto son los de la que estaba sirviendo, y sus recursos son los que ya no están en la activa.
+- **Rollback automático** (health check, nginx que rechaza el puente, la web de PHP en 5xx): `previous` vuelve **a lo que era antes del despliegue**. Si se quedara en la release rota, la trampa de salida no podría borrarla —`_deploy_drop_failed` no borra lo que `previous` sirve— y, si la borrara, los recursos de la anterior de verdad darían 404.
+
+**La poda** ya no tocaba la activa ni la que servía antes del despliegue (1.4.1), y ésa es por construcción la de `previous`. Se comprueba aparte de todas formas, para que la garantía no dependa de que dos variables coincidan. Cuando la poda se la lleva por otra vía, el enlace queda colgando y el recurso es un 404 normal: no hay nada que limpiar en nginx.
+
+**Un precio que conviene saber**: un fichero que se quita del repositorio sigue saliendo **un despliegue más**, si tiene extensión de recurso. Si lo quitas porque no debía estar publicado, despliega dos veces o borra la release anterior; y si era un secreto, ya era público y lo que toca es rotarlo.
+
+Una app que ya existía tiene el bloque en su siguiente despliegue o `orbit nginx-rebuild`, y el enlace `previous` en su siguiente cambio de release: hasta entonces la location apunta a una ruta que no existe, que es exactamente un 404 como el de antes.
 
 ### Despliegue automático: por qué se sondea y no se reciben webhooks
 
@@ -368,7 +411,9 @@ Decisiones que no se ven desde fuera:
 
 Lo que las pruebas cubren y lo que no: la secuencia completa está fijada con dobles en `deploy_test.sh` —el orden es lo único que separa «sin corte» de «con corte», y la mutación de adelantar el `restart` la pone en rojo— y la unidad puente en `systemd_test.sh`. El drenaje de nginx es parte de ese mismo orden, con una comprobación por mitad.
 
-Y esto ya se ha ejercitado con systemd y nginx de verdad bajo tráfico, que es lo que ningún doble podía ver: una sonda de ~10 req/s contra el dominio durante el despliegue, contando los 502. La primera tanda dio **5 en 3 despliegues**; con el drenaje, **0 en 5**. De ahí salió el fallo de arriba, que llevaba desde la v1.0.2 sin que ninguna prueba pudiera alcanzarlo. Dos avisos para quien repita la medición: la sonda tiene que ir **por debajo del `limit_req` de 40 r/s** del vhost, porque a 100 req/s nginx contesta 503 por rate limiting y parece un corte que no existe —la primera medición se acusó a sí misma—; y conviene distinguir el 502 (el hueco de verdad) del 503 (la página de mantenimiento del camino clásico, que ahí es lo correcto).
+Desde la 1.4.4 esa ventana tampoco existe para los recursos: lo que el HTML del proceso viejo pide y ya no está en la release nueva lo sirve `previous` (§4.1).
+
+Y esto ya se ha ejercitado con systemd y nginx de verdad bajo tráfico, que es lo que ningún doble podía ver: una sonda de ~10 req/s contra el dominio durante el despliegue, contando los 502. La primera tanda dio **5 en 3 despliegues**; con el drenaje, **0 en 5**. De ahí salió el fallo de arriba, que llevaba desde la v1.0.2 sin que ninguna prueba pudiera alcanzarlo. Dos avisos para quien repita la medición: la sonda tiene que ir **por debajo del `limit_req` de 40 r/s** del vhost, porque a 100 req/s nginx corta por rate limiting y parece un corte que no existe —la primera medición se acusó a sí misma; entonces era un 503, desde la 1.4.4 es un 429 (§8.0b)—; y conviene distinguir el 502 (el hueco de verdad) del 503 (la página de mantenimiento del camino clásico, que ahí es lo correcto).
 
 ### 5.3 Aislamiento por app: un usuario de sistema por aplicación
 
@@ -787,6 +832,41 @@ Si el testigo ya estaba puesto antes de empezar, el despliegue no lo retira: lo 
 
 ---
 
+## 8.0b Las páginas de error (1.4.4)
+
+### El 404 de la web, si el build trae uno
+
+Astro, Hugo, Eleventy, Jekyll, VitePress, Docusaurus y `next export` dejan un `404.html` en la raíz de lo que se publica; algunos, con formato de carpetas, `404/index.html`. Se sirve el primero que exista, **con código 404** —un 200 le diría a un buscador que esa URL es una página—, y si no hay ninguno, la página de nginx con el mismo código:
+
+```nginx
+error_page 404 /__orbit_404;
+location = /__orbit_404 { internal; try_files /404.html /404/index.html =404; }
+```
+
+Antes era `error_page 404 /404.html`, y la URI a secas volvía a entrar por `location /`, con su guarda de mantenimiento y, en una SPA, su fallback: **en una SPA sin `404.html`, un `.js` que faltaba se contestaba con el `index.html` entero** y un 404 encima. La location exacta e interna no pasa por ningún sitio más. No hay bucle posible: `recursive_error_pages` está apagado, así que el `=404` del final no vuelve a entrar.
+
+**En una SPA mandan las rutas del cliente.** Una ruta que no existe recibe `index.html` con 200, y es el router de la app quien pinta su «no encontrado»: el servidor no sabe qué rutas existen, y servir el `404.html` en `/panel/ajustes` rompería la app. El `404.html` sólo lo ve quien pide un **fichero** que no está —un chunk que no aparece ni en la activa ni en la anterior (§4.1), un `.php` que no se ejecuta—.
+
+No hay clave `error_pages` en el `orbit.json`. Todos los generadores que se miraron dejan uno de esos dos nombres, y una ruta configurable es una ruta que hay que validar (`..`, absolutas, fuera de la carpeta publicada) para no cubrir ningún caso que exista. Si aparece uno, el sitio para añadirla es `_notfound_location`.
+
+### «La app no contesta»: 502 y 504
+
+Con el proceso caído —o php-fpm—, nginx contestaba su página por defecto: «502 Bad Gateway» y su versión. Ahora sirve `shared/50x.html`, que se escribe la primera vez que se genera el vhost y a partir de ahí **es tuya**, como la de mantenimiento: vive fuera de las releases porque tiene que existir justo cuando todo lo demás está roto, no lleva recursos externos, y sale en el idioma del servidor. Con `Cache-Control: no-store`, para que un CDN no se quede con la caída.
+
+Tres decisiones:
+
+- **Sólo los errores que genera nginx.** No hay `proxy_intercept_errors` ni `fastcgi_intercept_errors`: un 500 o un 503 que devuelva la app pasan tal cual, con su cuerpo. El JSON de error de una API no puede convertirse en una página HTML.
+- **Una location por código, con `try_files /50x.html =<código>` detrás.** La primera versión copiaba la de mantenimiento —`rewrite ^ /50x.html break`— y, con el fichero borrado, **el 502 salía como 404**: medido. Un monitor que vigila los 5xx dejaría de ver la caída justo cuando alguien ha tocado la página. Con `try_files`, sin página sale la de nginx con el mismo código.
+- **Se crea en `render_nginx`**, que es por donde pasan todos los vhosts: despliegue, `nginx-rebuild`, `port`, `restore`, `doctor --fix`.
+
+### Pasar del límite es un 429
+
+`limit_req` y `limit_conn` contestan 503 por defecto, y el 503 de estos vhosts es el del mantenimiento. Quien pasaba de 40 r/s con 80 de ráfaga recibía «Volvemos enseguida, estamos publicando una actualización» con un `Retry-After` de dos minutos — o, si la app no había estado nunca en mantenimiento y la página no existía, **un 404**: el mismo `rewrite` sobre un fichero que falta. Medidas las dos cosas. Ahora `limit_req_status 429` y `limit_conn_status 429`, que es el código que significa «vas demasiado deprisa» y no pasa por ninguna página.
+
+Y la de mantenimiento tenía el mismo `rewrite` sobre un fichero que puede faltar: `orbit maintenance on` la crea siempre, pero el testigo **se puede poner a mano** —es la promesa del principio 3— y entonces toda la web salía en 404. Ahora busca la página con `try_files /maintenance.html =503`; sin ella sale la de nginx, con el 503 y el `Retry-After`. La SSI del motivo no cambia: la subpetición sigue cayendo en su location exacta (§8.0), y `maintenance_test` lo comprueba con nginx de verdad.
+
+---
+
 ## 8.1 Redirecciones
 
 Dos problemas distintos que se resuelven de dos formas distintas a propósito.
@@ -1139,7 +1219,7 @@ Dos detalles que importan:
 | `unit_test.sh` | conteo de apps, reparto de puertos, detección de conflictos y `orbit port` completo | nada |
 | `subcmd_test.sh` | `_subcmd` en aislamiento y los ocho comandos que lo usan, con apps llamadas `status`, `set`, `get` y `on` para forzar el choque | nada |
 | `exec_test.sh` | entorno de `orbit exec`, precedencia de `NODE_ENV`, `PATH`, formas de invocación, código de salida y secretos fuera del log | nada |
-| `nginx_test.sh` | vhost real validado con `nginx -t` y servido en los puertos 18080/18443, ambas ramas (con y sin certificado), y `/static/` servido desde disco | `nginx` |
+| `nginx_test.sh` | vhost real validado con `nginx -t` y servido en los puertos 18080/18443, ambas ramas (con y sin certificado), `/static/` servido desde disco, los recursos de la release anterior (§4.1) y las páginas de error (§8.0b) | `nginx` |
 | `maintenance_test.sh` | el 503 servido por nginx de verdad, la cabecera `Retry-After`, que la validación de certbot sigue pasando y que un despliegue abortado no deja la web cerrada | `nginx` |
 | `env_test.sh` | ida y vuelta del `.env` con valores que llevan `$`, comillas y espacios; compatibilidad con lo escrito por versiones anteriores | nada |
 | `autodeploy_test.sh` | `deploy --all`, detección de commits nuevos con repos git reales, permiso por app, commit roto que no se reintenta y remoto mudo avisado una sola vez | `git`, `rsync` |
