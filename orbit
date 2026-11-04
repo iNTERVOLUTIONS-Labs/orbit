@@ -1,10 +1,83 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # ============================================================================
 #  ORBIT · Deploy platform CLI
 #  https://github.com/  ·  MIT
 # ============================================================================
+# El intérprete va por su ruta y no con '/usr/bin/env bash'. Cuando sudo
+# ejecuta este fichero para alguien que no es root, el núcleo resuelve el
+# shebang con el PATH que le pasa sudo, antes de que corra una sola línea de
+# Orbit. El sudoers de Ubuntu fija secure_path y ese PATH es seguro, pero uno
+# sin él deja pasar el PATH de quien llama, y su 'bash' correría como root.
+#
+# Y con -p, el modo privilegiado de bash, que no importa funciones del entorno
+# ni lee BASH_ENV ni SHELLOPTS. Sin él, una función exportada llamada 'set'
+# —BASH_FUNC_set%%— se ejecuta en la línea de abajo, antes que nada de Orbit:
+# comprobado, y por eso ninguna limpieza escrita dentro del script puede
+# defender eso; la primera versión de la de abajo borraba las funciones
+# importadas con 'unset -f', y un 'unset' importado se la saltaba. Sudo hoy
+# quita esas variables, pero eso es del sudo de cada máquina, no de Orbit.
+# Ver ARCHITECTURE §9.1.
 set -Eeuo pipefail
 shopt -s nullglob
+
+# >>> limpieza del entorno · root en nombre de quien no lo es
+# Elevado por sudo en nombre de alguien que no es root —un miembro de
+# orbit-admin, o cualquiera del grupo sudo que teclee 'orbit'—, el entorno es
+# el de quien llama, y Orbit lee mucho de él: cada ajuste de más abajo es
+# "${X:-defecto}", así que un BACKUP_HOOK o un APPS_DIR en el entorno decidirían
+# qué hace root. Hoy el env_reset de sudo lo tira todo, pero eso es una
+# propiedad del sudoers de cada servidor —y de sudo-rs, que Ubuntu ya trae—, no
+# de Orbit. Así que los ajustes salen de /etc/orbit y de ningún otro sitio.
+#
+# Se queda la identidad (quién lo pidió: SUDO_*), las tres preferencias
+# documentadas (ORBIT_LANG, NO_COLOR, UI_GLYPHS: se comparan, nunca se
+# ejecutan), el tamaño del terminal y la configuración regional, que sólo
+# sobrevive sin '/': un LANGUAGE con una ruta dentro apuntaría gettext a un
+# catálogo elegido por quien llama. PATH y HOME se fijan, no se heredan: un
+# HOME suyo le daría a root su .gitconfig, y ahí dentro cabe un comando.
+#
+# Se lee /proc/self/environ y no las variables de bash, porque bash no importa
+# como variable lo que no tiene nombre de variable ('a.b=1') pero sí se lo pasa
+# a cada proceso hijo, y un 'unset' no lo alcanza. Si sobra algo, Orbit se
+# vuelve a ejecutar a sí mismo con 'env -i' y sólo lo de la lista; la segunda
+# vez no sobra nada y sigue. No hay marca que diga «ya limpio» —quien llama
+# podría ponerla—: lo que decide es lo que hay en el entorno.
+#
+# Y la umask se fija también: es la de quien llama, y con un 077 cada release,
+# vhost y carpeta que creara root saldría sin permiso de lectura para nginx y
+# php-fpm — una web en 403 por la configuración de la shell de otro.
+#
+# Sin /proc no se puede mirar, y no se sigue: se apunta aquí y se aborta en
+# cuanto existe 'die', un poco más abajo.
+_ORBIT_ENV_DIRTY=""
+if [[ $EUID -eq 0 && "${SUDO_UID:-0}" != 0 ]]; then
+  _orbit_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+  _orbit_home=~root
+  _orbit_keep=() _orbit_more="" _orbit_seen=0
+  if [[ -r /proc/self/environ ]]; then
+    while IFS= read -r -d '' _orbit_e; do
+      _orbit_n="${_orbit_e%%=*}"
+      [[ "$_orbit_n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { _orbit_more=1; continue; }
+      case "$_orbit_n" in
+        USER|LOGNAME|SUDO_USER|SUDO_UID|SUDO_GID|SUDO_COMMAND|SUDO_HOME) _orbit_keep+=("$_orbit_e") ;;
+        ORBIT_LANG|NO_COLOR|UI_GLYPHS|COLUMNS|LINES) _orbit_keep+=("$_orbit_e") ;;
+        TERM|LANG|LANGUAGE|LC_*)
+          if [[ "${_orbit_e#*=}" =~ ^[A-Za-z0-9_.@:-]*$ ]]; then _orbit_keep+=("$_orbit_e"); else _orbit_more=1; fi ;;
+        PATH) [[ "$_orbit_e" == "PATH=$_orbit_path" ]] && _orbit_seen=$(( _orbit_seen | 1 )) || _orbit_more=1 ;;
+        HOME) [[ "$_orbit_e" == "HOME=$_orbit_home" ]] && _orbit_seen=$(( _orbit_seen | 2 )) || _orbit_more=1 ;;
+        *) _orbit_more=1 ;;
+      esac
+    done < /proc/self/environ
+    (( _orbit_seen == 3 )) || _orbit_more=1
+    [[ -z "$_orbit_more" ]] \
+      || exec /usr/bin/env -i "${_orbit_keep[@]}" PATH="$_orbit_path" HOME="$_orbit_home" /bin/bash -p -- "$0" "$@"
+  else
+    _ORBIT_ENV_DIRTY="yes"
+  fi
+  unset -v _orbit_path _orbit_home _orbit_keep _orbit_more _orbit_seen _orbit_e _orbit_n
+  umask 022
+fi
+# <<< limpieza del entorno
 
 ETC_DIR="/etc/orbit"
 CONF_FILE="$ETC_DIR/orbit.conf"
@@ -254,9 +327,16 @@ if [[ $EUID -ne 0 ]]; then
   # a validarse, así que un 'export ORBIT_LANG=klingon' en un .bashrc dejaba
   # orbit inservible para ese usuario… y funcionando para root, que no se eleva.
   # Dos comportamientos distintos según quién ejecuta es lo peor de las dos.
+  #
+  # Y se eleva la ruta real, no la que se tecleó. La regla de 'orbit admin'
+  # nombra /usr/local/bin/orbit, y el sudo clásico, antes de comparar inodos,
+  # exige que coincida el nombre del fichero: invocado como 'dv' —el enlace que
+  # crea install.sh— la regla no casaba, y sudo pedía una contraseña que un
+  # miembro del grupo no tiene por qué tener.
+  _orbit_self="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
   [[ -n "$ORBIT_LANG_ENV" ]] && _lang_supported "$(_lang_norm "$ORBIT_LANG_ENV")" \
-    && exec sudo -- "$0" --lang "$ORBIT_LANG_ENV" "$@"
-  exec sudo -- "$0" "$@"
+    && exec sudo -- "$_orbit_self" --lang "$ORBIT_LANG_ENV" "$@"
+  exec sudo -- "$_orbit_self" "$@"
   fi
 fi
 
@@ -299,7 +379,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.5"
+ORBIT_VERSION="1.4.6"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -317,6 +397,13 @@ WATCH_MAINT_MAX="${WATCH_MAINT_MAX:-30}"  # minutos en mantenimiento antes de av
 TOP_LOG_LINES="${TOP_LOG_LINES:-5000}"    # cuántas líneas de log mira 'orbit top'
 METRICS_FILE="${METRICS_FILE:-/var/lib/orbit/deploys.tsv}"
 METRICS_KEEP="${METRICS_KEEP:-2000}"      # despliegues que se conservan en el histórico
+# Dónde se dejan las métricas para el colector de ficheros de node_exporter.
+# Vacío es apagado; lo enciende 'orbit metrics prom enable'. Ver _prom_render.
+METRICS_PROM_DIR="${METRICS_PROM_DIR:-}"
+# El binario que nombra la regla de sudo de 'orbit admin', y el que 'doctor'
+# comprueba que sólo pueda cambiar root. Y dónde va esa regla.
+ORBIT_BIN="${ORBIT_BIN:-/usr/local/bin/orbit}"
+SUDOERS_ADMIN="${SUDOERS_ADMIN:-/etc/sudoers.d/orbit-admin}"
 TOP_INTERVAL="${TOP_INTERVAL:-2}"         # segundos entre refrescos de 'orbit top'
 BUILD_RECOVERY="${BUILD_RECOVERY:-yes}"   # reintentar un build fallido si se sabe arreglarlo
 BUILD_UNFREEZE="no"                       # sólo durante un reintento; nunca se guarda
@@ -488,7 +575,16 @@ hint()    { _t "$@"; printf "  ${BLU}%s${R} %s\n" "$G_INFO" "$I18N_MSG" >&2; }
 warn()    { _t "$@"; printf "  ${YEL}%s${R} %s\n" "$G_WARN" "$I18N_MSG" >&$UI_FD; }
 err()     { _t "$@"; printf "  ${RED}%s${R} %s\n" "$G_ERR" "$I18N_MSG" >&2; }
 die()     { err "$@"; exit 1; }
-logline() { mkdir -p "$(dirname "$LOG_FILE")"; printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
+# Lo apuntado en la limpieza del entorno, en cuanto hay con qué decirlo.
+[[ -z "${_ORBIT_ENV_DIRTY:-}" ]] \
+  || die "No puedo leer /proc/self/environ, y sin él no puedo limpiar el entorno de quien me llama con sudo: no sigo."
+# Cada línea del registro lleva quién la pidió cuando no fue root a secas: con
+# el grupo orbit-admin (§9.1) varias personas actúan como root, y «root hizo
+# esto» no le dice nada a quien lo lea después. SUDO_USER lo pone sudo, no
+# quien llama; se filtra igual, porque va a un fichero que se lee con 'cat'.
+_LOG_WHO=""
+[[ "${SUDO_USER:-root}" != root && "${SUDO_USER}" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && _LOG_WHO="[$SUDO_USER] "
+logline() { mkdir -p "$(dirname "$LOG_FILE")"; printf '%s %s%s\n' "$(date -Iseconds)" "$_LOG_WHO" "$*" >> "$LOG_FILE"; }
 
 # ¿Se puede animar? Hacen falta las tres: terminal de verdad (si no, cada
 # fotograma se queda escrito en el fichero — la misma trampa del spinner),
@@ -3407,13 +3503,35 @@ has_cert()  { [[ -f "$(cert_file "$1")" ]]; }
 # certificado o si openssl no sabe leerlo: cero días es una emergencia y «no
 # hay» no lo es, así que no pueden compartir valor.
 cert_days_left() { # cert_days_left <dominio>
+  [[ -n "${1:-}" ]] || return 0
+  _cert_end_load "$1" fresh
+  local end="${CERT_END[$1]}"
+  [[ -n "$end" ]] || return 0
+  printf '%s' "$(( (end - $(date +%s)) / 86400 ))"
+}
+
+# Cuándo caduca, en segundos desde 1970, guardado en CERT_END[<dominio>] y
+# vacío si no hay certificado o no se puede leer. Se apunta en el shell que
+# llama —por eso no devuelve nada por stdout— para que la pasada del vigilante
+# lo pregunte una vez y las métricas de Prometheus lo reutilicen: son dos
+# procesos por certificado y cada minuto, y la segunda vez no aportaría nada.
+# Con 'fresh' se vuelve a leer: cert_days_left no se fía de lo guardado, porque
+# en un mismo proceso puede haber un 'orbit ssl' entre medias, y un «no hay
+# certificado» de antes de emitirlo seguiría diciéndolo después.
+declare -A CERT_END=()
+_cert_end_load() { # _cert_end_load <dominio> [fresh]
+  # Sin dominio no hay clave: un subíndice vacío en un array asociativo es un
+  # error fatal de bash, no un «no hay».
+  [[ -n "${1:-}" ]] || return 0
+  [[ "${2:-}" != fresh && -n "${CERT_END[$1]+x}" ]] && return 0
+  CERT_END[$1]=""
   has_cert "$1" || return 0
   local exp end
-  exp="$(openssl x509 -enddate -noout -in "$(cert_file "$1")" 2>/dev/null | cut -d= -f2)"
+  exp="$(openssl x509 -enddate -noout -in "$(cert_file "$1")" 2>/dev/null | cut -d= -f2 || true)"
   [[ -n "$exp" ]] || return 0
   end="$(date -d "$exp" +%s 2>/dev/null || echo 0)"
   (( end > 0 )) || return 0
-  printf '%s' "$(( (end - $(date +%s)) / 86400 ))"
+  CERT_END[$1]="$end"
 }
 
 _proxy_block() {
@@ -8050,7 +8168,20 @@ _metrics_trend() { # _metrics_trend <app> -> segundos de diferencia, o vacío
   printf '%s' "$(( nuevo - viejo ))"
 }
 
-cmd_metrics() { # orbit metrics [app]
+cmd_metrics() { # orbit metrics [app] | --prom | prom …
+  # Las dos formas de Prometheus van delante de la app: 'prom' es un
+  # subcomando y gana, como en todo _subcmd (§8.3).
+  case "${1:-}" in
+    --prom)
+      [[ "$JSON" == "yes" ]] && die "--json y --prom son dos formatos: elige uno."
+      (( $# == 1 )) || die "'orbit metrics --prom' va solo: son las métricas del servidor entero."
+      _prom_render
+      return 0 ;;
+    prom)
+      app_exists prom && hint "«prom» es además el nombre de una app; su histórico sale en 'orbit metrics', con las demás."
+      shift; _metrics_prom "$@"
+      return 0 ;;
+  esac
   local name="${1:-}"
   [[ "$name" == -* ]] && die "orbit metrics: no entiendo «%s»." "$name"
   [[ -n "$name" ]] && { app_exists "$name" || die "La app '%s' no existe. Mira 'orbit list'." "$name"; }
@@ -8138,6 +8269,351 @@ _metrics_app_json() { # _metrics_app_json <app>
     "$([[ -n "$tend" ]] && _j_num "$tend" || printf 'null')" \
     "$([[ -n "$ult" ]] && _j_str "$ult" || printf 'null')"
   return 0
+}
+
+# ═════════════════════════════════════════ métricas para Prometheus ═══════
+# Para quien ya tiene Grafana. Sin exportador: un exportador es un proceso
+# escuchando en un puerto, y eso es justo lo que el principio 2 descarta. Lo
+# que se hace es escribir un fichero de texto en la carpeta del colector de
+# ficheros de node_exporter (textfile collector), que ya está corriendo si hay
+# Prometheus en la máquina, y él lo publica junto a todo lo demás. Orbit no
+# instala node_exporter: si no está, el fichero no lo lee nadie y se dice.
+#
+# La carpeta por defecto es la que trae compilada el paquete de Ubuntu
+# —/etc/default/prometheus-node-exporter deja ARGS vacío y el binario lleva
+# /var/lib/prometheus/node-exporter como valor de --collector.textfile.directory,
+# comprobado en el .deb de noble (1.7.0) y en el de la siguiente (1.10)—, y el
+# paquete crea esa carpeta como root:root 0755.
+#
+# Lo refresca la pasada del vigilante, que ya corre cada minuto y ya ha
+# preguntado lo caro: si cada app contesta. Un temporizador propio tendría que
+# volver a preguntarlo —un curl por app y minuto más— o publicar un «arriba»
+# que significara otra cosa que el de 'orbit watch'. Por eso sin vigilante no
+# hay fichero (ver cmd_watch disable): una foto vieja con 'up 1' se lee en
+# Grafana como el estado de ahora, y eso es peor que una serie que desaparece.
+#
+# Lo que NO lleva, a propósito: nada del .env, ni la URL del repositorio —la de
+# uno privado puede llevar un token dentro—, ni la rama. Lo que va en etiquetas
+# es el nombre de la app, su tipo y su dominio, que ya son públicos.
+METRICS_PROM_DEFAULT="/var/lib/prometheus/node-exporter"
+METRICS_PROM_NAME="orbit.prom"     # node_exporter sólo lee los *.prom
+PROM_RC=0
+PROM_TMP=""
+
+# Escapado de un valor de etiqueta según el formato de exposición: la barra,
+# la comilla y el salto de línea. Por printf -v y no por "$(…)": son una docena
+# de etiquetas por app y cada minuto.
+_prom_esc_v() { # _prom_esc_v <variable> <texto>
+  local _pe=${2-}
+  _pe=${_pe//\\/\\\\}; _pe=${_pe//\"/\\\"}; _pe=${_pe//$'\n'/\\n}
+  printf -v "$1" '%s' "$_pe"
+}
+
+# Una familia: su ayuda, su tipo y sus muestras juntas, que es lo que exige el
+# formato. Sin muestras no se escribe nada: una familia vacía es ruido.
+_prom_family() { # _prom_family <nombre> <tipo> <ayuda> <muestras>
+  [[ -n "$4" ]] || return 0
+  printf '# HELP %s %s\n# TYPE %s %s\n%s' "$1" "$3" "$1" "$2" "$4"
+}
+
+# Fecha ISO-8601 con huso —la de deploys.tsv— a segundos desde 1970, en awk
+# portable: Ubuntu trae mawk, que no tiene mktime (ver §8.5). Es el algoritmo
+# de días desde la fecha civil de Howard Hinnant.
+_PROM_AWK_EPOCH='
+function epoch(s,   y, m, d, z, off, era, yoe, doy, doe) {
+  if (s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return ""
+  y = substr(s, 1, 4) + 0; m = substr(s, 6, 2) + 0; d = substr(s, 9, 2) + 0
+  z = substr(s, 20); off = 0
+  if (z ~ /^[+-][0-9][0-9]:?[0-9][0-9]$/) {
+    gsub(":", "", z)
+    off = (substr(z, 2, 2) * 3600 + substr(z, 4, 2) * 60) * (substr(z, 1, 1) == "-" ? -1 : 1)
+  }
+  if (m <= 2) y--
+  era = int(y / 400); yoe = y - era * 400
+  doy = int((153 * (m > 2 ? m - 3 : m + 9) + 2) / 5) + d - 1
+  doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+  return (era * 146097 + doe - 719468) * 86400 \
+    + substr(s, 12, 2) * 3600 + substr(s, 15, 2) * 60 + substr(s, 18, 2) - off
+}'
+
+# Las métricas, en el formato de exposición de Prometheus, por stdout.
+#
+# --fresh quiere decir «llamado desde la pasada del vigilante»: WS_STATE ya es
+# de este minuto. Sin él se lee el fichero de estado, que es lo que dejó la
+# última pasada, y por eso va también su hora: con el vigilante parado, un
+# 'orbit_app_up' sin fecha diría más de lo que sabe.
+#
+# Coste por pasada, que importa porque es cada minuto: un 'systemctl show' para
+# todas las unidades, un 'stat' para todos los enlaces 'current', un awk sobre
+# el histórico y tres 'is-active'. Lo de cada app se lee sin procesos —las rutas
+# se componen a mano, como en _lock_read— y los certificados ya los abrió la
+# pasada (CERT_END).
+_prom_render() { # _prom_render [--fresh]
+  local fresh="${1:-}" now n lbl ty dom st line a wts=""
+  printf -v now '%(%s)T' -1
+  if [[ "$fresh" == "--fresh" ]]; then
+    wts="$now"
+  else
+    _watch_state_load
+    [[ -f "$WATCH_STATE" ]] && wts="$(stat -c %Y -- "$WATCH_STATE" 2>/dev/null || true)"
+  fi
+
+  local -a apps=() units=() rels=()
+  local -A L=()
+  mapfile -t apps < <(app_names)
+  local s_info="" s_up="" s_rst="" s_maint="" s_lock="" s_auto="" s_rel="" s_cert=""
+  local s_lts="" s_lok="" s_ldur="" s_lbuild="" s_lsok="" s_dep="" s_timer=""
+
+  for n in "${apps[@]}"; do
+    [[ -n "$n" ]] || continue
+    load_app "$n"
+    _prom_esc_v lbl "$n"; L[$n]="$lbl"
+    _prom_esc_v ty "$A_TYPE"; _prom_esc_v dom "$A_DOMAIN"
+    s_info+="orbit_app_info{app=\"$lbl\",type=\"$ty\",domain=\"$dom\"} 1"$'\n'
+    if needs_svc "$A_TYPE"; then
+      units+=("orbit-$n.service")          # svc_name, sin un subshell por app
+      st="${WS_STATE[app:$n]:-}"
+      if [[ "$st" == "ok" ]]; then s_up+="orbit_app_up{app=\"$lbl\"} 1"$'\n'
+      elif [[ -n "$st" ]];      then s_up+="orbit_app_up{app=\"$lbl\"} 0"$'\n'; fi
+    fi
+    # maint_flag, compuesta a mano por lo mismo.
+    if [[ -e "$APPS_DIR/$n/shared/maintenance.on" ]]; then s_maint+="orbit_app_maintenance{app=\"$lbl\"} 1"$'\n'
+    else s_maint+="orbit_app_maintenance{app=\"$lbl\"} 0"$'\n'; fi
+    if _lock_read "$n"; then s_lock+="orbit_app_locked{app=\"$lbl\"} 1"$'\n'
+    else s_lock+="orbit_app_locked{app=\"$lbl\"} 0"$'\n'; fi
+    if [[ "$A_AUTODEPLOY" == "yes" ]]; then s_auto+="orbit_app_autodeploy_enabled{app=\"$lbl\"} 1"$'\n'
+    else s_auto+="orbit_app_autodeploy_enabled{app=\"$lbl\"} 0"$'\n'; fi
+    [[ -L "$APPS_DIR/$n/current" ]] && rels+=("$APPS_DIR/$n/current")
+    [[ -n "$A_DOMAIN" ]] && _cert_end_load "$A_DOMAIN"
+    [[ -n "$A_DOMAIN" && -n "${CERT_END[$A_DOMAIN]}" ]] \
+      && s_cert+="orbit_cert_expiry_timestamp_seconds{app=\"$lbl\",domain=\"$dom\"} ${CERT_END[$A_DOMAIN]}"$'\n'
+  done
+
+  # Los reinicios que ha hecho systemd por su cuenta (Restart=), de todas las
+  # unidades en una llamada. Las propiedades salen en el orden de systemd y no
+  # en el pedido, así que se cierra cada bloque en la línea en blanco.
+  if (( ${#units[@]} )); then
+    local id="" lst="" nr=""
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+      case "$line" in
+        Id=*)         id="${line#Id=}" ;;
+        LoadState=*)  lst="${line#LoadState=}" ;;
+        NRestarts=*)  nr="${line#NRestarts=}" ;;
+      esac
+      if [[ -z "$line" ]]; then
+        a="${id#orbit-}"; a="${a%.service}"
+        [[ -n "$a" && "$lst" == "loaded" && "$nr" =~ ^[0-9]+$ && -n "${L[$a]+x}" ]] \
+          && s_rst+="orbit_app_restarts_total{app=\"${L[$a]}\"} $nr"$'\n'
+        id=""; lst=""; nr=""
+      fi
+    done 3< <(systemctl show -p Id -p LoadState -p NRestarts -- "${units[@]}" 2>/dev/null; echo)
+  fi
+
+  # Cuándo se activó la release que se sirve: la fecha del propio enlace, que
+  # 'ln -sfn' crea de nuevo en cada despliegue y en cada rollback. La de la
+  # carpeta sería cuándo se compiló, que tras un rollback es otra cosa.
+  if (( ${#rels[@]} )); then
+    local ts p
+    while read -r ts p <&3; do
+      a="${p#"$APPS_DIR"/}"; a="${a%/current}"
+      [[ -n "$a" && "$ts" =~ ^[0-9]+$ && -n "${L[$a]+x}" ]] \
+        && s_rel+="orbit_app_current_release_timestamp_seconds{app=\"${L[$a]}\"} $ts"$'\n'
+    done 3< <(stat -c '%Y %n' -- "${rels[@]}" 2>/dev/null)
+  fi
+
+  # El histórico de despliegues, en una sola pasada. Separado por US (0x1f) y
+  # no por tabuladores: con IFS=$'\t' bash junta dos separadores seguidos, y una
+  # app sin build terminado correría todas las columnas un sitio.
+  if [[ -s "$METRICS_FILE" ]]; then
+    local app last ok dur bld lok nok nfail
+    while IFS=$'\037' read -r app last ok dur bld lok nok nfail <&3; do
+      [[ -n "$app" && -n "${L[$app]+x}" ]] || continue   # una app ya borrada no publica series
+      lbl="${L[$app]}"
+      s_lts+="orbit_app_last_deploy_timestamp_seconds{app=\"$lbl\"} $last"$'\n'
+      s_lok+="orbit_app_last_deploy_success{app=\"$lbl\"} $ok"$'\n'
+      [[ "$dur" =~ ^[0-9]+$ ]] && s_ldur+="orbit_app_last_deploy_duration_seconds{app=\"$lbl\"} $dur"$'\n'
+      [[ "$bld" =~ ^[0-9]+$ ]] && s_lbuild+="orbit_app_last_build_duration_seconds{app=\"$lbl\"} $bld"$'\n'
+      [[ "$lok" =~ ^[0-9]+$ ]] && s_lsok+="orbit_app_last_successful_deploy_timestamp_seconds{app=\"$lbl\"} $lok"$'\n'
+      s_dep+="orbit_app_deploys{app=\"$lbl\",result=\"ok\"} $nok"$'\n'
+      s_dep+="orbit_app_deploys{app=\"$lbl\",result=\"failed\"} $nfail"$'\n'
+    done 3< <(awk -F'\t' "$_PROM_AWK_EPOCH"'
+      $2 != "" { t = epoch($1); if (t == "") next
+        a = $2; seen[a] = 1; last[a] = t; res[a] = $3; tot[a] = $4
+        if ($5 ~ /^[0-9]+$/) bld[a] = $5
+        if ($3 == "ok") { nok[a]++; lok[a] = t } else nfail[a]++ }
+      END { for (a in seen)
+        printf "%s\037%.0f\037%d\037%s\037%s\037%s\037%d\037%d\n", a, last[a], res[a] == "ok", \
+          tot[a], bld[a], (a in lok) ? sprintf("%.0f", lok[a]) : "", nok[a], nfail[a] }' \
+      "$METRICS_FILE" 2>/dev/null | sort)
+  fi
+
+  local tm
+  for tm in watch autodeploy queue; do
+    if systemctl is-active --quiet "orbit-$tm.timer" 2>/dev/null; then s_timer+="orbit_timer_active{timer=\"$tm\"} 1"$'\n'
+    else s_timer+="orbit_timer_active{timer=\"$tm\"} 0"$'\n'; fi
+  done
+
+  local ver; _prom_esc_v ver "$ORBIT_VERSION"
+  # La ayuda va en inglés y no se traduce (§21.6): es para otro programa, y la
+  # misma métrica con dos textos según el idioma de cada servidor rompería los
+  # paneles y las alertas que se comparten entre máquinas.
+  _prom_family orbit_info gauge "Orbit version that wrote this file." "orbit_info{version=\"$ver\"} 1"$'\n'
+  [[ "$wts" =~ ^[0-9]+$ ]] && _prom_family orbit_watch_last_run_timestamp_seconds gauge \
+    "Unix time of the orbit watch pass that orbit_app_up comes from." "orbit_watch_last_run_timestamp_seconds $wts"$'\n'
+  _prom_family orbit_timer_active gauge "Whether each Orbit systemd timer is active (1) or not (0)." "$s_timer"
+  _prom_family orbit_app_info gauge "One series per app registered in Orbit, with its type and main domain." "$s_info"
+  _prom_family orbit_app_up gauge "1 if the app answered on its port in the last orbit watch pass, 0 if not. Only apps with a process." "$s_up"
+  _prom_family orbit_app_restarts_total counter "Restarts systemd did on its own (NRestarts) since the unit was last started by hand or by a deploy." "$s_rst"
+  _prom_family orbit_app_maintenance gauge "1 if the app is in maintenance mode and answers 503." "$s_maint"
+  _prom_family orbit_app_locked gauge "1 if deploys are frozen with orbit lock." "$s_lock"
+  _prom_family orbit_app_autodeploy_enabled gauge "1 if the app deploys on its own when its branch moves." "$s_auto"
+  _prom_family orbit_app_current_release_timestamp_seconds gauge "Unix time the release being served was activated, by a deploy or a rollback." "$s_rel"
+  _prom_family orbit_app_last_deploy_timestamp_seconds gauge "Unix time of the most recent deploy attempt, successful or not." "$s_lts"
+  _prom_family orbit_app_last_deploy_success gauge "1 if the most recent deploy attempt succeeded, 0 if it failed." "$s_lok"
+  _prom_family orbit_app_last_deploy_duration_seconds gauge "Seconds the most recent deploy attempt took, end to end." "$s_ldur"
+  _prom_family orbit_app_last_build_duration_seconds gauge "Seconds the build took in the most recent deploy that finished building." "$s_lbuild"
+  _prom_family orbit_app_last_successful_deploy_timestamp_seconds gauge "Unix time of the most recent successful deploy." "$s_lsok"
+  _prom_family orbit_app_deploys gauge "Deploys in the retained history (the last METRICS_KEEP), by result. Not a counter: pruning lowers it." "$s_dep"
+  _prom_family orbit_cert_expiry_timestamp_seconds gauge "Unix time the TLS certificate of the app's main domain expires." "$s_cert"
+  return 0
+}
+
+# Escribe el fichero de una vez: un temporal en la misma carpeta y un 'mv', que
+# es atómico dentro de un sistema de ficheros. node_exporter puede leer en
+# cualquier momento, y un fichero a medio escribir sería un error de formato en
+# su /metrics — que se lleva por delante todas las métricas de ese colector.
+# El temporal no acaba en .prom, así que el colector no lo mira; y 'mv'
+# sustituye el nombre, no sigue un enlace que alguien hubiera dejado en él.
+#
+# Y sólo en una carpeta que nadie más que root pueda escribir. Entre el mktemp
+# y el mv hay un chmod y una redirección, y los dos siguen enlaces: el dueño de
+# la carpeta —el usuario de node_exporter, en las instalaciones que la crean
+# suya— podría cambiar el temporal por un enlace a /etc/shadow, y root le
+# pondría 0644 o lo sobrescribiría. Se mira en cada pasada y no sólo al
+# encender, porque los permisos de una carpeta pueden cambiar después.
+#
+# Deja un trap EXIT: se llama siempre dentro de un subshell (_prom_refresh).
+_prom_write() { # _prom_write [--fresh]
+  local dir="$METRICS_PROM_DIR"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  [[ -z "$(_paths_unsafe "$EUID" "$dir")" ]] || return 1
+  PROM_TMP="$(mktemp "$dir/.orbit.prom.XXXXXX")"
+  trap 'rm -f -- "$PROM_TMP"' EXIT
+  _prom_render "$@" > "$PROM_TMP"
+  chmod 0644 "$PROM_TMP"
+  mv -f -- "$PROM_TMP" "$dir/$METRICS_PROM_NAME"
+  trap - EXIT
+}
+
+# Con errexit de verdad dentro (ver CLAUDE.md: la única forma que funciona) y
+# el resultado en PROM_RC, para que quien llama pueda seguir: la pasada del
+# vigilante no puede morirse porque no haya podido escribir unas métricas.
+_prom_refresh() { # _prom_refresh [--fresh]  -> PROM_RC
+  local had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  ( set -Eeuo pipefail; _prom_write "$@" )
+  PROM_RC=$?
+  (( had_e )) && set -e
+  return 0
+}
+
+_prom_status() {
+  title "Métricas para Prometheus"
+  if [[ -z "$METRICS_PROM_DIR" ]]; then
+    info "Apagadas. Se encienden con:  orbit metrics prom enable [carpeta]"
+    info "Sin puerto ni proceso nuevo: Orbit deja un fichero que lee node_exporter."
+    return 0
+  fi
+  local f="$METRICS_PROM_DIR/$METRICS_PROM_NAME" ts now
+  info "Fichero:  %s" "$f"
+  if [[ -f "$f" ]]; then
+    ts="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; printf -v now '%(%s)T' -1
+    info "Escrito hace %s s" "$(( now - ts ))"
+  else
+    warn "Todavía no está escrito."
+  fi
+  if systemctl is-active --quiet orbit-watch.timer 2>/dev/null; then
+    ok "Lo refresca la pasada de 'orbit watch', cada minuto"
+  else
+    warn "El vigilante está parado, y es quien lo escribe: no se refresca."
+    info "Actívalo con:  orbit watch enable"
+  fi
+  return 0
+}
+
+_prom_enable() { # _prom_enable [carpeta]
+  local dir="${1:-${METRICS_PROM_DIR:-$METRICS_PROM_DEFAULT}}" antes="$METRICS_PROM_DIR"
+  [[ "$dir" == "/" ]] || dir="${dir%/}"
+  [[ "$dir" =~ ^/[A-Za-z0-9._/@+-]+$ && "$dir" != *..* ]] \
+    || die "La carpeta tiene que ser una ruta absoluta y sin caracteres raros: «%s»" "$dir"
+  if [[ ! -d "$dir" ]]; then
+    err "No existe %s." "$dir"
+    info "Es la que lee el paquete de Ubuntu:  sudo apt-get install prometheus-node-exporter"
+    info "Si tu node_exporter lee otra (--collector.textfile.directory), dímela:  orbit metrics prom enable <carpeta>"
+    exit 1
+  fi
+  # Ver _prom_write: en una carpeta que puede escribir otro, root escribiría
+  # donde ese otro quisiera.
+  if [[ -n "$(_paths_unsafe "$EUID" "$dir")" ]]; then
+    err "%s la puede escribir alguien que no es root, y root no escribe ahí: quien la controla podría hacerle sobrescribir cualquier fichero del sistema." "$dir"
+    info "Dásela a root y deja que node_exporter sólo la lea:  sudo chown root:root %s && sudo chmod 0755 %s" "$dir" "$dir"
+    exit 1
+  fi
+  # Se escribe una vez antes de apuntar nada: si la carpeta no admite el
+  # fichero, mejor saberlo ahora que en el journal del vigilante.
+  METRICS_PROM_DIR="$dir"
+  _prom_refresh
+  if (( PROM_RC != 0 )); then
+    METRICS_PROM_DIR="$antes"
+    die "No he podido escribir en %s; no cambio nada." "$dir"
+  fi
+  [[ -n "$antes" && "$antes" != "$dir" ]] && rm -f -- "$antes/$METRICS_PROM_NAME"
+  _conf_set METRICS_PROM_DIR "$dir"
+  ok "Métricas para Prometheus en %s" "$dir/$METRICS_PROM_NAME"
+  if systemctl is-active --quiet orbit-watch.timer 2>/dev/null; then
+    info "Las refresca la pasada de 'orbit watch', cada minuto. Ningún proceso nuevo ni ningún puerto abierto."
+  else
+    # Sin quien lo refresque, el fichero no se deja: dentro de una hora diría
+    # que todo va bien con el estado de ahora, y Grafana no tiene forma de
+    # saber que es una foto vieja.
+    rm -f -- "$dir/$METRICS_PROM_NAME"
+    warn "El vigilante está parado, y es quien las escribe: aparecerán en su primera pasada."
+    info "Actívalo con:  orbit watch enable"
+  fi
+  systemctl is-active --quiet prometheus-node-exporter 2>/dev/null \
+    || info "No veo prometheus-node-exporter en marcha: el fichero estará ahí, pero todavía no lo publica nadie."
+  logline "metrics prom enable $dir"
+  return 0
+}
+
+_prom_disable() {
+  if [[ -z "$METRICS_PROM_DIR" ]]; then
+    info "Las métricas para Prometheus ya estaban apagadas."
+    return 0
+  fi
+  local f="$METRICS_PROM_DIR/$METRICS_PROM_NAME"
+  # Borrarlo es la mitad que importa: node_exporter seguiría publicando la
+  # última foto como si fuera el estado de ahora.
+  rm -f -- "$f"
+  _conf_set METRICS_PROM_DIR ""
+  ok "Métricas para Prometheus apagadas; he borrado %s" "$f"
+  logline "metrics prom disable"
+  return 0
+}
+
+_metrics_prom() { # orbit metrics prom enable [carpeta] | disable | status
+  need_root metrics
+  [[ "$JSON" == "yes" ]] && die "--json sólo está en 'orbit metrics [app]'."
+  _subcmd "metrics prom" status noapp "enable|on disable|off status" "$@"
+  local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  case "$sub" in
+    enable)
+      (( $# <= 1 )) || die "uso: orbit metrics prom enable [carpeta]"
+      _prom_enable "${1:-}" ;;
+    disable) _prom_disable ;;
+    status)  _prom_status ;;
+  esac
 }
 
 # ═══════════════════════════════════════════════════════ tráfico ══════════
@@ -12459,15 +12935,33 @@ _watch_maint() {
 }
 
 _watch_certs() {
-  local n left
+  local n left now
+  printf -v now '%(%s)T' -1
   for n in $(app_names); do
     load_app "$n"
-    left="$(cert_days_left "$A_DOMAIN")"
-    [[ -n "$left" ]] || continue
+    [[ -n "$A_DOMAIN" ]] || continue
+    # Sin "$(cert_days_left …)": dentro de un subshell lo leído se perdería, y
+    # las métricas de Prometheus de esta misma pasada tendrían que volver a
+    # abrir cada certificado.
+    _cert_end_load "$A_DOMAIN"
+    [[ -n "${CERT_END[$A_DOMAIN]}" ]] || continue
+    left=$(( (${CERT_END[$A_DOMAIN]} - now) / 86400 ))
     _watch_warn "cert:$A_DOMAIN" "$(( left < WATCH_CERT_DAYS ))" crit \
       "$(t "El certificado de %s caduca en %s días. Renueva con 'orbit ssl %s'." "$A_DOMAIN" "$left" "$n")" \
       "$(t "El certificado de %s vuelve a estar vigente (%s días)" "$A_DOMAIN" "$left")"
   done
+}
+
+# Las métricas para Prometheus salen de esta pasada y al final, cuando WS_STATE
+# ya dice cómo está cada app este minuto (ver _prom_render). Si no se pueden
+# escribir se avisa como de todo lo demás —una vez al fallar y otra al volver—
+# y la pasada sigue: la vigilancia no puede caerse por la observabilidad.
+_watch_prom() {
+  [[ -n "$METRICS_PROM_DIR" ]] || return 0
+  _prom_refresh --fresh
+  _watch_warn prom "$(( PROM_RC != 0 ))" warn \
+    "$(t "No puedo escribir las métricas de Prometheus en %s." "$METRICS_PROM_DIR")" \
+    "$(t "Las métricas de Prometheus vuelven a escribirse en %s" "$METRICS_PROM_DIR")"
 }
 
 _watch_run() {
@@ -12480,6 +12974,7 @@ _watch_run() {
   _watch_mem
   _watch_maint
   _watch_certs
+  _watch_prom
   _watch_state_save
 }
 
@@ -12572,6 +13067,14 @@ cmd_watch() {
     disable)
       systemctl disable --now orbit-watch.timer >/dev/null 2>&1 || true
       ok "Vigilancia desactivada"
+      # Las métricas de Prometheus las escribe esta pasada. Sin ella, el
+      # fichero se quedaría diciendo para siempre lo de este minuto, y Grafana
+      # no tiene forma de saber que es una foto vieja: se retira, y la serie
+      # que desaparece es la señal honesta. Vuelve con 'orbit watch enable'.
+      if [[ -n "$METRICS_PROM_DIR" && -f "$METRICS_PROM_DIR/$METRICS_PROM_NAME" ]]; then
+        rm -f -- "$METRICS_PROM_DIR/$METRICS_PROM_NAME"
+        info "He retirado %s: sin vigilancia nadie lo refresca. Vuelve con la vigilancia." "$METRICS_PROM_DIR/$METRICS_PROM_NAME"
+      fi
       logline "watch disable" ;;
     status)
       # Con --json, por la salida normal no puede ir **nada** que no sea el
@@ -14495,6 +14998,121 @@ _fix_ports() {
   (( movidas > 0 ))
 }
 
+# Las rutas de la lista que podría cambiar alguien que no es <uid>, una por
+# línea: de otro dueño, escribibles por todos o escribibles por un grupo que no
+# es el de root. Salvo un directorio con el bit pegajoso, donde nadie puede
+# sustituir lo que no es suyo. Los enlaces simbólicos no cuentan: no se pueden
+# modificar, sólo sustituir, y eso lo decide su carpeta, que también se mira.
+_paths_unsafe() { # _paths_unsafe <uid> <ruta…>
+  local want="$1" uid gid mode kind name m sticky; shift
+  (( $# )) || return 0
+  while IFS=: read -r uid gid mode kind name <&3; do
+    [[ "$kind" == "symbolic link" ]] && continue
+    [[ "$mode" =~ ^[0-7]+$ && "$gid" =~ ^[0-9]+$ ]] || { printf '%s\n' "$name"; continue; }
+    m=$(( 8#$mode )); sticky=0
+    [[ "$kind" == "directory" ]] && (( m & 8#1000 )) && sticky=1
+    if [[ "$uid" != "$want" ]] \
+       || (( (m & 8#002) && !sticky )) \
+       || (( (m & 8#020) && gid != 0 && !sticky )); then
+      printf '%s\n' "$name"
+    fi
+  done 3< <(stat -c '%u:%g:%a:%F:%n' -- "$@" 2>/dev/null)
+  return 0
+}
+
+# Lo que root ejecuta de Orbit tiene que poder cambiarlo sólo root: el propio
+# binario —cada minuto lo arranca el vigilante, y con orbit-admin lo arranca
+# además cualquiera del grupo—, cada carpeta por encima de él, y la
+# configuración —orbit.conf, notify.conf y la de cada app—, que se carga con
+# 'source'. Quien pueda escribir en cualquiera de esos sitios es root a la
+# siguiente pasada del temporizador. Sin acción: si alguien lo ha cambiado,
+# cambiar los permisos taparía justo la pista.
+_doctor_paths() {
+  [[ $EUID -eq 0 ]] || return 0   # sin ser root todo es de quien pregunta
+  _doctor_paths_as 0
+}
+
+# El trabajo, con el dueño que se espera como argumento: así la prueba lo
+# ejercita entero con su propio uid, sin ser root.
+_doctor_paths_as() { # _doctor_paths_as <uid>
+  local want="$1"
+  local -a p=() ; local real cur bad
+  if [[ -e "$ORBIT_BIN" ]]; then
+    real="$(readlink -f -- "$ORBIT_BIN" 2>/dev/null || printf '%s' "$ORBIT_BIN")"
+    for cur in "$ORBIT_BIN" "$real"; do
+      p+=("$cur"); cur="${cur%/*}"
+      while [[ -n "$cur" ]]; do p+=("$cur"); cur="${cur%/*}"; done
+    done
+    p+=("/")
+  fi
+  [[ -e "$ETC_DIR" ]] && p+=("$ETC_DIR")
+  [[ -e "$CONF_FILE" ]] && p+=("$CONF_FILE")
+  [[ -e "$NOTIFY_CONF" ]] && p+=("$NOTIFY_CONF")   # también se carga con '.'
+  [[ -d "$APPS_CONF" ]] && p+=("$APPS_CONF" "$APPS_CONF"/*.conf)
+  (( ${#p[@]} )) || return 0
+  bad="$(_paths_unsafe "$want" "${p[@]}" | sort -u)"
+  if [[ -n "$bad" ]]; then
+    _doc error paths "$(t "Root ejecuta ficheros que puede cambiar alguien que no es root: %s" "${bad//$'\n'/, }")" \
+      "$(t "dáselos a root:  sudo chown root:root <ruta> && sudo chmod go-w <ruta>")"
+  else
+    _doc ok paths "$(t "Lo que root ejecuta de Orbit sólo lo puede cambiar root")"
+  fi
+}
+
+# El grupo orbit-admin: si hay regla, que sea de root, 0440, válida y que
+# nombre este binario; si hay miembros sin regla, que se sepa.
+_doctor_admin() {
+  local -a m=(); local st
+  mapfile -t m < <(_admin_members)
+  if [[ -f "$SUDOERS_ADMIN" ]]; then
+    st="$(stat -c '%u %a' -- "$SUDOERS_ADMIN" 2>/dev/null || true)"
+    if [[ "$st" != "$EUID 440" ]]; then
+      _doc error admin "$(t "La regla de sudo %s no es de root con permisos 0440" "$SUDOERS_ADMIN")" \
+        "$(t "rehazla con:  orbit admin add <usuario>")"
+    elif command -v visudo >/dev/null 2>&1 && ! visudo -c -f "$SUDOERS_ADMIN" >/dev/null 2>&1; then
+      _doc error admin "$(t "visudo no acepta %s" "$SUDOERS_ADMIN")" \
+        "$(t "rehazla con:  orbit admin add <usuario>")"
+    elif ! grep -qF -- "NOPASSWD: $ORBIT_BIN" "$SUDOERS_ADMIN"; then
+      _doc warn admin "$(t "La regla de %s no nombra %s" "$SUDOERS_ADMIN" "$ORBIT_BIN")" \
+        "$(t "rehazla con:  orbit admin add <usuario>")"
+    elif (( ${#m[@]} )); then
+      _doc info admin "$(t "%s, en %s: equivale a root" "$(IFS=,; printf '%s' "${m[*]}")" "$ADMIN_GROUP")"
+    else
+      _doc ok admin "$(t "Regla de %s en su sitio, y nadie en el grupo" "$ADMIN_GROUP")"
+    fi
+  elif (( ${#m[@]} )); then
+    _doc warn admin "$(t "Hay miembros en %s pero no hay regla de sudo: tendrán que entrar como root" "$ADMIN_GROUP")" \
+      "$(t "escríbela con:  orbit admin add <usuario>")"
+  fi
+  return 0
+}
+
+# Las métricas de Prometheus, si están encendidas: que la carpeta exista, que
+# alguien las refresque y que lo esté haciendo.
+_doctor_prom() {
+  [[ -n "$METRICS_PROM_DIR" ]] || return 0
+  local f="$METRICS_PROM_DIR/$METRICS_PROM_NAME" ts now
+  if [[ ! -d "$METRICS_PROM_DIR" ]]; then
+    _doc error prom "$(t "No existe %s, donde van las métricas de Prometheus" "$METRICS_PROM_DIR")" \
+      "$(t "elige otra:  orbit metrics prom enable <carpeta>")"
+  elif [[ -n "$(_paths_unsafe "$EUID" "$METRICS_PROM_DIR")" ]]; then
+    _doc error prom "$(t "%s la puede escribir alguien que no es root: las métricas de Prometheus no se escriben ahí" "$METRICS_PROM_DIR")" \
+      "$(t "dásela a root:  sudo chown root:root %s && sudo chmod 0755 %s" "$METRICS_PROM_DIR" "$METRICS_PROM_DIR")"
+  elif ! systemctl is-active --quiet orbit-watch.timer 2>/dev/null; then
+    _doc warn prom "$(t "Las métricas de Prometheus no se escriben: las escribe el vigilante, y está parado")" \
+      "$(t "actívalo con:  orbit watch enable")"
+  else
+    ts="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"; printf -v now '%(%s)T' -1
+    if (( now - ts > 300 )); then
+      _doc warn prom "$(t "%s lleva más de cinco minutos sin refrescarse" "$f")" \
+        "$(t "mira qué pasa:  journalctl -u orbit-watch -n 30")"
+    else
+      _doc ok prom "$(t "Métricas de Prometheus al día en %s" "$f")"
+    fi
+  fi
+  return 0
+}
+
 _doctor_collect() {
   DOC_LEVEL=(); DOC_ID=(); DOC_MSG=(); DOC_FIX=(); DOC_ACT=()
 
@@ -14815,6 +15433,10 @@ _doctor_collect() {
       "$(t "vuelve a activarlo:  orbit queue enable <app>")"
   fi
 
+  _doctor_paths
+  _doctor_admin
+  _doctor_prom
+
   # 'dig' viene de dnsutils, que instala install.sh. Si falta —un servidor donde
   # alguien limpió paquetes, un contenedor— el diagnóstico no puede morirse: con
   # errexit, un 'command not found' dentro de una asignación mataba a doctor a
@@ -14897,6 +15519,190 @@ cmd_version() {
     return 0
   fi
   echo "orbit ${ORBIT_VERSION}"
+}
+
+# ═══════════════════════════════════════════════════════ admin ════════════
+# El grupo orbit-admin: usar 'orbit' sin entrar como root. Un grupo de Unix y
+# una regla de sudo de una línea que sólo nombra el binario de Orbit; nada que
+# Orbit tenga que mantener vivo, y si Orbit desaparece se retira con un 'rm' y
+# un 'groupdel'.
+#
+# Lo primero que hay que decir, y se dice cada vez que se añade a alguien: **es
+# equivalente a root**. No porque la regla sea floja sino porque Orbit hace
+# como root lo que se le pide, y quien decide qué se le pide decide qué hace
+# root: 'orbit restore' de una copia preparada por él carga como root la
+# configuración que traiga, por ejemplo. Una lista de comandos permitidos no lo
+# arreglaría — sería otra herramienta. El grupo sirve para no compartir la
+# contraseña de root y para que cada orden quede a nombre de quien la dio
+# (SUDO_USER, en el registro y en 'orbit lock'), no para repartir menos poder.
+#
+# Sin contraseña (NOPASSWD), y es una decisión: Orbit Desktop llama a
+# 'orbit … --json' por SSH sin terminal, y un sudo que pide contraseña ahí no
+# tiene a quién preguntársela. La puerta de verdad es la clave SSH de cada
+# uno; una contraseña de sudo delante de algo equivalente a root protege poco
+# contra quien ya tiene una shell con esa cuenta, que puede esperar a que la
+# teclee. Ver ARCHITECTURE §9.1.
+ADMIN_GROUP="orbit-admin"
+ADMIN_TMP=""
+
+# La regla. Se valida con visudo antes de que exista en su sitio: un fichero
+# de sudoers roto deja a todo el servidor sin sudo, incluido quien tendría que
+# arreglarlo. Ni 'Defaults' propios ni nada que no entiendan por igual el sudo
+# de siempre y sudo-rs: lo que protege el entorno lo hace el propio Orbit al
+# arrancar (la limpieza del principio del script), y así no depende de cómo
+# esté escrito el sudoers de cada máquina.
+_admin_rule() {
+  cat <<EOF
+# Orbit · el grupo $ADMIN_GROUP puede ejecutar 'orbit' como root.
+# Lo escribe 'orbit admin add'. Equivale a root: ver 'orbit admin'.
+%$ADMIN_GROUP ALL=(root) NOPASSWD: $ORBIT_BIN
+EOF
+}
+
+_admin_members() { # una por línea
+  local line; local -a m=()
+  line="$(getent group "$ADMIN_GROUP" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 0
+  IFS=, read -ra m <<<"${line##*:}"
+  (( ${#m[@]} )) && printf '%s\n' "${m[@]}"
+  return 0
+}
+
+_admin_is_member() { # _admin_is_member <usuario>
+  local m
+  while IFS= read -r m <&3; do [[ "$m" == "$1" ]] && return 0; done 3< <(_admin_members)
+  return 1
+}
+
+# A quién no: a quien no existe, a root —que no lo necesita—, a las cuentas de
+# sistema y a las que Orbit usa para clonar y ejecutar código. Esas últimas son
+# la razón de ser del aislamiento (§5.3): un fallo en una app o en un 'git'
+# acaba como mucho en su usuario, y si ese usuario fuera de orbit-admin
+# acabaría en root.
+_admin_user_check() { # _admin_user_check <usuario>
+  local u="$1" pw uid n
+  [[ "$u" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "«%s» no es un nombre de usuario válido." "$u"
+  pw="$(getent passwd "$u" 2>/dev/null || true)"
+  [[ -n "$pw" ]] || die "No existe el usuario «%s» en este servidor. Créalo antes con:  sudo adduser %s" "$u" "$u"
+  IFS=: read -r _ _ uid _ <<<"$pw"
+  [[ "$uid" =~ ^[0-9]+$ ]] || die "No existe el usuario «%s» en este servidor. Créalo antes con:  sudo adduser %s" "$u" "$u"
+  (( uid != 0 )) || die "«%s» ya es root: no le hace falta el grupo." "$u"
+  [[ "$u" != "$DEPLOY_USER" ]] \
+    || die "«%s» es el usuario que clona los repositorios: si fuera de %s, lo que lograra ejecutar código como él sería root." "$u" "$ADMIN_GROUP"
+  for n in $(app_names); do
+    [[ "$(app_user_of "$n")" == "$u" ]] \
+      && die "«%s» es el usuario con el que corre la app «%s»: si fuera de %s, un fallo de la app sería root." "$u" "$n" "$ADMIN_GROUP"
+  done
+  # 1000 es el UID_MIN de Debian y Ubuntu: por debajo, y en el 65534 de
+  # 'nobody', están las cuentas de los servicios — www-data, postgres…
+  (( uid >= 1000 && uid != 65534 )) \
+    || die "«%s» es una cuenta de sistema (uid %s): un servicio con permiso para hacerse root es justo lo que no debe existir." "$u" "$uid"
+  return 0
+}
+
+# Prepara la regla en un temporal de la misma carpeta y la valida. Deja la ruta
+# en ADMIN_TMP. El nombre lleva un punto, y sudo se salta los ficheros de
+# sudoers.d con un punto en el nombre: mientras exista, no cuenta.
+_admin_rule_prepare() {
+  local dir out
+  dir="$(dirname "$SUDOERS_ADMIN")"
+  [[ -d "$dir" ]] || die "No existe %s: ¿está instalado sudo?" "$dir"
+  [[ "$ORBIT_BIN" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "La ruta de orbit no se puede escribir en sudoers tal cual: %s" "$ORBIT_BIN"
+  command -v visudo >/dev/null 2>&1 \
+    || die "Falta visudo, que viene con sudo: sin él no puedo comprobar la regla, y no la instalo sin comprobar."
+  ADMIN_TMP="$(mktemp "$dir/.orbit-admin.XXXXXX")"
+  _admin_rule > "$ADMIN_TMP"
+  chmod 0440 "$ADMIN_TMP"
+  chown root:root "$ADMIN_TMP"
+  out="$(visudo -c -f "$ADMIN_TMP" 2>&1)" || {
+    rm -f -- "$ADMIN_TMP"
+    err "visudo no acepta la regla, así que no la instalo:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    exit 1
+  }
+  return 0
+}
+
+# Y la pone en su sitio con un 'mv', que es atómico: sudo nunca ve un fichero
+# a medio escribir. Si la que hay ya es igual, no se toca.
+_admin_rule_commit() {
+  if [[ -f "$SUDOERS_ADMIN" ]] && cmp -s "$ADMIN_TMP" "$SUDOERS_ADMIN"; then
+    rm -f -- "$ADMIN_TMP"
+  else
+    mv -f -- "$ADMIN_TMP" "$SUDOERS_ADMIN"
+  fi
+  ADMIN_TMP=""
+}
+
+_admin_add() { # _admin_add <usuario>
+  local u="$1"
+  _admin_user_check "$u"
+  _admin_rule_prepare
+  if ! getent group "$ADMIN_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$ADMIN_GROUP" || { rm -f -- "$ADMIN_TMP"; die "No he podido crear el grupo %s." "$ADMIN_GROUP"; }
+  fi
+  _admin_rule_commit
+  if _admin_is_member "$u"; then
+    ok "«%s» ya era de %s" "$u" "$ADMIN_GROUP"
+  else
+    gpasswd -a "$u" "$ADMIN_GROUP" >/dev/null || die "No he podido añadir a «%s» al grupo %s." "$u" "$ADMIN_GROUP"
+    ok "«%s» puede usar orbit sin ser root" "$u"
+    logline "admin add $u"
+  fi
+  warn "Esto equivale a darle root. Orbit hace como root lo que se le pide, y quien decide qué se le pide decide qué hace root."
+  info "Dáselo a quien le darías la contraseña de root."
+  info "Cuenta desde su próxima sesión (una conexión SSH nueva)."
+  return 0
+}
+
+_admin_remove() { # _admin_remove <usuario>
+  local u="$1"
+  [[ "$u" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "«%s» no es un nombre de usuario válido." "$u"
+  if ! _admin_is_member "$u"; then
+    info "«%s» no era de %s." "$u" "$ADMIN_GROUP"
+    return 0
+  fi
+  gpasswd -d "$u" "$ADMIN_GROUP" >/dev/null || die "No he podido quitar a «%s» del grupo %s." "$u" "$ADMIN_GROUP"
+  ok "«%s» ya no es de %s" "$u" "$ADMIN_GROUP"
+  # sudo mira los grupos de la sesión, que se fijan al entrar: una que ya
+  # estuviera abierta puede seguir usándolo hasta que salga.
+  info "Una sesión que ya tenga abierta puede conservar el grupo hasta que salga. Si es urgente:  sudo loginctl terminate-user %s" "$u"
+  logline "admin remove $u"
+  return 0
+}
+
+_admin_list() {
+  title "Administradores de Orbit"
+  local -a m=(); local x
+  mapfile -t m < <(_admin_members)
+  if (( ${#m[@]} )); then
+    for x in "${m[@]}"; do printf "  ${GRN}%s${R} %s\n" "$G_ON" "$x"; done
+  else
+    info "Nadie. Se añade con:  orbit admin add <usuario>"
+  fi
+  echo
+  if [[ -f "$SUDOERS_ADMIN" ]]; then
+    info "Regla de sudo:  %s" "$SUDOERS_ADMIN"
+  else
+    info "Sin regla de sudo todavía: la escribe 'orbit admin add'."
+  fi
+  warn "Ser de %s equivale a ser root: Orbit hace como root lo que se le pide." "$ADMIN_GROUP"
+  return 0
+}
+
+cmd_admin() { # orbit admin [list] | add <usuario> | remove <usuario>
+  need_root admin
+  _subcmd admin list noapp "add remove|rm|del list|ls|status" "$@"
+  local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  case "$sub" in
+    add)
+      (( $# == 1 )) || die "uso: orbit admin add <usuario>"
+      _admin_add "$1" ;;
+    remove)
+      (( $# == 1 )) || die "uso: orbit admin remove <usuario>"
+      _admin_remove "$1" ;;
+    list) _admin_list ;;
+  esac
 }
 
 # ═══════════════════════════════════════════════════════ idioma ═══════════
@@ -15349,6 +16155,10 @@ cat <<EOF
     info [app]              Detail of one app
     top [--once]            Live panel: CPU, memory and requests per app
     metrics [app]           Deploy history: how long builds take, how many failed
+    metrics prom enable [dir]|disable|status
+                            Metrics for Prometheus via node_exporter's textfile
+                            collector: a file, no port, no new process
+    metrics --prom          The same metrics, on stdout
     traffic [app] [--since 24h]
                             Who visits, from the nginx log: no cookies, no JS
 
@@ -15383,6 +16193,9 @@ cat <<EOF
     notify status|setup|test
                             Notices over Telegram, Discord or a webhook
     lang [code]             Language Orbit speaks (${ORBIT_LANGS})
+    admin add|remove|list [user]
+                            Let a user run orbit without being root.
+                            It is root-equivalent: give it as you would root
     nginx-rebuild           Regenerate every vhost
     status                  Server health
     doctor [--fix]          Diagnosis. With --fix it applies the safe repairs
@@ -15446,6 +16259,10 @@ cat <<EOF
     info [app]              Detalle de una app
     top [--once]            Panel en vivo: CPU, memoria y peticiones por app
     metrics [app]           Histórico: cuánto tardan los builds, cuántos fallaron
+    metrics prom enable [carpeta]|disable|status
+                            Métricas para Prometheus por el colector de ficheros
+                            de node_exporter: un fichero, sin puerto ni proceso
+    metrics --prom          Las mismas métricas, por la salida estándar
     traffic [app] [--since 24h]
                             Quién visita, del log de nginx: sin cookies ni JS
 
@@ -15480,6 +16297,9 @@ cat <<EOF
     notify status|setup|test
                             Avisos por Telegram, Discord o webhook
     lang [código]           Idioma en el que habla Orbit (${ORBIT_LANGS})
+    admin add|remove|list [usuario]
+                            Que alguien use orbit sin ser root. Equivale a
+                            root: dáselo a quien le darías la contraseña
     nginx-rebuild           Regenerar todos los vhosts
     status                  Salud del servidor
     doctor [--fix]          Diagnóstico. Con --fix aplica los arreglos seguros
@@ -16482,6 +17302,85 @@ _i18n_en() {
     ["Con menos de seis builds correctos no se calcula: dos datos no son una tendencia."]="With fewer than six successful builds it is not computed: two points are not a trend."
     ["Últimos despliegues de %s"]="Latest deploys of %s"
     ["orbit metrics: no entiendo «%s»."]="orbit metrics: I do not understand '%s'."
+    ["--json y --prom son dos formatos: elige uno."]="--json and --prom are two formats: pick one."
+    ["'orbit metrics --prom' va solo: son las métricas del servidor entero."]="'orbit metrics --prom' takes nothing else: it is the metrics of the whole server."
+    ["«prom» es además el nombre de una app; su histórico sale en 'orbit metrics', con las demás."]="«prom» is also the name of an app; its history shows in 'orbit metrics', with the others."
+    ["Métricas para Prometheus"]="Metrics for Prometheus"
+    ["Apagadas. Se encienden con:  orbit metrics prom enable [carpeta]"]="Off. Turn them on with:  orbit metrics prom enable [directory]"
+    ["Sin puerto ni proceso nuevo: Orbit deja un fichero que lee node_exporter."]="No port and no new process: Orbit leaves a file that node_exporter reads."
+    ["Fichero:  %s"]="File:  %s"
+    ["Escrito hace %s s"]="Written %s s ago"
+    ["Todavía no está escrito."]="Not written yet."
+    ["Lo refresca la pasada de 'orbit watch', cada minuto"]="The 'orbit watch' pass refreshes it, every minute"
+    ["El vigilante está parado, y es quien lo escribe: no se refresca."]="Watch is stopped, and it is what writes it: it is not being refreshed."
+    ["Actívalo con:  orbit watch enable"]="Turn it on with:  orbit watch enable"
+    ["La carpeta tiene que ser una ruta absoluta y sin caracteres raros: «%s»"]="The directory has to be an absolute path with no odd characters: «%s»"
+    ["No existe %s."]="%s does not exist."
+    ["Es la que lee el paquete de Ubuntu:  sudo apt-get install prometheus-node-exporter"]="It is the one Ubuntu's package reads:  sudo apt-get install prometheus-node-exporter"
+    ["Si tu node_exporter lee otra (--collector.textfile.directory), dímela:  orbit metrics prom enable <carpeta>"]="If your node_exporter reads another one (--collector.textfile.directory), tell me:  orbit metrics prom enable <directory>"
+    ["No he podido escribir en %s; no cambio nada."]="I could not write to %s; nothing changed."
+    ["Métricas para Prometheus en %s"]="Metrics for Prometheus in %s"
+    ["Las refresca la pasada de 'orbit watch', cada minuto. Ningún proceso nuevo ni ningún puerto abierto."]="The 'orbit watch' pass refreshes them, every minute. No new process and no open port."
+    ["El vigilante está parado, y es quien las escribe: aparecerán en su primera pasada."]="Watch is stopped, and it is what writes them: they will appear on its first pass."
+    ["No veo prometheus-node-exporter en marcha: el fichero estará ahí, pero todavía no lo publica nadie."]="I do not see prometheus-node-exporter running: the file will be there, but nobody publishes it yet."
+    ["Las métricas para Prometheus ya estaban apagadas."]="Metrics for Prometheus were already off."
+    ["Métricas para Prometheus apagadas; he borrado %s"]="Metrics for Prometheus off; I deleted %s"
+    ["--json sólo está en 'orbit metrics [app]'."]="--json is only in 'orbit metrics [app]'."
+    ["uso: orbit metrics prom enable [carpeta]"]="usage: orbit metrics prom enable [directory]"
+    ["No puedo escribir las métricas de Prometheus en %s."]="I cannot write the Prometheus metrics to %s."
+    ["Las métricas de Prometheus vuelven a escribirse en %s"]="The Prometheus metrics are being written to %s again"
+    ["He retirado %s: sin vigilancia nadie lo refresca. Vuelve con la vigilancia."]="I removed %s: without watch nobody refreshes it. It comes back with watch."
+    ["Root ejecuta ficheros que puede cambiar alguien que no es root: %s"]="Root runs files that someone who is not root can change: %s"
+    ["dáselos a root:  sudo chown root:root <ruta> && sudo chmod go-w <ruta>"]="give them to root:  sudo chown root:root <path> && sudo chmod go-w <path>"
+    ["Lo que root ejecuta de Orbit sólo lo puede cambiar root"]="What root runs of Orbit only root can change"
+    ["La regla de sudo %s no es de root con permisos 0440"]="The sudo rule %s is not root's with mode 0440"
+    ["rehazla con:  orbit admin add <usuario>"]="rewrite it with:  orbit admin add <user>"
+    ["visudo no acepta %s"]="visudo rejects %s"
+    ["La regla de %s no nombra %s"]="The rule in %s does not name %s"
+    ["%s, en %s: equivale a root"]="%s, in %s: root-equivalent"
+    ["Regla de %s en su sitio, y nadie en el grupo"]="Rule for %s in place, and nobody in the group"
+    ["Hay miembros en %s pero no hay regla de sudo: tendrán que entrar como root"]="There are members in %s but no sudo rule: they will have to log in as root"
+    ["escríbela con:  orbit admin add <usuario>"]="write it with:  orbit admin add <user>"
+    ["No existe %s, donde van las métricas de Prometheus"]="%s, where the Prometheus metrics go, does not exist"
+    ["elige otra:  orbit metrics prom enable <carpeta>"]="pick another:  orbit metrics prom enable <directory>"
+    ["Las métricas de Prometheus no se escriben: las escribe el vigilante, y está parado"]="The Prometheus metrics are not being written: watch writes them, and it is stopped"
+    ["actívalo con:  orbit watch enable"]="turn it on with:  orbit watch enable"
+    ["%s lleva más de cinco minutos sin refrescarse"]="%s has not been refreshed for more than five minutes"
+    ["mira qué pasa:  journalctl -u orbit-watch -n 30"]="see what is going on:  journalctl -u orbit-watch -n 30"
+    ["Métricas de Prometheus al día en %s"]="Prometheus metrics up to date in %s"
+    ["%s la puede escribir alguien que no es root, y root no escribe ahí: quien la controla podría hacerle sobrescribir cualquier fichero del sistema."]="%s can be written by someone who is not root, and root does not write there: whoever controls it could make it overwrite any file on the system."
+    ["Dásela a root y deja que node_exporter sólo la lea:  sudo chown root:root %s && sudo chmod 0755 %s"]="Give it to root and let node_exporter only read it:  sudo chown root:root %s && sudo chmod 0755 %s"
+    ["%s la puede escribir alguien que no es root: las métricas de Prometheus no se escriben ahí"]="%s can be written by someone who is not root: the Prometheus metrics are not written there"
+    ["dásela a root:  sudo chown root:root %s && sudo chmod 0755 %s"]="give it to root:  sudo chown root:root %s && sudo chmod 0755 %s"
+    ["No puedo leer /proc/self/environ, y sin él no puedo limpiar el entorno de quien me llama con sudo: no sigo."]="I cannot read /proc/self/environ, and without it I cannot clean the environment of whoever calls me through sudo: stopping."
+    ["«%s» no es un nombre de usuario válido."]="«%s» is not a valid user name."
+    ["No existe el usuario «%s» en este servidor. Créalo antes con:  sudo adduser %s"]="There is no user «%s» on this server. Create it first with:  sudo adduser %s"
+    ["«%s» ya es root: no le hace falta el grupo."]="«%s» is already root: it does not need the group."
+    ["«%s» es el usuario que clona los repositorios: si fuera de %s, lo que lograra ejecutar código como él sería root."]="«%s» is the user that clones repositories: if it were in %s, whatever managed to run code as it would be root."
+    ["«%s» es el usuario con el que corre la app «%s»: si fuera de %s, un fallo de la app sería root."]="«%s» is the user the app «%s» runs as: if it were in %s, a flaw in the app would be root."
+    ["«%s» es una cuenta de sistema (uid %s): un servicio con permiso para hacerse root es justo lo que no debe existir."]="«%s» is a system account (uid %s): a service allowed to become root is exactly what must not exist."
+    ["No existe %s: ¿está instalado sudo?"]="%s does not exist: is sudo installed?"
+    ["La ruta de orbit no se puede escribir en sudoers tal cual: %s"]="The path to orbit cannot be written into sudoers as it is: %s"
+    ["Falta visudo, que viene con sudo: sin él no puedo comprobar la regla, y no la instalo sin comprobar."]="visudo is missing (it comes with sudo): without it I cannot check the rule, and I do not install it unchecked."
+    ["visudo no acepta la regla, así que no la instalo:"]="visudo rejects the rule, so I am not installing it:"
+    ["No he podido crear el grupo %s."]="I could not create the group %s."
+    ["«%s» ya era de %s"]="«%s» was already in %s"
+    ["No he podido añadir a «%s» al grupo %s."]="I could not add «%s» to the group %s."
+    ["«%s» puede usar orbit sin ser root"]="«%s» can use orbit without being root"
+    ["Esto equivale a darle root. Orbit hace como root lo que se le pide, y quien decide qué se le pide decide qué hace root."]="This is the same as giving them root. Orbit does as root what it is asked, and whoever decides what it is asked decides what root does."
+    ["Dáselo a quien le darías la contraseña de root."]="Give it to whoever you would give the root password."
+    ["Cuenta desde su próxima sesión (una conexión SSH nueva)."]="It counts from their next session (a new SSH connection)."
+    ["«%s» no era de %s."]="«%s» was not in %s."
+    ["No he podido quitar a «%s» del grupo %s."]="I could not remove «%s» from the group %s."
+    ["«%s» ya no es de %s"]="«%s» is no longer in %s"
+    ["Una sesión que ya tenga abierta puede conservar el grupo hasta que salga. Si es urgente:  sudo loginctl terminate-user %s"]="A session they already have open may keep the group until they leave. If it is urgent:  sudo loginctl terminate-user %s"
+    ["Administradores de Orbit"]="Orbit administrators"
+    ["Nadie. Se añade con:  orbit admin add <usuario>"]="Nobody. Add someone with:  orbit admin add <user>"
+    ["Regla de sudo:  %s"]="sudo rule:  %s"
+    ["Sin regla de sudo todavía: la escribe 'orbit admin add'."]="No sudo rule yet: 'orbit admin add' writes it."
+    ["Ser de %s equivale a ser root: Orbit hace como root lo que se le pide."]="Being in %s is root-equivalent: Orbit does as root what it is asked."
+    ["uso: orbit admin add <usuario>"]="usage: orbit admin add <user>"
+    ["uso: orbit admin remove <usuario>"]="usage: orbit admin remove <user>"
     ["hace %s s"]="%s s ago"
     ["hace %s min"]="%s min ago"
     ["hace %s h"]="%s h ago"
@@ -16779,6 +17678,7 @@ main() {
     backup|copia)   cmd_backup "$@" ;;
     restore)        cmd_restore "$@" ;;
     lang|idioma)    cmd_lang "$@" ;;
+    admin)          cmd_admin "$@" ;;
     github|gh)      cmd_github ;;
     cf-token)       cmd_cf_token ;;
     cf-update)      cmd_cf_update ;;

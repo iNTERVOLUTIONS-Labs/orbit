@@ -1112,7 +1112,7 @@ Solo tres puertos: 22, 80 y 443. PostgreSQL escucha en localhost. Los procesos d
 
 ### Privilegios
 
-Orbit necesita root porque escribe en `/etc/nginx`, gestiona systemd y crea usuarios de PostgreSQL. Si lo invocas sin ser root, se auto-eleva con `sudo`.
+Orbit necesita root porque escribe en `/etc/nginx`, gestiona systemd y crea usuarios de PostgreSQL. Si lo invocas sin ser root, se auto-eleva con `sudo`. Quien no tenga sudo para todo puede tenerlo sólo para Orbit con `orbit admin add` (§9.1), que es igual de root y lo dice.
 
 Pero **el código de tus apps nunca corre como root**. Clonar, compilar y ejecutar ocurre como el usuario `deploy`, que no tiene contraseña ni shell de login útil. El endurecimiento de systemd limita el daño de una app comprometida a su propio directorio.
 
@@ -1123,6 +1123,41 @@ Honestidad sobre los límites:
 - El aislamiento entre apps cubre **todo lo que ejecuta código**: las apps con proceso por su usuario (§5.3) y las PHP por su usuario más su pool de php-fpm (§5.4). Ninguna puede leer el `.env` de otra. Lo que **no** cubre: las apps registradas antes de la v1.0.3 siguen compartiendo `deploy` hasta que se migren con `orbit isolate <app>`, y el aislamiento es entre apps, no contra el sistema — para eso está el endurecimiento de la unidad.
 - Orbit **no audita el código que despliegas**. Si tu repo tiene una dependencia maliciosa, se ejecutará durante el build con los permisos del usuario de la app.
 - **Los secretos se guardan en texto plano** en `shared/.env`, con permisos `0640` y dueño el usuario de la app. Es el mismo modelo que usa casi todo el mundo, pero no es una bóveda.
+
+### 9.1 El grupo `orbit-admin`, y lo que Orbit deja de creerse al elevarse (1.4.6)
+
+`orbit admin add <usuario>` mete a alguien en el grupo `orbit-admin` y escribe `/etc/sudoers.d/orbit-admin`, una regla de una línea:
+
+```
+%orbit-admin ALL=(root) NOPASSWD: /usr/local/bin/orbit
+```
+
+**Es equivalente a root, y se dice cada vez que se añade a alguien.** La tentación es pensar que una regla limitada a un binario limita lo que se puede hacer, y aquí no: Orbit hace como root lo que se le pide, y quien decide qué se le pide decide qué hace root. El camino más corto ni siquiera es `orbit exec` —que corre como el usuario de la app— sino `orbit restore` de una copia preparada a mano: trae un `app.conf` que root carga con `source`. Recortar eso sería otra herramienta. Lo que el grupo da es no repartir la contraseña de root y que cada orden quede a nombre de quien la dio (`SUDO_USER`, en el registro y en `orbit lock`).
+
+**Sin contraseña, y es una decisión.** Orbit Desktop (§13.4) llama a `orbit … --json` por SSH sin terminal; un sudo que pide contraseña ahí no tiene a quién pedírsela, y el cliente no podría existir. Contra quien ya tiene una shell con esa cuenta, una contraseña de sudo delante de algo equivalente a root protege poco: puede esperar a que la teclees. La puerta de verdad es la clave SSH.
+
+**Lo que se valida antes de tocar nada.** Un fichero roto en `sudoers.d` deja sin sudo a todo el servidor, incluido quien tendría que arreglarlo. La regla se escribe en un temporal de la misma carpeta con un punto en el nombre —sudo se salta esos ficheros—, se le pone `0440` y dueño root, se pasa por `visudo -c -f`, y sólo entonces se crea el grupo y se mueve a su sitio con un `mv`. Sin `visudo` no se instala. Y no lleva `Defaults` propios: el sudo de siempre y sudo-rs —que Ubuntu ya trae por defecto— no entienden exactamente lo mismo, y una línea que uno de los dos no lee es una regla que rompe a la mitad de los servidores.
+
+**A quién no.** A quien no existe, a root, a las cuentas de sistema (uid por debajo de 1000, y `nobody`) y, sobre todo, al usuario de despliegue y a los de las apps: son los que ejecutan código que no es tuyo —git, el build, la app—, y el aislamiento de §5.3 existe para que un fallo ahí no llegue a root.
+
+**Por qué la auto-elevación usa la ruta real.** `exec sudo -- "$0"` invocado como `dv`, el enlace que crea el instalador, no casaba con la regla: el sudo clásico exige que coincida el nombre del fichero antes de comparar inodos. Ahora se eleva `readlink -f "$0"`.
+
+#### El entorno de quien llama
+
+Al elevarse en nombre de otro, el entorno sigue siendo de quien llamó, y Orbit lee mucho de él: cada ajuste de la cabecera es `${X:-defecto}`, así que un `BACKUP_HOOK` o un `APPS_DIR` en el entorno decidirían qué hace root. Hoy el `env_reset` de sudo lo tira, pero eso es una propiedad del sudoers de cada máquina —uno con `!env_reset`, un `env_keep` de más, un `SETENV`—, no de Orbit. Así que, cuando `EUID` es 0 y `SUDO_UID` no, lo primero que hace el script es limpiarlo:
+
+- **El shebang es `#!/bin/bash -p`.** Sin ruta por `env`: el núcleo resuelve el intérprete con el `PATH` que le pasa sudo antes de que corra una sola línea de Orbit, y un sudoers sin `secure_path` haría correr como root el `bash` de quien llama. Y con `-p`, el modo privilegiado de bash, que **no importa funciones del entorno** ni lee `BASH_ENV` ni `SHELLOPTS`. Esto no se puede hacer desde dentro del script, y la primera versión lo intentó: borraba las funciones importadas con `unset -f` en la tercera línea. Pero bash las importa antes de la primera, y una función exportada llamada `set` —`BASH_FUNC_set%%`— se ejecuta en el `set -Eeuo pipefail` del principio; una llamada `unset` se saltaba la propia limpieza. Comprobado ejecutándolo, las dos cosas.
+- **Se lee `/proc/self/environ`, no las variables de bash.** Lo que no tiene nombre de variable (`a.b=1`) bash no lo importa, así que ningún `unset` lo alcanza, pero **sí se lo pasa a cada proceso hijo**. Si en el entorno sobra algo, Orbit se vuelve a ejecutar a sí mismo con `env -i` y sólo lo de la lista, y la segunda vez no sobra nada. No hay una marca de «ya limpio», que podría poner quien llama: lo que decide es lo que hay. Sin `/proc` no se puede mirar, y Orbit no sigue.
+- **Se queda una lista corta.** La identidad (`SUDO_*`, `USER`, `LOGNAME`), las tres preferencias documentadas (`ORBIT_LANG`, `NO_COLOR`, `UI_GLYPHS`, que se comparan y nunca se ejecutan), el tamaño del terminal (`COLUMNS` se valida como número antes de usarse en aritmética, que en bash ejecuta lo que encuentre dentro) y la configuración regional, que sólo sobrevive sin `/`: un `LANGUAGE` con una ruta apuntaría gettext a un catálogo elegido por quien llama.
+- **`PATH`, `HOME` y la umask se fijan, no se heredan.** Un `HOME` de quien llama le daría a root su `.gitconfig`, y ahí cabe un comando (`core.fsmonitor`). Y con su umask de 077, cada release, vhost y carpeta que creara root saldría sin lectura para nginx y php-fpm.
+
+Lo que se pierde: quien es del grupo `sudo` ya no puede escribir `sudo BACKUP_DIR=/x orbit backup` y que cuente, ni que `orbit env edit` abra su `EDITOR` (se abre `nano`). Los ajustes van en `/etc/orbit/orbit.conf`, que es donde se pueden leer con `cat`. Root de verdad —un temporizador, un cron, `ssh root@…`— no lo nota. Una shell abierta con `sudo -i` sí, porque deja `SUDO_UID` puesto: desde ahí `export ORBIT_LANG=en` sigue valiendo, y un ajuste por el entorno no.
+
+**Y el registro dice quién.** Con varias personas actuando como root, «root hizo esto» no le sirve a quien lo lea después: cada línea de `/var/log/orbit/orbit.log` lleva `[usuario]` cuando la pidió alguien por sudo. Sale de `SUDO_USER`, que lo pone sudo y no quien llama, y aun así se filtra a un nombre de usuario válido.
+
+#### Y lo que `doctor` mira
+
+Que `/usr/local/bin/orbit`, cada carpeta por encima de él (y las del fichero real, si es un enlace), `/etc/orbit`, `orbit.conf`, `notify.conf` y los `apps/*.conf` —todo lo que root carga con `.`— sean de root y no los pueda escribir nadie más —ni un grupo que no sea el de root: el `staff` que Debian ponía en `/usr/local` es exactamente ese caso—. Quien pueda escribir en cualquiera de esos sitios es root en la siguiente pasada del vigilante, sin necesidad de grupo alguno. Sin acción: si alguien lo ha cambiado, arreglar los permisos taparía la pista. Y de la regla: que sea de root con `0440`, que `visudo` la acepte y que nombre este binario.
 
 ### Lo que sí hace el instalador
 
@@ -1249,12 +1284,14 @@ Dos detalles que importan:
 | `unit_test.sh` | conteo de apps, reparto de puertos, detección de conflictos y `orbit port` completo | nada |
 | `subcmd_test.sh` | `_subcmd` en aislamiento y los ocho comandos que lo usan, con apps llamadas `status`, `set`, `get` y `on` para forzar el choque | nada |
 | `exec_test.sh` | entorno de `orbit exec`, precedencia de `NODE_ENV`, `PATH`, formas de invocación, código de salida y secretos fuera del log | nada |
-| `nginx_test.sh` | vhost real validado con `nginx -t` y servido en los puertos 18080/18443, ambas ramas (con y sin certificado), `/static/` servido desde disco, los recursos de la release anterior (§4.1) y las páginas de error (§8.0b) | `nginx` |
+| `nginx_test.sh` | vhost real validado con `nginx -t` y servido en los puertos 18080/18443 (o los de `ORBIT_TEST_HTTP_PORT`/`ORBIT_TEST_HTTPS_PORT`), ambas ramas (con y sin certificado), `/static/` servido desde disco, los recursos de la release anterior (§4.1) y las páginas de error (§8.0b) | `nginx` |
 | `maintenance_test.sh` | el 503 servido por nginx de verdad, la cabecera `Retry-After`, que la validación de certbot sigue pasando y que un despliegue abortado no deja la web cerrada | `nginx` |
 | `env_test.sh` | ida y vuelta del `.env` con valores que llevan `$`, comillas y espacios; compatibilidad con lo escrito por versiones anteriores | nada |
 | `autodeploy_test.sh` | `deploy --all`, detección de commits nuevos con repos git reales, permiso por app, commit roto que no se reintenta y remoto mudo avisado una sola vez | `git`, `rsync` |
 | `gates_test.sh` | las tres puertas de §4 con repos git reales: congelar (deploy, `--force`, rollback, lote, clon, copia, `remove`), rutas vigiladas (diff contra lo desplegado, rutas de la raíz, lo que se vigila siempre, dudas que despliegan) y la CI con un `gh` de mentira que pasa el `--jq` por jq de verdad, incluida la carrera del commit fijado | `git`, `rsync`, `jq` |
 | `watch_test.sh` | transiciones de estado, protección contra bucles de reinicio, recuperación, filtrado por nivel y ausencia de avisos repetidos | nada |
+| `prom_test.sh` | el fichero de §18.10b: formato línea a línea (y `promtool` si está), el `up` del vigilante de la misma pasada, la fecha del histórico en mawk y gawk, ningún secreto en la salida, un coste que no crece con las apps, escritura atómica, ninguna escritura en una carpeta que pueda tocar otro, y retirada sin vigilante | nada |
+| `admin_test.sh` | `orbit admin` (§9.1) con el `visudo` de verdad sobre ficheros temporales: a quién no, idempotencia, nada instalado sin validar; la limpieza del entorno ejecutada con el shebang de verdad y funciones `set`/`read` exportadas, lo que no tiene nombre de variable, el relanzamiento con `env -i` y sin `/proc`; el `[usuario]` del registro, lo que mira `doctor`, y la auto-elevación con un `sudo` de mentira | `visudo` |
 | `redirect_test.sh` | reglas de ruta y dominios enteros, con nginx sirviéndolas de verdad: códigos, cadena de consulta, orden de evaluación y `Location` relativo | `nginx` |
 | `python_test.sh` | proyecto Django real: venv, `collectstatic`, lectura de los ajustes, avisos y `orbit migrate`; y arranque real de Flask y FastAPI con el comando generado | `git`, `rsync`, red |
 | `deploy_test.sh` | despliegue de principio a fin contra un repo git local: releases, symlink, poda, build fallido, y el ciclo completo clonar → desplegar → quitar el mantenimiento | `git`, `rsync` |
@@ -2567,6 +2604,30 @@ Un detalle que salió de mutarlo y cambió el diseño: la primera versión sólo
 **No entra en las copias de seguridad**, igual que el estado del vigilante: es observabilidad derivada, no configuración. Un servidor restaurado empieza su histórico de cero, y eso es correcto — las medianas de otra máquina no describen ésta.
 
 **Y hay una restricción para quien añada un motivo de fallo nuevo:** esto se queda en disco. Hoy los diecisiete `DEP_ERR` son cadenas fijas cuya única parte variable es un código HTTP. Meter ahí la salida de git sería otra cosa: la URL de un repositorio privado puede llevar un token dentro.
+
+## 18.10b Métricas para Prometheus, sin exportador (1.4.6)
+
+Un exportador de Prometheus es un proceso escuchando en un puerto, que es lo que el principio 2 descarta. Pero quien tiene Prometheus tiene casi siempre `node_exporter`, y `node_exporter` tiene un **colector de ficheros**: lee los `*.prom` de una carpeta y los publica con lo suyo. Orbit escribe ahí un fichero de texto (`orbit metrics prom enable [carpeta]`), y ya. Si Orbit desaparece, queda un fichero que se borra con `rm`; si no hay `node_exporter`, el fichero no lo lee nadie y se dice. No se instala nada.
+
+**La carpeta por defecto** es `/var/lib/prometheus/node-exporter`, comprobada en el paquete y no supuesta: en el `.deb` de noble (1.7.0) y en el de la versión siguiente (1.10), `/etc/default/prometheus-node-exporter` trae `ARGS=""` y el binario lleva esa ruta compilada como valor de `--collector.textfile.directory`; el paquete la crea como `root:root 0755`. Si no existe, `enable` se niega en vez de crearla: una carpeta que no lee nadie es un fichero que no publica nadie.
+
+**Lo refresca la pasada del vigilante**, al final, cuando ya sabe cómo está cada app este minuto. Las alternativas eran peores: un temporizador propio tendría que volver a preguntar a cada app —un `curl` por app y minuto más— o publicar un `up` que significara otra cosa que el de `orbit watch`. Y de ahí sale la regla que importa: **sin vigilante no hay fichero**. `orbit watch disable` lo retira y `enable` sin vigilante no lo deja escrito, porque una foto vieja con `orbit_app_up 1` se lee en Grafana como el estado de ahora, y una serie que desaparece es una señal honesta que `absent()` sabe ver. Para lo que quede entre medias, `node_exporter` ya publica `node_textfile_mtime_seconds` de cada fichero. Si no se puede escribir, el vigilante avisa como de todo lo demás —una vez al fallar, otra al volver— y la pasada sigue: la vigilancia no puede caerse por la observabilidad.
+
+**Se escribe de una vez**: un temporal en la misma carpeta, que no acaba en `.prom` y por eso el colector no lo mira, y un `mv`. Un fichero a medio escribir sería un error de formato en el `/metrics` de `node_exporter`, que invalida todas las métricas de ese colector, no sólo las nuestras. Y `mv` sustituye el nombre: no sigue un enlace que alguien hubiera dejado ahí.
+
+**Y sólo en una carpeta que nadie más que root pueda escribir**, comprobado al encender, en cada pasada y en `doctor`. Entre el `mktemp` y el `mv` hay un `chmod` y una redirección, y los dos siguen enlaces: hay instalaciones de `node_exporter` —roles de Ansible, sobre todo— que le dan la carpeta a su propio usuario, y ese usuario, que es un proceso escuchando en la red, podría cambiar el temporal por un enlace a `/etc/shadow` y root le pondría `0644`. La del paquete de Ubuntu es `root:root 0755` y pasa; una con el bit pegajoso también, porque ahí nadie puede renombrar lo que no es suyo. Si no, `enable` se niega y dice cómo dársela a root: `node_exporter` sólo necesita leerla.
+
+**El coste no crece con las apps**, y hay una prueba que lo cuenta: una llamada a `systemctl show` para todas las unidades —las propiedades llegan en el orden de systemd y no en el pedido, así que se cierra cada bloque en la línea en blanco—, un `stat` para todos los enlaces `current`, un `awk` sobre el histórico y tres `is-active`. Lo de cada app se lee sin procesos. Y los certificados no se abren dos veces: `_cert_end_load` guarda la caducidad en el shell de la pasada, y por eso `_watch_certs` ya no la pregunta con `$(cert_days_left …)`, cuyo subshell la habría tirado.
+
+Tres decisiones del formato con contenido:
+
+- **Fechas, no edades.** `orbit_app_current_release_timestamp_seconds` y no «edad de la release»: la edad cambia cada segundo sin que pase nada, y en PromQL es `time() - x`. La de la release es la del propio enlace `current`, que `ln -sfn` crea de nuevo en cada despliegue y en cada rollback; la de la carpeta sería cuándo se compiló.
+- **`orbit_app_deploys` es un gauge**, con `result="ok|failed"`, y no un `_total`. Sale del histórico, que se poda a los últimos `METRICS_KEEP`; un contador que baja es un reinicio para Prometheus, y `rate()` se inventaría un pico del tamaño del histórico entero. `orbit_app_restarts_total` sí es un contador: `NRestarts` sólo sube, y vuelve a cero cuando la unidad se arranca a mano o la arranca un despliegue, que es justo lo que Prometheus entiende por reinicio.
+- **`orbit_app_up` sólo existe para las apps con proceso, y sólo si el vigilante las ha mirado.** Una estática no tiene proceso que pueda caerse; un 0 por defecto sería una alerta falsa y un 1, una afirmación sin comprobar. Fuera de la pasada (`orbit metrics --prom`) sale lo que dejó la última, con `orbit_watch_last_run_timestamp_seconds` al lado para que nadie se crea que es de ahora.
+
+La ayuda de cada métrica (`# HELP`) va en inglés y no se traduce (§21.6): es para otro programa, y la misma métrica con dos textos según el idioma del servidor rompería paneles y alertas compartidos entre máquinas. **Lo que no lleva:** nada del `.env`, ni la URL del repositorio —la de uno privado puede llevar un token—, ni la rama. Las etiquetas son `app`, `type` y `domain`, escapadas según el formato de exposición; hay una prueba que siembra un token y un secreto y los busca en la salida.
+
+La fecha del histórico se convierte en `awk` portable —Ubuntu trae mawk, sin `mktime` (§8.5)— con la aritmética de días desde la fecha civil, y la prueba la contrasta con `date` en mawk, gawk y el `awk` que haya, con husos de los dos signos y un 29 de febrero. La salida la acepta `promtool check metrics` (3.15.1, sin avisos de estilo), y como `promtool` no es una dependencia, la suite lleva además su propia comprobación del formato línea a línea.
 
 ## 18.11 Qwik: lo decide el adaptador, y el adaptador no es un paquete
 

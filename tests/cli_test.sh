@@ -27,6 +27,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 sed "s|^ETC_DIR=.*|ETC_DIR=\"$TMP/etc\"|; \
      s|^LOG_FILE=.*|LOG_FILE=\"$TMP/orbit.log\"|; \
      s|^if \[\[ \$EUID -ne 0 \]\]; then|if false; then|; \
+     s|^if \[\[ \$EUID -eq 0 \&\& .*SUDO_UID.*; then$|if false; then|; \
      s|^need_root() {.*|need_root() { return 0; }|" \
     "$ORBIT_ROOT/orbit" > "$TMP/orbitcli"
 chmod +x "$TMP/orbitcli"
@@ -188,5 +189,17 @@ check "info sin app elige la primera" "app-a" \
 check "info --json no elige"     "1" "$(rc "$O" info --json)"
 check "deploy --json no elige"   "1" "$(rc "$O" deploy --json)"
 check "logs --json no elige"     "1" "$(rc "$O" logs --json)"
+
+# ── los comandos de 1.4.6 llegan por el router ─────────────────────────────
+section "admin y metrics prom, por el router"
+# Sus suites (admin_test, prom_test) llaman a las funciones; esto comprueba que
+# main los despacha y que --json, que no hablan, se rechaza sin ensuciar stdout.
+check "orbit admin despacha"      "0" "$(rc "$O" admin list)"
+check "--json admin se rechaza"   "1" "$(rc "$O" --json admin)"
+check "admin desconocido"         "1" "$(rc "$O" admin bogus)"
+check "metrics prom despacha"     "0" "$(rc "$O" metrics prom status)"
+check "--json metrics prom no"    "" "$("$O" --json metrics prom status 2>/dev/null)"
+check "la ayuda nombra admin"     "1" "$("$O" help 2>/dev/null | grep -c '^    admin ')"
+check "la ayuda nombra --prom"    "1" "$("$O" help 2>/dev/null | grep -c 'metrics --prom')"
 
 report
