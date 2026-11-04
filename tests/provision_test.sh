@@ -57,8 +57,8 @@ A_TYPE=""; A_ENV_FILE=""; A_ENV_SPEC=""
 _read_descriptor "$REPO" >/dev/null 2>&1
 check "coge el fichero declarado" "api/.env" "$A_ENV_FILE"
 check "y las tres variables"      "3"        "$(printf '%s\n' "$A_ENV_SPEC" | grep -c .)"
-check "TOKEN se genera"           "generate" "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\t' '$1=="TOKEN"{print $2}')"
-check "SMTP_PASS es secreto"      "secret"   "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\t' '$1=="SMTP_PASS"{print $4}')"
+check "TOKEN se genera"           "generate" "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\037' '$1=="TOKEN"{print $2}')"
+check "SMTP_PASS es secreto"      "secret"   "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\037' '$1=="SMTP_PASS"{print $4}')"
 
 # Sin bloque 'env' no se inventa nada: un repo que no lo declara no debe
 # encontrarse un .env aparecido de la nada. Va dentro de la guarda a
@@ -87,10 +87,10 @@ A_ENV_FILE="sucio"; A_ENV_SPEC="sucio"
 _read_env_block "$TMP/sinenv"
 check "sin bloque env, vacías"   ""  "$A_ENV_FILE$A_ENV_SPEC"
 # Y sobreviven al ciclo guardar/cargar, que es lo que hace el despliegue.
-A_ENV_FILE="api/.env"; A_ENV_SPEC="$(printf 'K\tgenerate\thex:8\tplain\t')"
+A_ENV_FILE="api/.env"; A_ENV_SPEC="$(printf 'K\tgenerate\thex:8\tplain\t' | tr '\t' '\037')"
 A_NAME="web"; save_app; A_ENV_FILE=""; A_ENV_SPEC=""; load_app web
 check "sobreviven a save/load"   "api/.env" "$A_ENV_FILE"
-check "y el spec entero"         "K"        "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\t' '{print $1}')"
+check "y el spec entero"         "K"        "$(printf '%s\n' "$A_ENV_SPEC" | awk -F'\037' '{print $1}')"
 
 # ------------------------------------------------------------- fichero único
 section "orbit env toca el mismo fichero que la provisión"
@@ -109,7 +109,7 @@ A_ENV_FILE="api/.env"
 section "Lo que no necesita a nadie se genera solo"
 
 A_ENV_FILE="api/.env"
-A_ENV_SPEC="$(printf 'TOKEN\tgenerate\thex:24\tplain\tToken del panel')"
+A_ENV_SPEC="$(printf 'TOKEN\tgenerate\thex:24\tplain\tToken del panel' | tr '\t' '\037')"
 ASSUME_YES="yes"     # como un autodeploy: sin nadie al teclado
 _provision_env web "$SHARED" >/dev/null 2>&1
 
@@ -134,7 +134,7 @@ check "respeta el valor manual" "puesto-a-mano" "$(_env_read "$ENVF" TOKEN)"
 # ------------------------------------------------------- sin nadie al teclado
 section "Lo que hay que preguntar, sin terminal"
 
-A_ENV_SPEC="$(printf 'SMTP_USER\tprompt\tCuenta SMTP\tplain\t\nSMTP_PASS\tprompt\tContraseña\tsecret\t')"
+A_ENV_SPEC="$(printf 'SMTP_USER\tprompt\tCuenta SMTP\tplain\t\nSMTP_PASS\tprompt\tContraseña\tsecret\t' | tr '\t' '\037')"
 ASSUME_YES="yes"
 _provision_env web "$SHARED" > "$TMP/out" 2>&1
 check "no se cuelga"          "0" "$?"
@@ -157,7 +157,7 @@ section "Un valor vacío puesto a mano es una decisión, no un hueco"
 # `orbit env set app CLAVE ''` es como se desactiva algo opcional. Si la
 # provisión lo tratara como «falta», cada despliegue lo volvería a rellenar.
 A_ENV_FILE="api/.env"
-A_ENV_SPEC="$(printf 'OPCIONAL\tgenerate\thex:8\tplain\t')"
+A_ENV_SPEC="$(printf 'OPCIONAL\tgenerate\thex:8\tplain\t' | tr '\t' '\037')"
 _env_write "$ENVF" OPCIONAL ''
 _provision_env web "$SHARED" >/dev/null 2>&1
 check "no lo rellena"        ""  "$(_env_read "$ENVF" OPCIONAL)"
@@ -166,12 +166,12 @@ check "y sigue declarada"    "1" "$(grep -c '^OPCIONAL=' "$ENVF")"
 # ------------------------------------------------------------------ defensa
 section "Entradas hostiles"
 A_ENV_FILE="../../../etc/passwd"
-A_ENV_SPEC="$(printf 'X\tgenerate\thex:8\tplain\t')"
+A_ENV_SPEC="$(printf 'X\tgenerate\thex:8\tplain\t' | tr '\t' '\037')"
 _provision_env web "$SHARED" > "$TMP/bad" 2>&1
 check "rechaza salirse del directorio" "1" "$(grep -c 'no es una ruta dentro' "$TMP/bad")"
 
 A_ENV_FILE="api/.env"
-A_ENV_SPEC="$(printf '2MALA\tgenerate\thex:8\tplain\t')"
+A_ENV_SPEC="$(printf '2MALA\tgenerate\thex:8\tplain\t' | tr '\t' '\037')"
 _provision_env web "$SHARED" > "$TMP/bad2" 2>&1
 check "rechaza nombres inválidos" "1" "$(grep -c 'no es un nombre de variable' "$TMP/bad2")"
 
@@ -183,7 +183,7 @@ section "No se escribe a través de un enlace simbólico"
 VICTIMA="$TMP/victima"; echo "no me toques" > "$VICTIMA"
 
 rm -f "$SHARED/api/.env"; ln -s "$VICTIMA" "$SHARED/api/.env"
-A_ENV_FILE="api/.env"; A_ENV_SPEC="$(printf 'X\tgenerate\thex:8\tplain\t')"
+A_ENV_FILE="api/.env"; A_ENV_SPEC="$(printf 'X\tgenerate\thex:8\tplain\t' | tr '\t' '\037')"
 _provision_env web "$SHARED" > "$TMP/sym" 2>&1
 check "avisa del enlace"        "1"              "$(grep -c 'enlace simbólico' "$TMP/sym")"
 check "y no escribe la víctima" "no me toques"   "$(cat "$VICTIMA")"
@@ -195,5 +195,136 @@ _provision_env web "$SHARED" > "$TMP/sym2" 2>&1
 check "detecta el enlace intermedio" "1" "$(grep -c 'enlace simbólico' "$TMP/sym2")"
 check "y no crea nada fuera"         "0" "$(find "$TMP/fuera" -type f | wc -l)"
 rm -f "$SHARED/api"
+
+
+# ----------------------------------------------------------- con alguien delante
+section "Las respuestas van a su variable, no a la lista"
+# Hasta la 1.3.7 el bucle leía la especificación por la entrada estándar y las
+# preguntas también: la respuesta se tragaba la línea siguiente de la lista.
+# Aquí se simula a alguien delante con la entrada por una tubería.
+_env_can_ask() { return 0; }
+rm -rf "$SHARED/api"; mkdir -p "$SHARED/api"
+A_ENV_FILE="api/.env"
+A_ENV_SPEC="$(printf 'SMTP_USER\tprompt\tCuenta SMTP\tplain\t\nSMTP_PASS\tprompt\tContraseña\tsecret\t\nOTRA\tprompt\tOtra\tplain\t' | tr '\t' '\037')"
+_provision_env web "$SHARED" < <(printf 'yo@x.test\nsecreto1\ntercera\n') > "$TMP/ask" 2>&1
+check "la primera respuesta, a la primera" "yo@x.test" "$(_env_read "$ENVF" SMTP_USER)"
+check "la segunda, a la segunda"           "secreto1"  "$(_env_read "$ENVF" SMTP_PASS)"
+check "y la tercera también"               "tercera"   "$(_env_read "$ENVF" OTRA)"
+check "nada pendiente"                     ""          "$ENV_MISSING"
+
+if ! command -v jq >/dev/null; then
+  echo "  (falta jq: me salto lo que se declara en orbit.json)"
+else
+section "Una variable declarada sin 'prompt' también se pregunta"
+cat > "$TMP/orbit.json" <<'JSON'
+{ "type": "static",
+  "env": { "file": "api/.env", "vars": {
+    "API_URL": { "desc": "URL de la API", "default": "https://api.test" },
+    "DB_PASS": { "prompt": "Contraseña de la base", "secret": true, "required": true },
+    "ANALYTICS": {}
+  } } }
+JSON
+_read_env_block "$TMP"
+check "API_URL se pregunta"          "prompt"   "$(awk -F'\037' '$1=="API_URL"{print $2}' <<<"$A_ENV_SPEC")"
+check "con su descripción de etiqueta" "URL de la API" "$(awk -F'\037' '$1=="API_URL"{print $3}' <<<"$A_ENV_SPEC")"
+check "y su valor por defecto"       "https://api.test" "$(awk -F'\037' '$1=="API_URL"{print $7}' <<<"$A_ENV_SPEC")"
+check "DB_PASS es obligatoria"       "required" "$(awk -F'\037' '$1=="DB_PASS"{print $6}' <<<"$A_ENV_SPEC")"
+check "una vacía se pregunta por su nombre" "ANALYTICS" "$(awk -F'\037' '$1=="ANALYTICS"{print $3}' <<<"$A_ENV_SPEC")"
+
+section "Sin nadie delante: lo que tiene valor por defecto se pone, lo obligatorio para"
+_env_can_ask() { return 1; }
+rm -f "$ENVF"
+_provision_env web "$SHARED" > "$TMP/req" 2>&1
+check "el valor por defecto, puesto" "https://api.test" "$(_env_read "$ENVF" API_URL)"
+check "la obligatoria, apuntada"     "DB_PASS"          "$ENV_MISSING_REQ"
+check "la opcional, sólo pendiente"  "DB_PASS ANALYTICS" "$ENV_MISSING"
+check "y propone --env"              "1" "$(grep -c 'orbit deploy web --env' "$TMP/req")"
+
+section "Con alguien delante, Intro acepta el valor por defecto"
+_env_can_ask() { return 0; }
+rm -f "$ENVF"
+_provision_env web "$SHARED" < <(printf '\nclave-db\n\n') > "$TMP/req2" 2>&1
+check "Intro deja el de por defecto" "https://api.test" "$(_env_read "$ENVF" API_URL)"
+check "la obligatoria, contestada"   "clave-db" "$(_env_read "$ENVF" DB_PASS)"
+check "ya no para nada"              ""         "$ENV_MISSING_REQ"
+check "la vacía queda pendiente"     "ANALYTICS" "$ENV_MISSING"
+
+section "Una obligatoria sin respuesta se pregunta dos veces y luego para"
+rm -f "$ENVF"
+_provision_env web "$SHARED" < <(printf 'x\n\n\n\n') > "$TMP/req3" 2>&1
+check "insiste una vez" "1" "$(grep -c 'Hace falta un valor' "$TMP/req3")"
+check "y la deja como obligatoria pendiente" "DB_PASS" "$ENV_MISSING_REQ"
+
+fi
+_env_can_ask() { return 0; }
+
+section "Un valor con salto de línea o comilla simple no se guarda"
+rm -f "$ENVF"
+A_ENV_SPEC="$(printf 'K\tprompt\tK\tplain\t' | tr '\t' '\037')"
+_provision_env web "$SHARED" < <(printf "con'comilla\n") > "$TMP/q" 2>&1
+check "no lo escribe" "0" "$(grep -c '^K=' "$ENVF" 2>/dev/null || true)"
+check "y dice por qué" "1" "$(grep -c 'comilla simple' "$TMP/q")"
+check "falla _env_value_ok con salto" "1" "$(_env_value_ok $'a\nb' && echo 0 || echo 1)"
+
+section "Lo que llega con deploy --env se escribe antes que nada"
+rm -f "$ENVF"
+DEP_ENV_SET=("K=desde-cli" "OTRA=dos")
+_env_can_ask() { return 1; }
+_provision_env web "$SHARED" > "$TMP/cli" 2>&1
+check "escribe la primera"     "desde-cli" "$(_env_read "$ENVF" K)"
+check "y la segunda"           "dos"       "$(_env_read "$ENVF" OTRA)"
+check "y K ya no falta"        ""          "$ENV_MISSING"
+DEP_ENV_SET=()
+
+section "El .env.example del repo"
+REL="$TMP/release"; mkdir -p "$REL/api"
+printf '# comentario\nAPP_ENV=production\nexport MAIL_HOST="smtp.test" # nota\nSTRIPE_SECRET=sk_test_cambiame\r\nYA=1\n' > "$REL/api/.env.example"
+rm -f "$ENVF"; printf 'YA=hecho\n' > "$ENVF"
+A_ENV_FILE="api/.env"; A_ENV_SPEC=""; ENV_EXAMPLE_DECL=""
+_provision_env web "$SHARED" "$REL" > "$TMP/ex1" 2>&1
+check "sin nadie delante, lo dice" "1" "$(grep -c 'api/.env.example trae variable(s).*APP_ENV MAIL_HOST STRIPE_SECRET' "$TMP/ex1")"
+check "y no escribe nada"          "0" "$(grep -c '^APP_ENV=' "$ENVF")"
+check "ni toca lo que había"       "hecho" "$(_env_read "$ENVF" YA)"
+check "no para el despliegue"      ""  "$ENV_MISSING_REQ"
+
+_env_can_ask() { return 0; }
+# s = sí; Intro = el del ejemplo; un valor; el secreto no trae el del ejemplo.
+_provision_env web "$SHARED" "$REL" < <(printf 's\n\nmail.mio.test\nsk_live_bueno\n') > "$TMP/ex2" 2>&1
+check "Intro deja el del ejemplo"    "production"    "$(_env_read "$ENVF" APP_ENV)"
+check "un valor nuevo manda"         "mail.mio.test" "$(_env_read "$ENVF" MAIL_HOST)"
+check "el secreto, el que se teclea" "sk_live_bueno" "$(_env_read "$ENVF" STRIPE_SECRET)"
+check "el ejemplo no se ofrece en un secreto" "0" "$(grep -c 'sk_test_cambiame' "$TMP/ex2")"
+
+rm -f "$ENVF"
+_provision_env web "$SHARED" "$REL" < <(printf 'n\n') > "$TMP/ex3" 2>&1
+check "si dice que no, nada" "0" "$(grep -c '=' "$ENVF" 2>/dev/null || true)"
+
+ENV_EXAMPLE_DECL="no"
+_provision_env web "$SHARED" "$REL" > "$TMP/ex4" 2>&1 </dev/null
+check "\"example\": false lo apaga" "0" "$(grep -c 'env.example' "$TMP/ex4")"
+ENV_EXAMPLE_DECL=""
+ln -sf /etc/hostname "$REL/.env.example"; rm -f "$REL/api/.env.example"
+check "un ejemplo que es un enlace no se lee" "" "$(_env_example_file "$REL")"
+_env_can_ask() { return 1; }
+
+section "Leer un .env como lo lee la app"
+printf 'A="v" # nota\nB=v # nota\nC=crlf\r\nD=%s\nE="con \\" dentro"\nF=  \n' "$(_q "ab'cd")" > "$TMP/lee.env"
+check "comillas dobles y comentario" "v"     "$(_env_read "$TMP/lee.env" A)"
+check "sin comillas y comentario"    "v"     "$(_env_read "$TMP/lee.env" B)"
+check "un CRLF no deja \\r"          "crlf"  "$(_env_read "$TMP/lee.env" C)"
+check "lo que escribe _q vuelve igual" "ab'cd" "$(_env_read "$TMP/lee.env" D)"
+check "una comilla escapada"         'con " dentro' "$(_env_read "$TMP/lee.env" E)"
+check "sólo espacios es vacío"       ""      "$(_env_read "$TMP/lee.env" F)"
+
+section "orbit env no sigue un enlace hasta un fichero de root"
+VICT2="$TMP/shadow"; printf 'root:x\n' > "$VICT2"; chmod 0600 "$VICT2"
+rm -rf "$SHARED/api"; mkdir -p "$SHARED/api"; ln -s "$VICT2" "$SHARED/api/.env"
+A_ENV_FILE="api/.env"
+run _env_path web >/dev/null 2>"$TMP/ep"; r=$?
+check "se niega"               "1"   "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+check "y lo dice"              "1"   "$(grep -c 'enlace simbólico' "$TMP/ep")"
+check "el destino sigue en 600" "600" "$(stat -c '%a' "$VICT2")"
+rm -f "$SHARED/api/.env"
+
 
 report
