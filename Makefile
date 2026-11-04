@@ -69,6 +69,7 @@ test: check lint
 	bash tests/watch_test.sh
 	bash tests/notify_test.sh
 	bash tests/autodeploy_test.sh
+	bash tests/gates_test.sh
 	bash tests/queue_test.sh
 	bash tests/deploy_test.sh
 	bash tests/clone_test.sh
