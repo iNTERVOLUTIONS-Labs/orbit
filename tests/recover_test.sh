@@ -160,6 +160,16 @@ check "con heap"          "1"       "$(_build_run "$REL" | grep -c -- '--max-old
 check "respeta el de la app" "1"    "$(_build_run "$REL" | grep -cF '${NODE_OPTIONS:-}')"
 A_NODE_HEAP=""
 
+# Y ejecutándolo de verdad: un HOME o un PATH en el .env ganaban al build,
+# porque se cargaba después de que sudo -H y el perfil los pusieran. El build
+# escribía sus cachés en el HOME de otro y usaba las herramientas de otro.
+sudo() { while [[ "${1:-}" == -* ]]; do [[ "$1" == -u ]] && shift; shift; done; "$@"; }
+printf 'HOME=/home/ana\nPATH=/home/ana/.nvm/bin\nDE_LA_APP=si\n' > "$REL/.env"
+A_BUILD='printf "%s|%s|%s\n" "$HOME" "$DE_LA_APP" "$(command -v env)"'
+check "el .env no cambia HOME ni PATH en el build" "$HOME|si|$(command -v env)" "$(_build_run "$REL" 2>/dev/null | tail -1)"
+rm -f "$REL/.env"; sudo() { printf '%s\n' "${*: -1}"; }
+load_app web
+
 section "Decidir si merece la pena reintentar"
 ws
 load_app web; A_PNPM_ALLOW=""; A_NODE_HEAP=""; save_app; load_app web

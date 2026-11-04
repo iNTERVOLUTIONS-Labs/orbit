@@ -133,6 +133,21 @@ ORDEN="$(sed -n 's/^ExecStart=//p' "$(svc_unit eco)")"; ORDEN="${ORDEN//\$\$/\$}
 check "un .env con PORT y HOST no gana" "3007 3007 127.0.0.1 production" \
   "$(PORT=8080 HOST=0.0.0.0 NODE_ENV=development bash -c "exec $ORDEN")"
 
+# Y lo mismo con lo demás que fija Orbit. Con sólo Environment=HOME, un HOME
+# del .env —el /home/ana del portátil de quien lo escribió— ganaba, y el
+# proceso arrancaba con un HOME que ProtectHome tapa: EACCES en bucle, el
+# fallo de §5.1 abierto desde el .env. Medido con systemd-run antes de
+# arreglarlo. PATH, COREPACK_HOME y DENO_DIR, por lo mismo.
+check "HOME en la orden"          "1" "$(grep -c " HOME=$TMP/apps/web/shared/home " <<<"$EXEC")"
+check "PATH en la orden"          "1" "$(grep -c " PATH=$UNIT_PATH " <<<"$EXEC")"
+check "COREPACK_HOME en la orden" "1" "$(grep -c " COREPACK_HOME=$TMP/apps/web/shared/home/.cache/node/corepack " <<<"$EXEC")"
+load_app eco; A_START='echo "$HOME|$PATH|$COREPACK_HOME"'; save_app
+render_systemd eco
+ORDEN="$(sed -n 's/^ExecStart=//p' "$(svc_unit eco)")"; ORDEN="${ORDEN//\$\$/\$}"
+check "un .env con HOME, PATH y COREPACK_HOME no gana" \
+  "$TMP/apps/eco/shared/home|$UNIT_PATH|$TMP/apps/eco/shared/home/.cache/node/corepack" \
+  "$(HOME=/home/ana PATH=/home/ana/.nvm/bin:/usr/bin:/bin COREPACK_HOME=/tmp/otra bash -c "exec $ORDEN")"
+
 section "Regenerar es idempotente"
 before="$(md5sum < "$U")"
 render_systemd web
@@ -154,6 +169,8 @@ render_systemd api
 UD="$(svc_unit api)"
 env_of_d() { sed -n "s/^Environment=$1=//p" "$UD"; }
 check "DENO_DIR fijo"       "$TMP/apps/api/shared/deno" "$(env_of_d DENO_DIR)"
+check "y en la orden, que es lo que gana al .env" "1" \
+  "$(grep -c "^ExecStart=/usr/bin/env .* DENO_DIR=$TMP/apps/api/shared/deno /bin/bash -c " "$UD")"
 check "creada en disco"     "1" "$([[ -d "$(env_of_d DENO_DIR)" ]] && echo 1 || echo 0)"
 # En shared/ y no en la release: si viviera en la release, cada despliegue
 # empezaría con la caché vacía y el primer arranque tendría que bajarlo todo.
@@ -165,6 +182,7 @@ check "bajo ReadWritePaths" "1" \
 # Y a una app que no es de Deno no se le cuela la variable: la unidad de antes
 # tiene que salir byte a byte igual que salía.
 check "sólo en Deno"        "0" "$(grep -c '^Environment=DENO_DIR=' "$U")"
+check "ni en su orden"       "0" "$(grep -c 'DENO_DIR=' "$U")"
 
 section "Una app en una subcarpeta arranca donde vive"
 # WorkingDirectory es la raíz de la release y no se toca: la unidad no sabe de

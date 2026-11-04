@@ -350,6 +350,35 @@ ln -sfn "$GREL" "$TMP/apps/monoweb/current"
 mkapp monoweb static "" "monoweb.test"
 A_TYPE="static"; A_OUTDIR="site/public"; A_APPDIR="site"; A_SPA="no"; save_app
 
+# Una app PHP a secas servida desde la raíz del repositorio: la detección deja
+# A_DOCROOT="." cuando no hay public/, web/ ni html/. Es la web estática con PHP
+# de 'hibrida' con otro tipo, y le faltaba la misma protección: phpunit se
+# ejecutaba y los composer.* salían con 200.
+PLREL="$TMP/apps/plano/releases/r1"
+mkdir -p "$PLREL/vendor/phpunit/phpunit/src/Util/PHP" "$PLREL/lib" "$PLREL/assets"
+printf '<?php echo "portada plana\n"; ?>\n'      > "$PLREL/index.php"
+printf '<?php echo "contacto plano\n"; ?>\n'     > "$PLREL/contacto.php"
+printf 'body{color:blue}\n'                     > "$PLREL/assets/app.css"
+printf '<?php echo "FUGA eval-stdin\n"; ?>\n'    > "$PLREL/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"
+printf '<?php echo "FUGA lib\n"; ?>\n'           > "$PLREL/lib/db.php"
+printf '<?php echo "FUGA privado\n"; ?>\n'       > "$PLREL/_conexion.php"
+for f in README.md composer.json composer.lock config.inc 'contacto.php~' contacto.php.save backup.sql.gz datos.sqlite3; do
+  printf 'FUGA %s\n' "$f" > "$PLREL/$f"
+done
+ln -sfn "$PLREL" "$TMP/apps/plano/current"
+mkapp plano php "" "plano.test"
+A_TYPE="php"; A_DOCROOT="."; save_app
+# Y en un monorepo: la app en web/, sin public/ dentro. La detección deja el
+# docroot en la raíz de la app, que es web/, y las URL parten de ahí.
+MPREL="$TMP/apps/monoplano/releases/r1"
+mkdir -p "$MPREL/web/vendor/composer"
+printf '<?php echo "portada monoplano\n"; ?>\n'  > "$MPREL/web/index.php"
+printf '[{"name":"FUGA"}]\n'                     > "$MPREL/web/vendor/composer/installed.json"
+printf '{"require":{"FUGA":"1"}}\n'              > "$MPREL/web/composer.json"
+ln -sfn "$MPREL" "$TMP/apps/monoplano/current"
+mkapp monoplano php "" "monoplano.test"
+A_TYPE="php"; A_DOCROOT="web"; A_APPDIR="web"; save_app
+
 # php-fpm de verdad si está instalado: probar que el vhost "parece correcto" no
 # demuestra que el formulario funcione, que es justo lo que falló.
 #
@@ -411,7 +440,7 @@ EOF
   # php-fpm se niega a correr como root, así que el pool va como www-data y el
   # árbol de pruebas tiene que ser legible para él.
   chmod a+rx "$TMP" "$NG" 2>/dev/null || true
-  chmod -R a+rX "$TMP/apps/hibrida" "$TMP/apps/tienda" "$TMP/apps/monolara" "$TMP/apps/apiweb" "$TMP/apps/monophp" 2>/dev/null || true
+  chmod -R a+rX "$TMP/apps/hibrida" "$TMP/apps/plano" "$TMP/apps/monoplano" "$TMP/apps/tienda" "$TMP/apps/monolara" "$TMP/apps/apiweb" "$TMP/apps/monophp" 2>/dev/null || true
   priv "$PHPFPM" -y "$NG/php-fpm.conf" >/dev/null 2>&1
   [[ -S "$NG/php.sock" ]] || PHPFPM=""
 fi
@@ -444,7 +473,7 @@ else
     > "$NG/fastcgi.conf"
 fi
 
-for app in sincert concert spa proxyapp pyapp hibrida tienda aislada denoapp lara monolara monoweb apiweb monophp; do install_vhost "$app"; done
+for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp; do install_vhost "$app"; done
 
 # El servidor por defecto, igual que lo escribe install.sh. Va en 000- para que
 # nginx lo vea antes que los vhosts de las apps, que es de donde salía el bug:
@@ -936,6 +965,34 @@ if [[ -n "$PHPFPM" ]]; then
     "$(BODY -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/contacto.php" | head -1)"
   check "raíz: sus estáticos, sí" "una librería de js" \
     "$(BODY -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/assets/lib.js")"
+fi
+
+section "Una app PHP servida desde la raíz del repositorio"
+# plano: A_TYPE=php y A_DOCROOT=".". Antes del arreglo, las once rutas de abajo
+# salían con 200 —eval-stdin.php y lib/db.php, ejecutados—.
+check "el vhost lo niega"  "1" "$(grep -c 'location \^~ /vendor/' "$NG/vhosts/plano.conf")"
+check "en un monorepo también" "1" "$(grep -c 'location \^~ /vendor/' "$NG/vhosts/monoplano.conf")"
+# Y un docroot que no es la raíz de la app no lo necesita: lo de fuera ya no
+# está a una URL, y negar /lib/*.php ahí podría quitarle páginas a la app.
+check "con public/, no hace falta" "0" "$(grep -c 'location \^~ /vendor/' "$NG/vhosts/tienda.conf")"
+check "ni en Laravel"      "0" "$(grep -c 'location \^~ /vendor/' "$NG/vhosts/lara.conf")"
+if [[ -n "$PHPFPM" ]]; then
+  for ruta in /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php /lib/db.php /_conexion.php \
+              /README.md /composer.json /composer.lock /config.inc '/contacto.php~' /contacto.php.save \
+              /backup.sql.gz /datos.sqlite3; do
+    check "php en la raíz: $ruta" "404 0" \
+      "$(H -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT$ruta") $(BODY -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT$ruta" | grep -c 'FUGA')"
+  done
+  check "la portada, sí"      "portada plana"  "$(BODY -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT/")"
+  check "sus páginas, sí"     "contacto plano" "$(BODY -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT/contacto.php")"
+  check "sus estáticos, sí"   "body{color:blue}" "$(BODY -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT/assets/app.css")"
+  check "una ruta bonita va al front controller" "portada plana" \
+    "$(BODY -H 'Host: plano.test' "http://127.0.0.1:$HTTP_PORT/blog/hola")"
+  for ruta in /vendor/composer/installed.json /composer.json; do
+    check "monorepo: $ruta" "404 0" \
+      "$(H -H 'Host: monoplano.test' "http://127.0.0.1:$HTTP_PORT$ruta") $(BODY -H 'Host: monoplano.test' "http://127.0.0.1:$HTTP_PORT$ruta" | grep -c 'FUGA')"
+  done
+  check "monorepo: la portada, sí" "portada monoplano" "$(BODY -H 'Host: monoplano.test' "http://127.0.0.1:$HTTP_PORT/")"
 fi
 
 section "Las cabeceras de seguridad, también en los estáticos"

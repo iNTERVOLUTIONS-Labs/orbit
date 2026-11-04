@@ -58,6 +58,24 @@ check "node_modules/.bin en PATH" "binario-local" "$(x web miherramienta)"
 check ".venv/bin en PATH" "1" \
   "$(x web sh -c 'case $PATH in *"/.venv/bin"*) echo 1;; *) echo 0;; esac')"
 
+section "Lo que fija Orbit no lo cambia el .env"
+# Igual que en la unidad (systemd_test): un HOME o un PATH copiados de otra
+# máquina llegaban al comando y le cambiaban la caché y las herramientas. Con
+# el .env de antes, 'orbit exec' devolvía /home/ana y un PATH sin /usr/bin.
+cp "$TMP/apps/web/shared/.env" "$TMP/env.bak"
+cat >> "$TMP/apps/web/shared/.env" <<'EOF'
+HOME=/home/ana
+PATH=/home/ana/.nvm/bin
+COREPACK_HOME=/tmp/otra-cache
+EOF
+check "HOME no viene del .env"   "$HOME" "$(x web sh -c 'echo $HOME')"
+check "PATH tampoco"             "1" \
+  "$(x web sh -c 'case $PATH in */home/ana/*) echo 0;; *:/usr/bin:*|*:/usr/bin) echo 1;; *) echo 0;; esac')"
+check "COREPACK_HOME, el de la app" "$TMP/apps/web/shared/home/.cache/node/corepack" \
+  "$(x web sh -c 'echo $COREPACK_HOME')"
+check "y lo demás del .env sí"   "hola" "$(x web sh -c 'echo $DEL_ENV')"
+cp "$TMP/env.bak" "$TMP/apps/web/shared/.env"
+
 section "Formas de invocación"
 check "argv directo" "uno dos" "$(x web echo uno dos)"
 check "respeta las comillas" "un argumento" "$(x web echo 'un argumento')"

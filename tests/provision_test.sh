@@ -305,6 +305,17 @@ check "\"example\": false lo apaga" "0" "$(grep -c 'env.example' "$TMP/ex4")"
 ENV_EXAMPLE_DECL=""
 ln -sf /etc/hostname "$REL/.env.example"; rm -f "$REL/api/.env.example"
 check "un ejemplo que es un enlace no se lee" "" "$(_env_example_file "$REL")"
+# Y tampoco uno con un enlace por el camino: git guarda enlaces, y con 'cfg'
+# apuntando a /etc/orbit y "example": "cfg/orbit.conf", root leía la
+# configuración del servidor y ofrecía sus valores para el .env de la app.
+mkdir -p "$TMP/de-root"; printf 'NOTIFY_TELEGRAM_TOKEN=secreto-del-servidor\n' > "$TMP/de-root/orbit.conf"
+ln -sfn "$TMP/de-root" "$REL/cfg"
+ENV_EXAMPLE_DECL="cfg/orbit.conf"
+check "ni uno con un enlace por el camino" "" "$(_env_example_file "$REL")"
+ENV_EXAMPLE_DECL=""; rm -f "$REL/cfg"
+mkdir -p "$REL/cfg"; printf 'A=1\n' > "$REL/cfg/ejemplo.env"; ENV_EXAMPLE_DECL="cfg/ejemplo.env"
+check "pero uno de verdad, sí" "$REL/cfg/ejemplo.env" "$(_env_example_file "$REL")"
+ENV_EXAMPLE_DECL=""; rm -rf "$REL/cfg"
 _env_can_ask() { return 1; }
 
 section "Leer un .env como lo lee la app"
