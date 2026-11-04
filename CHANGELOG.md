@@ -87,6 +87,33 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.3.8] - 2026-11-04
+
+### Añadido — las variables que faltan se piden justo antes del despliegue
+
+Desplegar una app que necesita una contraseña ya no es «despliega, mira que falla, entra por SSH, `orbit env set`, vuelve a desplegar». Orbit la pide en el mismo despliegue, antes del build, y si nadie puede contestar y es imprescindible, para sin tocar producción.
+
+- **`"required": true`** en una variable de `orbit.json`: sin valor, el despliegue **se para antes del build** —la release a medias se borra, el symlink no se mueve— y dice cómo darla. Con `--json`, el error lo cuenta
+- **`"default": "…"`**: Intro lo acepta y, sin nadie al teclado, se pone solo
+- **Toda variable declarada se pregunta**, también las que sólo traen `desc` o `{}`: antes se ignoraban, y declarar una variable sin `prompt` era lo mismo que no declararla
+- **`orbit deploy --env CLAVE=valor`** (repetible) y **`--env-file F`**: se escriben antes del build. Es como se despacha una variable obligatoria desde CI o desde Orbit Desktop
+- **El `.env.example` del repo**: el despliegue ofrece rellenar lo que trae y tu `.env` no tiene, con el valor del ejemplo por defecto —salvo en lo que parece un secreto—. Nunca para un despliegue. `"env": {"example": false}` o `ENV_EXAMPLE="no"` lo apagan
+- **`orbit env check <app> [--json]`**: lo declarado frente a lo puesto, sin enseñar valores; sale con 1 si falta una obligatoria
+- **`orbit deploy --json` trae `"env_missing"`**, la lista de lo que sigue sin valor
+
+### Corregido — la pregunta de una variable `prompt` leía la lista, no el teclado
+
+El bucle recorría la especificación por la entrada estándar y las preguntas leían de ahí también, así que cada respuesta se tragaba la línea siguiente de la lista: la trampa de `while read` sin redirección de CLAUDE.md. Y los campos iban separados por tabuladores, que `read` funde cuando hay dos seguidos —una descripción vacía corría los campos de detrás—. Ahora la lista va por el descriptor 3 y separada por `\x1f`.
+
+### Corregido — `orbit env` seguía enlaces simbólicos como root
+
+La comprobación de enlaces estaba sólo en la provisión del despliegue. `orbit env list|get|set|unset|edit` —y `db create` y `clone`, que pasan por el mismo sitio— hacían `chown` y `chmod 0640` sobre el destino: una app que cambiara su `.env` por un enlace a `/etc/shadow` se quedaba con él en el siguiente `orbit env list --json`. Medido. Ahora se niegan, y el despliegue también se niega si `shared/.env` es un enlace (Laravel y Django escriben en él como root). La provisión comprueba el camino **antes** de crear la carpeta: un `install -d` de root a través de un enlace cambiaba el modo del destino.
+
+### Corregido — valores de `.env` con saltos de línea, comillas o CRLF
+
+- `orbit env set` con un valor de varias líneas lo escribía como varias variables. Ahora se rechaza, igual que en las preguntas y en `--env`
+- Leer `Q="v" # nota` devolvía `v" # nota`; un valor con comilla simple escrito por el propio Orbit volvía con el escape dentro; y una línea con `\r` del final hacía que `APP_DEBUG=true` no se detectara. `_env_read` interpreta ahora las comillas como quien carga el fichero
+
 ## [1.3.7] - 2026-11-04
 
 ### Corregido — dos despliegues de la misma app podían correr a la vez

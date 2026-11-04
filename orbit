@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.3.7"
+ORBIT_VERSION="1.3.8"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -326,6 +326,9 @@ BUILD_UNFREEZE="no"                       # sólo durante un reintento; nunca se
 # cambiar y el symlink final apuntando a la release de quien acabara último.
 DEPLOY_LOCK_DIR="${DEPLOY_LOCK_DIR:-/var/lib/orbit/locks}"
 DEPLOY_LOCK_WAIT="${DEPLOY_LOCK_WAIT:-900}"  # segundos que se espera al despliegue en curso
+# "no" deja de mirar el .env.example del repo al desplegar (ver _provision_env).
+# Un repo concreto lo apaga con "env": {"example": false} en su orbit.json.
+ENV_EXAMPLE="${ENV_EXAMPLE:-yes}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/orbit}"
 BACKUP_KEEP="${BACKUP_KEEP:-14}"          # días que se conservan las copias
 BACKUP_HOOK="${BACKUP_HOOK:-}"            # comando al que se le pasa cada copia recién hecha
@@ -1790,21 +1793,37 @@ _safe_relpath() { # _safe_relpath <valor>  -> 0 si es una ruta dentro del repo
 # de la anterior.
 _read_env_block() { # _read_env_block <dir>
   local f="$1/orbit.json"
-  A_ENV_FILE=""; A_ENV_SPEC=""
+  A_ENV_FILE=""; A_ENV_SPEC=""; ENV_EXAMPLE_DECL=""
   [[ -f "$f" ]] || return 0
   command -v jq >/dev/null || return 0
   jq -e 'has("env")' "$f" >/dev/null 2>&1 || return 0
 
   A_ENV_FILE="$(jq -r '.env.file // ".env"' "$f" 2>/dev/null)"
-  # Un registro por línea: CLAVE<TAB>modo<TAB>argumento<TAB>secreto<TAB>descripción
+  # "example": false lo apaga; una cadena dice dónde está. Sin la clave, se busca.
+  ENV_EXAMPLE_DECL="$(jq -r 'if (.env | has("example")) then (if .env.example == false then "no" elif (.env.example | type) == "string" then .env.example else "" end) else "" end' "$f" 2>/dev/null || true)"
+  # Un registro por línea, con los campos separados por US (\x1f):
+  #   CLAVE·modo·argumento·secreto·descripción·obligatoria·por defecto
+  # US y no tabulador: el tabulador es espacio en blanco para 'read', y dos
+  # seguidos —una descripción vacía— se funden en uno y corren los campos de
+  # detrás. Una obligatoria sin 'desc' salía como opcional.
+  # Los dos últimos llegaron después: una configuración guardada por una
+  # versión anterior trae cinco campos, y 'read' deja vacíos los que faltan,
+  # que es justo «no obligatoria, sin valor por defecto».
+  #
+  # Una variable sin 'generate' ni 'prompt' ya no se ignora: se pregunta por su
+  # nombre (o su 'desc'). Antes era «skip», y declarar una variable en el repo
+  # sin decir cómo conseguirla era lo mismo que no declararla.
   A_ENV_SPEC="$(jq -r '
     (.env.vars // {}) | to_entries[] |
+    (if (.value | type) == "object" then .value else {} end) as $v |
     [ .key,
-      (if .value.generate then "generate" elif .value.prompt then "prompt" else "skip" end),
-      (.value.generate // .value.prompt // ""),
-      (if .value.secret then "secret" else "plain" end),
-      (.value.desc // "")
-    ] | @tsv' "$f" 2>/dev/null)"
+      (if $v.generate then "generate" else "prompt" end),
+      ($v.generate // $v.prompt // $v.desc // .key | tostring),
+      (if $v.secret then "secret" else "plain" end),
+      ($v.desc // "" | tostring),
+      (if $v.required then "required" else "optional" end),
+      (if ($v | has("default")) then ($v.default | tostring) else "" end)
+    ] | map(gsub("[\u001f\n\r]"; " ")) | join("\u001f")' "$f" 2>/dev/null)"
   return 0
 }
 
@@ -4935,6 +4954,10 @@ _deploy_json() {
   # 'rolled_back' y 'recovered' son las dos cosas que un panel tiene que poder
   # enseñar distinto de un despliegue normal: en una salió mal y se volvió
   # atrás, en la otra Orbit arregló el build por su cuenta.
+  # Las variables que siguen sin valor tras el despliegue (obligatorias o no):
+  # lo que un cliente tiene que pedirle a quien mira para que la app funcione.
+  local -a em=(); [[ -n "${ENV_MISSING:-}" ]] && read -ra em <<<"$ENV_MISSING"
+  printf '"env_missing":%s,' "$(_j_list "${em[@]}")"
   printf '"rolled_back":%s,"recovered":%s,"duration_s":%s,"failed_step":%s,"error":%s}\n' \
     "$(_j_bool "$DEP_ROLLBACK")" "$(_j_bool "$DEP_RECOVER")" "$(( SECONDS - DEP_T0 ))" \
     "$([[ "$DEP_OK" == "no" && -n "$DEP_STEP" ]] && _j_str "$DEP_STEP" || printf 'null')" \
@@ -5238,12 +5261,41 @@ _repo_shared() { # _repo_shared <release>  -> una ruta por línea
   return 0
 }
 
+# Valida y apunta un CLAVE=valor de --env/--env-file. Se valida aquí, al leer
+# los argumentos, y no al escribir: un valor que no se puede guardar tiene que
+# parar el despliegue antes de traer nada.
+_deploy_env_add() { # _deploy_env_add <CLAVE=valor> <origen>
+  local kv="$1" key val why
+  [[ "$kv" == *=* ]] || die "orbit deploy: %s espera CLAVE=valor, y «%s» no lo es." "$2" "$kv"
+  key="${kv%%=*}"; val="${kv#*=}"
+  _env_key_ok "$key" || die "'%s' no es un nombre válido. Solo letras, números y '_', sin empezar por número." "$key"
+  why="$(_env_value_problem "$val")"
+  [[ -z "$why" ]] || die "El valor de %s %s." "$key" "$why"
+  DEP_ENV_SET+=("$key=$val")
+}
+
 cmd_deploy() {
   need_root deploy
   local name="" ref="" pick="no" a
+  DEP_ENV_SET=()
   while [[ $# -gt 0 ]]; do
     a="$1"
     case "$a" in
+      --env)
+        [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
+        _deploy_env_add "$2" "--env"; shift 2 ;;
+      --env-file)
+        [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
+        [[ -f "$2" && -r "$2" ]] || die "orbit deploy: no puedo leer «%s»." "$2"
+        local efl
+        while IFS= read -r efl || [[ -n "$efl" ]]; do
+          efl="${efl%$'\r'}"
+          [[ "$efl" =~ ^[[:space:]]*(#|$) ]] && continue
+          [[ "$efl" =~ ^[[:space:]]*(export[[:space:]]+)?([^=]*)=(.*)$ ]] \
+            || die "orbit deploy: «%s» no es una línea CLAVE=valor de %s." "$efl" "$2"
+          _deploy_env_add "${BASH_REMATCH[2]}=$(_env_unquote "${BASH_REMATCH[3]}")" "$2"
+        done < "$2"
+        shift 2 ;;
       --ref|--commit|--pr)
         [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
         ref="$2"; [[ "$a" == "--pr" ]] && ref="pr:$2"; shift 2 ;;
@@ -5261,6 +5313,8 @@ cmd_deploy() {
         printf '%b' "$(t "  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\n\
        orbit deploy --all [--if-changed]\n\
        --pick        elegir de una lista qué desplegar (PRs, commits)\n\
+       --env K=V     poner una variable en el .env antes del build (repetible)\n\
+       --env-file F  poner las de un fichero CLAVE=valor antes del build\n\
        --ref <x>     desplegar un commit o rama concretos\n\
        --pr <n>      desplegar un pull request sin fusionarlo\n\
        --json        el resultado como un objeto, por stdout (también con --all)\n\
@@ -5378,6 +5432,15 @@ cmd_deploy() {
   as_app "rsync -a --delete --exclude '.git' '$cache/' '$rel/'"
 
   # 3 · fichero de entorno compartido
+  # Un shared/.env que es un enlace lo ha puesto alguien que no es Orbit, y todo
+  # lo que viene detrás lo trata como root: Laravel le añade la APP_KEY, Django
+  # sus ajustes. Siguiéndolo, root escribiría donde la app eligiera. Ver
+  # _path_has_link.
+  if [[ -L "$shared/.env" ]]; then
+    rm -rf "$rel"
+    DEP_ERR="$(t "shared/.env es un enlace simbólico")"
+    die "%s es un enlace simbólico y no un fichero. No lo sigo: sustitúyelo por el fichero de verdad y vuelve a desplegar." "$shared/.env"
+  fi
   [[ -f "$shared/.env" ]] || { install -o "$(app_user)" -g "$(app_user)" -m 0640 /dev/null "$shared/.env"; }
   as_app "ln -sfn '$shared/.env' '$rel/.env'"
   # Y otro dentro de la app, cuando la app no está en la raíz del repositorio.
@@ -5462,7 +5525,15 @@ cmd_deploy() {
   # pase, un repo sin bloque `env` —o sin orbit.json— no provisiona nada en
   # vez de heredar lo de la app anterior en un `deploy --all`.
   _read_env_block "$rel"
-  _provision_env "$name" "$shared"
+  _provision_env "$name" "$shared" "$rel"
+  # Una variable obligatoria sin valor para aquí, antes del build: el principio
+  # 4 —fallar antes de tocar producción— aplicado a la configuración. Lo que
+  # hace falta para arreglarlo ya lo ha dicho _provision_env.
+  if [[ -n "$ENV_MISSING_REQ" ]]; then
+    rm -rf "$rel"
+    DEP_ERR="$(t "faltan variables obligatorias: %s" "$ENV_MISSING_REQ")"
+    die "Faltan variables obligatorias (%s). Nada tocado: la versión anterior sigue en producción." "$ENV_MISSING_REQ"
+  fi
 
   # 3b · sembrar shared/storage antes de sustituirlo
   #
@@ -11461,6 +11532,32 @@ cmd_port() { # orbit port [app] [puerto]
 # El .env lo leen dos parsers distintos: bash con 'source' (el build y
 # 'orbit exec') y systemd como EnvironmentFile. Lo que se escriba aquí tiene
 # que valer para los dos, y no escapan igual.
+# ¿Pasa <rel> por algún enlace simbólico dentro de <base>? Se mira cada
+# componente y el propio fichero.
+#
+# Todo lo que toca el .env corre como root y shared/ es del usuario de la app a
+# propósito, porque la app escribe ahí. Si una app comprometida cambia su .env
+# —o la carpeta que lo contiene— por un enlace a /etc/shadow, un 'chown', un
+# 'chmod 0640' o un 'cat >' de root siguiéndolo le dan ese fichero a la app.
+# Medido: 'orbit env list --json' dejaba un 0600 de root en 0640 y del usuario
+# de la app. La comprobación estaba sólo en la provisión del despliegue; los
+# demás caminos al mismo fichero se la saltaban.
+_path_has_link() { # _path_has_link <base> <rel>  -> 0 si hay un enlace
+  local probe="$1" part
+  while IFS= read -r part; do
+    [[ -n "$part" ]] || continue
+    probe="$probe/$part"
+    [[ -L "$probe" ]] && return 0
+  done < <(printf '%s\n' "${2//\//$'\n'}")
+  return 1
+}
+
+# Un valor de .env es una línea. Uno con saltos de línea —una clave PEM, un JSON
+# pegado con formato— se escribía como varias, y a partir de ahí 'env list'
+# enseñaba variables que no existían, 'env get' devolvía media clave y el
+# siguiente 'set' dejaba una comilla huérfana que rompía el '. ./.env' del build.
+_env_value_ok() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
+
 _env_path() { # _env_path <app>
   local d; d="$(app_shared "$1")"
   # Si el repositorio declaró su propio fichero en orbit.json, es ESE el que
@@ -11477,9 +11574,12 @@ _env_path() { # _env_path <app>
   # el chown le robaba el .env al original y le enseñaba sus secretos al
   # usuario del clon (revisión del PR #10).
   local u; u="$(app_user_of "$1")"
+  _path_has_link "$d" "$rel" \
+    && die "El .env de '%s' (%s) pasa por un enlace simbólico. No lo toco: lo cambió alguien que no es Orbit." "$1" "$rel"
   install -d -o "$u" -g "$u" "$(dirname "$f")"
   [[ -f "$f" ]] || { : > "$f"; }
-  chown "$u:$u" "$f"; chmod 0640 "$f"
+  [[ -f "$f" && ! -L "$f" ]] || die "El .env de '%s' (%s) no es un fichero normal. No lo toco." "$1" "$rel"
+  chown -h "$u:$u" "$f"; chmod 0640 "$f"
   printf '%s' "$f"
 }
 
@@ -11551,12 +11651,49 @@ _env_read() { # _env_read <fichero> <clave>
       val="${line#*"$2"=}"
     done < "$1"
   fi
-  # Los comentarios de final de línea sólo cuentan fuera de comillas; phpdotenv
-  # hace lo mismo. Se quitan antes que las comillas para no comerse un '#' que
-  # forme parte del valor.
-  [[ "$val" != [\"\']* ]] && val="${val%%[[:space:]]#*}"
-  val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
-  printf '%s' "$val"
+  # Un .env editado en Windows trae '\r' al final de cada línea, y comparado
+  # con «true» ese '\r' hacía que el aviso de APP_DEBUG no saltara nunca.
+  val="${val%$'\r'}"
+  _env_unquote "$val"
+}
+
+# Quita las comillas de un valor como lo haría quien carga el fichero.
+#
+# Antes se recortaban la primera y la última comilla, y eso fallaba en tres
+# formas corrientes, las tres medidas: 'Q="v" # nota' devolvía 'v" # nota'; un
+# valor escrito por el propio Orbit con una comilla simple dentro ('ab'\''cd',
+# que es lo que produce _q) volvía como «ab'\''cd»; y con eso los avisos que
+# dependen de leer el .env —APP_DEBUG, la cola de Laravel— se callaban.
+_env_unquote() { # _env_unquote <valor crudo>
+  local s="$1" out="" c i
+  case "$s" in
+    \"*)
+      # Hasta la comilla de cierre, respetando \" dentro. Lo de detrás —un
+      # comentario— no es valor.
+      s="${s:1}"
+      for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == "\\" && "${s:i+1:1}" == [\"\\] ]]; then out+="${s:i+1:1}"; i=$((i+1)); continue; fi
+        [[ "$c" == '"' ]] && break
+        out+="$c"
+      done ;;
+    \'*)
+      # Comillas simples de shell, incluida la concatenación 'a'\''b'.
+      while [[ -n "$s" ]]; do
+        if [[ "$s" == \'* ]]; then
+          s="${s:1}"
+          if [[ "$s" == *\'* ]]; then out+="${s%%\'*}"; s="${s#*\'}"
+          else out+="$s"; s=""; fi
+        elif [[ "$s" == "\\'"* ]]; then out+="'"; s="${s:2}"
+        else break; fi
+      done ;;
+    *)
+      # Sin comillas, un ' #' empieza un comentario y los espacios del final
+      # sobran: phpdotenv hace lo mismo.
+      out="${s%%[[:space:]]#*}"
+      out="${out%"${out##*[![:space:]]}"}" ;;
+  esac
+  printf '%s' "$out"
 }
 
 _env_write() { # _env_write <fichero> <clave> [valor]   (sin valor, la borra)
@@ -11607,54 +11744,128 @@ _env_generate() { # _env_generate <spec>   p.ej. hex:24, base64:32, uuid
   esac
 }
 
-# Rellena el .env declarado en orbit.json con lo que falte.
+# Lo que deja la provisión para quien la llama: todas las que faltan, y de ésas
+# las obligatorias, que paran el despliegue. Globales y no un código de salida
+# a propósito: llamarla con '|| …' apagaría errexit dentro (CLAUDE.md).
+ENV_MISSING=""
+ENV_MISSING_REQ=""
+# CLAVE=valor pasados con 'orbit deploy --env' o '--env-file'.
+DEP_ENV_SET=()
+# Lo que el orbit.json dice del .env.example: vacío (búscalo), "no" o una ruta.
+ENV_EXAMPLE_DECL=""
+
+# Sólo se pregunta si hay alguien delante. Con --json, además, por stdout no
+# puede salir una pregunta: rompería el objeto que espera el cliente.
+_env_can_ask() { [[ -t 0 && "$ASSUME_YES" != "yes" && "$JSON" != "yes" ]]; }
+
+# Pide un valor. La etiqueta viene del repositorio, así que va como dato y no
+# como formato: un '%' en una descripción no puede romper el printf.
+_env_prompt_value() { # _env_prompt_value <var> <etiqueta> <secreto> [por defecto]
+  local __v="$1" __label="$2" __secret="$3" __def="${4-}" __a=""
+  if [[ "$__secret" == "secret" ]]; then
+    # Sin eco y sin quedar en el historial del shell. Y sin enseñar el valor
+    # por defecto: en un secreto suele ser un marcador del ejemplo.
+    printf "  ${B}%s${R}: " "$__label" >&$UI_FD
+    IFS= read -rs __a || true
+    printf "\n" >&$UI_FD
+  else
+    if [[ -n "$__def" ]]; then printf "  ${B}%s${R} ${D}[%s]${R}: " "$__label" "$__def" >&$UI_FD
+    else printf "  ${B}%s${R}: " "$__label" >&$UI_FD; fi
+    IFS= read -r __a || true
+    [[ -z "$__a" ]] && __a="$__def"
+  fi
+  printf -v "$__v" '%s' "$__a"
+}
+
+# Las mismas reglas para un valor venga de donde venga: ni saltos de línea (un
+# .env es una línea por variable) ni comilla simple (bash y systemd la escapan
+# distinto, ver 'orbit env set').
+_env_value_problem() { # _env_value_problem <valor>  -> imprime el motivo, o nada
+  _env_value_ok "$1" || { t "lleva saltos de línea, y en un .env cada variable es una línea"; return 0; }
+  [[ "$1" == *\'* ]] && { t "lleva una comilla simple, y systemd y bash no la escapan igual"; return 0; }
+  return 0
+}
+
+_env_looks_secret() { [[ "${1^^}" =~ (PASS|SECRET|TOKEN|KEY|PRIVATE|CREDENTIAL|DSN|AUTH) ]]; }
+
+# El .env.example del repositorio: la lista de variables que la app espera, en
+# la convención que usan Laravel, Node, Django y casi todo lo demás. Es lo
+# primero que alguien copia a mano en un servidor nuevo, y lo que se olvida
+# actualizar cuando la app aprende a leer una variable más.
+_env_example_file() { # _env_example_file <release>  -> ruta, o nada
+  local rel="$1" c
+  [[ "$ENV_EXAMPLE" == "no" || "$ENV_EXAMPLE_DECL" == "no" ]] && return 0
+  local -a cands=()
+  if [[ -n "$ENV_EXAMPLE_DECL" ]]; then
+    _safe_relpath "$ENV_EXAMPLE_DECL" && cands+=("$rel/$ENV_EXAMPLE_DECL")
+  else
+    [[ -n "$A_ENV_FILE" && "$A_ENV_FILE" == */* ]] && cands+=("$rel/$(dirname "$A_ENV_FILE")/.env.example")
+    cands+=("$(_app_root "$rel")/.env.example" "$rel/.env.example")
+  fi
+  for c in "${cands[@]}"; do
+    # Un enlace no se sigue: lo lee root, y el repositorio lo elige un tercero.
+    [[ -f "$c" && ! -L "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 0
+}
+
+_env_pend() { # _env_pend <clave> <required|optional>
+  ENV_MISSING="${ENV_MISSING}${ENV_MISSING:+ }$1"
+  [[ "$2" == "required" ]] && ENV_MISSING_REQ="${ENV_MISSING_REQ}${ENV_MISSING_REQ:+ }$1"
+  return 0
+}
+
+# Rellena el .env declarado con lo que falte, justo antes del build.
 #
-# Lo que se puede generar se genera y no se dice más que una línea. Lo que hay
-# que preguntar se pregunta UNA vez, y si nadie puede contestar —autodeploy,
-# CI, --yes— se avisa con el comando exacto para hacerlo después, en vez de
-# dejar el despliegue colgado esperando a un teclado que no existe.
-_provision_env() { # _provision_env <app> <shared>
-  local name="$1" shared="$2"
-  [[ -n "$A_ENV_SPEC" ]] || return 0
+# Por orden: lo que llega con 'deploy --env' se escribe; lo que se puede generar
+# se genera; lo que hay que preguntar se pregunta, una vez, si hay alguien
+# delante; y lo que trae el .env.example y el .env no tiene se ofrece rellenar.
+# Si nadie puede contestar —autodeploy, CI, --yes, --json— lo que tiene valor
+# por defecto se pone y lo demás se apunta. Lo marcado como "required" que se
+# quede sin valor para el despliegue antes del build: una app sin su clave de
+# base de datos no es un despliegue a medias, es una web caída.
+_provision_env() { # _provision_env <app> <shared> [release]
+  local name="$1" shared="$2" reldir="${3:-}"
+  ENV_MISSING=""; ENV_MISSING_REQ=""
+  local example=""; [[ -n "$reldir" ]] && example="$(_env_example_file "$reldir")"
+  [[ -n "$A_ENV_SPEC" || -n "$example" || ${#DEP_ENV_SET[@]} -gt 0 ]] || return 0
 
   local rel="${A_ENV_FILE:-.env}"
   # La misma validación que el resto de rutas del descriptor: además de '..' y
   # las absolutas, descarta los nombres raros y el guion inicial.
   _safe_relpath "$rel" || { warn "env: '%s' no es una ruta dentro de la app; me la salto." "$rel"; return 0; }
+  # Un enlace simbólico aquí no se sigue: se aborta. Ver _path_has_link. Se
+  # comprueba ANTES de crear la carpeta: un 'install -d' de root a través de
+  # un enlace cambia el modo del destino —medido: /root pasaba de 0700 a 0755—.
+  if _path_has_link "$shared" "$rel"; then
+    warn "env: '%s' pasa por un enlace simbólico; no escribo ahí." "$rel"
+    return 0
+  fi
   local f="$shared/$rel"
   install -d -o "$(app_user)" -g "$(app_user)" "$(dirname "$f")"
-
-  # Un enlace simbólico aquí no se sigue: se aborta.
-  #
-  # `shared/` es del usuario de despliegue a propósito —la app escribe ahí—,
-  # así que una app comprometida puede sustituir su .env por un enlace a
-  # cualquier fichero del sistema. Todo lo de abajo corre como root: `_env_write`
-  # hace `cat > "$f"` y luego `chown`, y siguiendo el enlace eso reescribiría y
-  # cambiaría el dueño de, por ejemplo, /etc/shadow. Escalada de privilegios
-  # completa, y encima automática: pasa sola en el siguiente despliegue.
-  #
-  # Se comprueba el fichero y también cada directorio del camino, porque un
-  # enlace a mitad de ruta consigue exactamente lo mismo.
-  local probe="$shared" part
-  while IFS= read -r part; do
-    [[ -n "$part" ]] || continue
-    probe="$probe/$part"
-    if [[ -L "$probe" ]]; then
-      warn "env: '%s' pasa por un enlace simbólico (%s); no escribo ahí." "$rel" "$probe"
-      return 0
-    fi
-  done < <(printf '%s\n' "${rel//\//$'\n'}")
-
   [[ -e "$f" ]] || install -o "$(app_user)" -g "$(app_user)" -m 0640 /dev/null "$f"
   if [[ ! -f "$f" ]]; then
     warn "env: '%s' existe y no es un fichero normal; no lo toco." "$rel"
     return 0
   fi
 
-  local key mode arg secret desc val made=0 asked=0 pend=""
-  while IFS=$'\t' read -r key mode arg secret desc; do
+  local kv key val n_cli=0
+  for kv in "${DEP_ENV_SET[@]}"; do
+    key="${kv%%=*}"; val="${kv#*=}"
+    _env_write "$f" "$key" "$val"
+    n_cli=$((n_cli+1))
+  done
+  (( n_cli > 0 )) && ok "%s variable(s) puesta(s) con --env en %s" "$n_cli" "$rel"
+
+  # El registro se lee por el descriptor 3: las preguntas leen de la entrada
+  # estándar, y con el bucle leyendo de ahí también, cada respuesta se comía
+  # la línea siguiente de la especificación en vez del teclado (CLAUDE.md,
+  # «while read sin redirección»). Así estaba hasta la 1.3.7.
+  local mode arg secret desc req def made=0 asked=0 defs=0 label why spec_keys=" "
+  while IFS=$'\x1f' read -r -u 3 key mode arg secret desc req def; do
     [[ -n "$key" ]] || continue
     _env_key_ok "$key" || { warn "env: '%s' no es un nombre de variable válido; me la salto." "$key"; continue; }
+    spec_keys+="$key "
     # Ya está declarada: no se toca. Basta con que EXISTA, aunque esté vacía:
     # `orbit env set app CLAVE ''` es la forma documentada de desactivar algo
     # opcional, y volver a generarle un valor sería deshacer una decisión
@@ -11662,39 +11873,89 @@ _provision_env() { # _provision_env <app> <shared>
     # «lo puesto a mano y además no vacío».
     _env_has "$f" "$key" && continue
 
-    case "$mode" in
-      generate)
-        val="$(_env_generate "$arg")" || { warn "env: no sé generar '%s' para %s" "$arg" "$key"; continue; }
-        _env_write "$f" "$key" "$val"
-        made=$((made+1))
-        ;;
-      prompt)
-        if [[ ! -t 0 || "$ASSUME_YES" == "yes" ]]; then
-          pend="${pend}${pend:+ }$key"
-          continue
-        fi
-        printf "\n  %s\n" "$(t "Falta un dato que solo tú puedes dar:")"
-        [[ -n "$desc" ]] && printf "  ${D}%s${R}\n" "$desc"
-        val=""
-        if [[ "$secret" == "secret" ]]; then
-          # Sin eco y sin quedar en el historial del shell.
-          printf "  ${B}%s${R}: " "$arg"; read -rs val || true; printf "\n"
-        else
-          ask val "$arg" ""
-        fi
-        if [[ -z "$val" ]]; then pend="${pend}${pend:+ }$key"; continue; fi
-        _env_write "$f" "$key" "$val"
-        asked=$((asked+1))
-        ;;
-    esac
-  done <<< "$A_ENV_SPEC"
+    if [[ "$mode" == "generate" ]]; then
+      val="$(_env_generate "$arg")" || { warn "env: no sé generar '%s' para %s" "$arg" "$key"; continue; }
+      _env_write "$f" "$key" "$val"
+      made=$((made+1))
+      continue
+    fi
+    if ! _env_can_ask; then
+      if [[ -n "$def" && -z "$(_env_value_problem "$def")" ]]; then
+        _env_write "$f" "$key" "$def"; defs=$((defs+1))
+      else
+        _env_pend "$key" "$req"
+      fi
+      continue
+    fi
+    printf "\n  %s\n" "$(t "Falta un dato que solo tú puedes dar:")" >&$UI_FD
+    [[ -n "$desc" && "$desc" != "$arg" ]] && printf "  ${D}%s${R}\n" "$desc" >&$UI_FD
+    [[ "$req" == "required" ]] && printf "  ${D}%s${R}\n" "$(t "Es obligatoria: sin ella no se despliega.")" >&$UI_FD
+    label="$arg"; [[ "$arg" != "$key" ]] && label="$arg · $key"
+    val=""; _env_prompt_value val "$label" "$secret" "$def"
+    if [[ -z "$val" && "$req" == "required" ]]; then
+      printf "  ${YEL}%s${R}\n" "$(t "Hace falta un valor.")" >&$UI_FD
+      _env_prompt_value val "$label" "$secret" "$def"
+    fi
+    if [[ -z "$val" ]]; then _env_pend "$key" "$req"; continue; fi
+    why="$(_env_value_problem "$val")"
+    if [[ -n "$why" ]]; then
+      warn "El valor de %s %s; no lo guardo." "$key" "$why"
+      _env_pend "$key" "$req"; continue
+    fi
+    _env_write "$f" "$key" "$val"
+    asked=$((asked+1))
+  done 3<<< "$A_ENV_SPEC"
 
-  (( made > 0 ))  && ok "%s variable(s) generada(s) en %s" "$made" "${A_ENV_FILE:-.env}"
-  (( asked > 0 )) && ok "%s variable(s) guardada(s) en %s" "$asked" "${A_ENV_FILE:-.env}"
-  if [[ -n "$pend" ]]; then
-    warn "Faltan por definir: %s" "$pend"
+  (( made > 0 ))  && ok "%s variable(s) generada(s) en %s" "$made" "$rel"
+  (( defs > 0 ))  && ok "%s variable(s) con su valor por defecto en %s" "$defs" "$rel"
+  (( asked > 0 )) && ok "%s variable(s) guardada(s) en %s" "$asked" "$rel"
+
+  # Y lo que el .env.example espera y nadie ha puesto. Nunca para un
+  # despliegue: un ejemplo trae también lo opcional, y lo que es obligatorio de
+  # verdad se declara en orbit.json.
+  if [[ -n "$example" ]]; then
+    local line ek ev exrel="${example#"$reldir"/}" n_ex=0
+    local -a ex_keys=() ex_vals=()
+    while IFS= read -r -u 3 line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+      ek="${BASH_REMATCH[2]}"; ev="$(_env_unquote "${BASH_REMATCH[3]}")"
+      [[ "$spec_keys" == *" $ek "* ]] && continue
+      _env_has "$f" "$ek" && continue
+      ex_keys+=("$ek"); ex_vals+=("$ev")
+    done 3< "$example"
+    if (( ${#ex_keys[@]} > 0 )); then
+      if _env_can_ask; then
+        printf "\n" >&$UI_FD
+        info "%s trae %s variable(s) que tu .env no tiene: %s" "$exrel" "${#ex_keys[@]}" "${ex_keys[*]}"
+        local yn=""
+        _env_prompt_value yn "$(t "¿Les das valor ahora? [S/n] (Intro deja el del ejemplo; vacío, la salta)")" plain ""
+        if [[ "$yn" != [nN]* ]]; then
+          local i sec
+          for (( i = 0; i < ${#ex_keys[@]}; i++ )); do
+            ek="${ex_keys[i]}"; ev="${ex_vals[i]}"; sec="plain"
+            _env_looks_secret "$ek" && { sec="secret"; ev=""; }
+            val=""; _env_prompt_value val "$ek" "$sec" "$ev"
+            [[ -n "$val" ]] || continue
+            why="$(_env_value_problem "$val")"
+            [[ -z "$why" ]] || { warn "El valor de %s %s; no lo guardo." "$ek" "$why"; continue; }
+            _env_write "$f" "$ek" "$val"; n_ex=$((n_ex+1))
+          done
+          (( n_ex > 0 )) && ok "%s variable(s) del ejemplo guardada(s) en %s" "$n_ex" "$rel"
+        fi
+      else
+        info "%s trae variable(s) que tu .env no tiene: %s" "$exrel" "${ex_keys[*]}"
+        info "  Ponlas con 'orbit env set %s <CLAVE> <valor>', o despliega desde un terminal y te las pido." "$name"
+      fi
+    fi
+  fi
+
+  if [[ -n "$ENV_MISSING" ]]; then
+    warn "Faltan por definir: %s" "$ENV_MISSING"
     local k
-    for k in $pend; do info "  orbit env set %s %s '<valor>'" "$name" "$k"; done
+    for k in $ENV_MISSING; do info "  orbit env set %s %s '<valor>'" "$name" "$k"; done
+    [[ -n "$ENV_MISSING_REQ" ]] && \
+      info "  o en el mismo despliegue:  orbit deploy %s --env CLAVE=valor" "$name"
   fi
   return 0
 }
@@ -11720,17 +11981,26 @@ _env_reminder() { # _env_reminder <app>
 
 cmd_env() {
   need_root env
-  _subcmd env edit app "get set unset list edit" "$@"
+  _subcmd env edit app "get set unset list check edit" "$@"
   local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
   # 'get' ya imprime el valor pelado y los demás no devuelven datos, así que
-  # el único que tiene algo que serializar es 'list'.
-  [[ "$JSON" == "yes" && "$sub" != "list" ]] && die "--json sólo está en 'orbit env list <app>'"
+  # los únicos que tienen algo que serializar son 'list' y 'check'.
+  [[ "$JSON" == "yes" && "$sub" != "list" && "$sub" != "check" ]] \
+    && die "--json sólo está en 'orbit env list <app>' y 'orbit env check <app>'"
   local name="${1:-}"; shift || true
   if [[ -z "$name" && "$JSON" == "yes" ]]; then
-    die "uso: orbit env list <app> --json"
+    die "uso: orbit env %s <app> --json" "$sub"
   fi
   [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
   load_app "$name"
+  # 'check' mira lo que pide la release que está sirviendo, no lo que se
+  # guardó en la configuración al desplegarla: es la misma pregunta que se
+  # hará el próximo despliegue.
+  local cur=""
+  if [[ "$sub" == "check" ]]; then
+    [[ -L "$(app_dir "$name")/current" ]] && cur="$(readlink -f "$(app_dir "$name")/current")"
+    [[ -n "$cur" && -d "$cur" ]] && _read_env_block "$cur"
+  fi
   local f; f="$(_env_path "$name")"
 
   case "$sub" in
@@ -11765,6 +12035,7 @@ cmd_env() {
       # escape: el mismo valor se leería distinto según lo lance el servicio o
       # 'orbit exec'. Mejor rechazarlo que guardar algo ambiguo.
       [[ "$val" == *\'* ]] && die "El valor lleva una comilla simple, y systemd y bash no la escapan igual. Edítalo con 'orbit env %s' y comprueba con 'orbit exec %s env'." "$name" "$name"
+      _env_value_ok "$val" || die "El valor lleva saltos de línea, y en un .env cada variable es una línea. Un JSON se puede guardar compacto; una clave PEM, con los saltos escritos como \\n."
       local had="no"; _env_has "$f" "$key" && had="si"
       _env_write "$f" "$key" "$val"
       [[ "$had" == "si" ]] && ok "%s actualizada en %s" "$key" "$name" || ok "%s añadida a %s" "$key" "$name"
@@ -11788,6 +12059,64 @@ cmd_env() {
       ok "%s eliminada de %s" "$key" "$name"
       _env_reminder "$name"
       logline "env unset $name $key" ;;
+    check)
+      # Lo que la app declara que necesita frente a lo que tiene. Sin valores:
+      # igual que 'list', aquí no sale ningún secreto.
+      local -a ck_keys=() ck_req=() ck_src=() ck_set=()
+      local key mode arg secret desc req def bad=0 ln
+      while IFS=$'\x1f' read -r -u 3 key mode arg secret desc req def; do
+        [[ -n "$key" ]] && _env_key_ok "$key" || continue
+        ck_keys+=("$key"); ck_req+=("$req"); ck_src+=("orbit.json")
+        _env_has "$f" "$key" && ck_set+=(yes) || ck_set+=(no)
+      done 3<<< "$A_ENV_SPEC"
+      local ex=""; [[ -n "$cur" ]] && ex="$(_env_example_file "$cur")"
+      if [[ -n "$ex" ]]; then
+        while IFS= read -r -u 3 ln || [[ -n "$ln" ]]; do
+          ln="${ln%$'\r'}"
+          [[ "$ln" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+          key="${BASH_REMATCH[2]}"
+          [[ " ${ck_keys[*]} " == *" $key "* ]] && continue
+          ck_keys+=("$key"); ck_req+=("optional"); ck_src+=("example")
+          _env_has "$f" "$key" && ck_set+=(yes) || ck_set+=(no)
+        done 3< "$ex"
+      fi
+      local i
+      for (( i = 0; i < ${#ck_keys[@]}; i++ )); do
+        [[ "${ck_set[i]}" == no && "${ck_req[i]}" == required ]] && bad=$((bad+1))
+      done
+      if [[ "$JSON" == "yes" ]]; then
+        local ck_json="" sep=""
+        for (( i = 0; i < ${#ck_keys[@]}; i++ )); do
+          ck_json+="$sep$(printf '{"key":%s,"set":%s,"required":%s,"source":%s}' \
+            "$(_j_str "${ck_keys[i]}")" "$(_j_bool "${ck_set[i]}")" \
+            "$([[ "${ck_req[i]}" == required ]] && echo true || echo false)" "$(_j_str "${ck_src[i]}")")"
+          sep=","
+        done
+        printf '{"schema":%s,"app":%s,"file":%s,"ok":%s,"vars":[%s]}\n' \
+          "$JSON_SCHEMA" "$(_j_str "$name")" "$(_j_str "${A_ENV_FILE:-.env}")" \
+          "$( (( bad == 0 )) && echo true || echo false)" "$ck_json"
+        return 0
+      fi
+      if (( ${#ck_keys[@]} == 0 )); then
+        info "'%s' no declara variables: ni bloque env en orbit.json ni .env.example." "$name"
+        return 0
+      fi
+      for (( i = 0; i < ${#ck_keys[@]}; i++ )); do
+        if [[ "${ck_set[i]}" == yes ]]; then
+          printf "  ${GRN}%s${R} %s\n" "$G_OK" "${ck_keys[i]}"
+        elif [[ "${ck_req[i]}" == required ]]; then
+          printf "  ${RED}%s${R} %s  ${D}%s${R}\n" "$G_ERR" "${ck_keys[i]}" "$(t "obligatoria, sin valor")"
+        else
+          printf "  ${YEL}%s${R} %s  ${D}%s${R}\n" "$G_WARN" "${ck_keys[i]}" \
+            "$([[ "${ck_src[i]}" == example ]] && t "en el .env.example, sin valor" || t "sin valor")"
+        fi
+      done
+      if (( bad > 0 )); then
+        err "Faltan %s variable(s) obligatoria(s): el próximo despliegue se parará antes del build." "$bad"
+        info "  orbit env set %s <CLAVE> '<valor>'   ·   orbit deploy %s --env CLAVE=valor" "$name" "$name"
+        return 1
+      fi
+      return 0 ;;
     list)
       # Solo los nombres: los valores son secretos y están a un 'env get' de
       # distancia, sin acabar en el historial ni en una captura de pantalla.
@@ -13206,12 +13535,42 @@ _i18n_en() {
     ["env: '%s' no es una ruta dentro de la app; me la salto."]="env: '%s' is not a path inside the app; skipping it."
     ["env: '%s' no es un nombre de variable válido; me la salto."]="env: '%s' is not a valid variable name; skipping it."
     ["env: no sé generar '%s' para %s"]="env: I do not know how to generate '%s' for %s"
-    ["env: '%s' pasa por un enlace simbólico (%s); no escribo ahí."]="env: '%s' goes through a symlink (%s); not writing there."
+    ["env: '%s' pasa por un enlace simbólico; no escribo ahí."]="env: '%s' goes through a symlink; not writing there."
     ["env: '%s' existe y no es un fichero normal; no lo toco."]="env: '%s' exists and is not a regular file; leaving it alone."
     ["Falta un dato que solo tú puedes dar:"]="This one only you can provide:"
     ["%s variable(s) generada(s) en %s"]="%s variable(s) generated in %s"
     ["%s variable(s) guardada(s) en %s"]="%s variable(s) saved in %s"
     ["Faltan por definir: %s"]="Still undefined: %s"
+    ["%s es un enlace simbólico y no un fichero. No lo sigo: sustitúyelo por el fichero de verdad y vuelve a desplegar."]="%s is a symlink, not a file. Not following it: replace it with the real file and deploy again."
+    ["El .env de '%s' (%s) no es un fichero normal. No lo toco."]="The .env of '%s' (%s) is not a regular file. Not touching it."
+    ["El .env de '%s' (%s) pasa por un enlace simbólico. No lo toco: lo cambió alguien que no es Orbit."]="The .env of '%s' (%s) goes through a symlink. Not touching it: someone other than Orbit changed it."
+    ["El valor de %s %s."]="The value of %s %s."
+    ["El valor lleva saltos de línea, y en un .env cada variable es una línea. Un JSON se puede guardar compacto; una clave PEM, con los saltos escritos como \\n."]="The value contains line breaks, and in a .env each variable is one line. Store JSON compact; a PEM key with the breaks written as \\n."
+    ["Faltan variables obligatorias (%s). Nada tocado: la versión anterior sigue en producción."]="Required variables are missing (%s). Nothing touched: the previous version is still live."
+    ["orbit deploy: %s espera CLAVE=valor, y «%s» no lo es."]="orbit deploy: %s expects KEY=value, and «%s» isn't."
+    ["orbit deploy: no puedo leer «%s»."]="orbit deploy: cannot read «%s»."
+    ["orbit deploy: «%s» no es una línea CLAVE=valor de %s."]="orbit deploy: «%s» is not a KEY=value line of %s."
+    ["Faltan %s variable(s) obligatoria(s): el próximo despliegue se parará antes del build."]="%s required variable(s) missing: the next deploy will stop before the build."
+    ["  Ponlas con 'orbit env set %s <CLAVE> <valor>', o despliega desde un terminal y te las pido."]="  Set them with 'orbit env set %s <KEY> <value>', or deploy from a terminal and I'll ask."
+    ["  o en el mismo despliegue:  orbit deploy %s --env CLAVE=valor"]="  or in the same deploy:  orbit deploy %s --env KEY=value"
+    ["  orbit env set %s <CLAVE> '<valor>'   ·   orbit deploy %s --env CLAVE=valor"]="  orbit env set %s <KEY> '<value>'   ·   orbit deploy %s --env KEY=value"
+    ["%s trae %s variable(s) que tu .env no tiene: %s"]="%s has %s variable(s) your .env doesn't: %s"
+    ["%s trae variable(s) que tu .env no tiene: %s"]="%s has variable(s) your .env doesn't: %s"
+    ["'%s' no declara variables: ni bloque env en orbit.json ni .env.example."]="'%s' declares no variables: no env block in orbit.json and no .env.example."
+    ["%s variable(s) con su valor por defecto en %s"]="%s variable(s) set to their default in %s"
+    ["%s variable(s) del ejemplo guardada(s) en %s"]="%s variable(s) from the example saved in %s"
+    ["%s variable(s) puesta(s) con --env en %s"]="%s variable(s) set with --env in %s"
+    ["Es obligatoria: sin ella no se despliega."]="It is required: without it the deploy stops."
+    ["Hace falta un valor."]="A value is needed."
+    ["en el .env.example, sin valor"]="in .env.example, no value"
+    ["faltan variables obligatorias: %s"]="required variables missing: %s"
+    ["lleva saltos de línea, y en un .env cada variable es una línea"]="contains line breaks, and in a .env each variable is one line"
+    ["lleva una comilla simple, y systemd y bash no la escapan igual"]="contains a single quote, and systemd and bash escape it differently"
+    ["obligatoria, sin valor"]="required, no value"
+    ["shared/.env es un enlace simbólico"]="shared/.env is a symlink"
+    ["sin valor"]="no value"
+    ["¿Les das valor ahora? [S/n] (Intro deja el del ejemplo; vacío, la salta)"]="Set them now? [Y/n] (Enter keeps the example value; empty skips it)"
+    ["El valor de %s %s; no lo guardo."]="The value of %s %s; not saving it."
     ["No he podido crear el cerrojo de despliegue en %s; sigo sin él."]="Could not create the deploy lock in %s; carrying on without it."
     ["Hay otro despliegue o rollback de '%s' en curso; espero a que termine…"]="Another deploy or rollback of '%s' is running; waiting for it to finish…"
     ["otro despliegue de la app sigue en curso"]="another deploy of the app is still running"
@@ -13334,7 +13693,7 @@ _i18n_en() {
     ["El build de %s ha fallado y se ha reintentado solo tras arreglarlo."]="The build of %s failed and was retried on its own after being fixed."
     ["orbit deploy: «%s» necesita un valor."]="orbit deploy: «%s» needs a value."
     ["orbit deploy: --progress sólo tiene sentido con --json."]="orbit deploy: --progress only makes sense with --json."
-    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
+    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --env K=V     poner una variable en el .env antes del build (repetible)\\n       --env-file F  poner las de un fichero CLAVE=valor antes del build\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --env K=V     set a variable in the .env before the build (repeatable)\\n       --env-file F  set the KEY=value lines of a file before the build\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
     ["orbit deploy: no entiendo «%s». Mira 'orbit deploy --help'."]="orbit deploy: I don't understand «%s». See 'orbit deploy --help'."
     ["orbit deploy: sobra «%s»."]="orbit deploy: «%s» is one argument too many."
     ["con --json hay que decir qué app desplegar"]="with --json you have to say which app to deploy"
@@ -13938,8 +14297,8 @@ _i18n_en() {
     ["La app aún no se ha desplegado: el puerto se usará en el primer 'orbit deploy'."]="The app has not been deployed yet: the port will be used on the first 'orbit deploy'."
     ["'%s' pasa del puerto %s al %s"]="'%s' moves from port %s to %s"
     ["Se aplicará al reiniciar:  orbit restart %s"]="It takes effect on restart:  orbit restart %s"
-    ["--json sólo está en 'orbit env list <app>'"]="--json is only in 'orbit env list <app>'"
-    ["uso: orbit env list <app> --json"]="usage: orbit env list <app> --json"
+    ["--json sólo está en 'orbit env list <app>' y 'orbit env check <app>'"]="--json is only in 'orbit env list <app>' and 'orbit env check <app>'"
+    ["uso: orbit env %s <app> --json"]="usage: orbit env %s <app> --json"
     ["Guardado. Recuerda: los cambios se aplican al reiniciar."]="Saved. Remember: changes take effect on restart."
     ["¿Reiniciar '%s' ahora?"]="Restart '%s' now?"
     ["Reiniciada"]="Restarted"
