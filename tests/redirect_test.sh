@@ -90,6 +90,13 @@ run cmd_redirect add web /solo-dos-args >/dev/null 2>&1; r=$?
 check "'web' no es un dominio" "1" "$r"
 run cmd_redirect add web https://x.test >"$TMP/e" 2>&1; r=$?
 check "y lo dice claro" "1" "$(grep -c 'no parece un dominio' "$TMP/e")"
+# Con un punto basta para «parecer» un dominio, pero el nombre acaba en el
+# server_name, en el nombre del vhost y en el de la app.
+run cmd_redirect add 'viejo.test;x' https://nuevo.test >"$TMP/e" 2>&1; r=$?
+check "dominio con ';'" "1" "$r"
+check "y no crea nada" "0" "$(app_names | grep -c 'viejo.test;x' || true)"
+run cmd_redirect add '*.viejo.test' https://nuevo.test >/dev/null 2>&1; r=$?
+check "ni un comodín" "1" "$r"
 
 # Un dominio que ya sirve otra app no puede convertirse en redirección: nginx
 # admite dos vhosts con el mismo server_name avisando por el log y se queda con

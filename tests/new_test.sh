@@ -266,4 +266,58 @@ nueva --repo https://example.test/compartida.git --domain compartida.test \
       --type node --start "node server.js" --yes
 check "apagado, sin usuario" ""       "$(campo compartida A_USER)"
 
+section "Un dominio que no es un dominio no llega al vhost"
+# Los dominios se escribían tal cual en 'server_name' y en la ruta del
+# certificado. 'tienda.ejemplo.com;x' daba un vhost que nginx no puede leer, y
+# con el enlace en sites-enabled caía la configuración del servidor entero.
+for d in ejemplo.com blog.ejemplo.com xn--espaa-rta.es a-b.c0.io 10.0.0.1; do
+  check "vale: $d" "0" "$(_domain_ok "$d"; echo $?)"
+done
+for d in 'tienda.ejemplo.com;x' 'a b.com' localhost '-a.com' 'a-.com' 'a..com' '.a.com' \
+         'a.com.' 'https://a.com' 'a.com/x' 'a_b.com' '*.ejemplo.com' '$host.com' "a.com
+b.com"; do
+  check "no vale: $d" "1" "$(_domain_ok "$d"; echo $?)"
+done
+check "comodín, sólo si se pide" "0" "$(_domain_ok '*.ejemplo.com' wild; echo $?)"
+check "y no a secas"             "1" "$(_domain_ok '*.com' wild; echo $?)"
+check "ni dos"                   "1" "$(_domain_ok '*.*.ejemplo.com' wild; echo $?)"
+L60="$(printf 'a%.0s' {1..60})"
+check "largo de más"             "1" "$(_domain_ok "$L60.$L60.$L60.$L60.$L60.com"; echo $?)"
+# La lista se normaliza: minúsculas, sin repetidos, comas como separador.
+_domain_list L 'WWW.Ejemplo.com, *.ejemplo.com www.ejemplo.com'
+check "lista normalizada" "www.ejemplo.com *.ejemplo.com" "$L"
+run _domain_list L 'a.com b.com' uno >/dev/null 2>&1; r=$?
+check "principal, uno solo" "1" "$r"
+
+# Y lo que importa: que se rechace **antes** de crear nada.
+nueva --repo https://example.test/inyec.git --name inyec --domain 'inyec.test;x' --yes
+check "new: dominio con ';'"   "1" "$r"
+check "y dice cuál"            "1" "$(grep -c "'inyec.test;x' no es un dominio válido" <<<"$SALIDA")"
+check "sin dejar la app"       "1" "$(app_exists inyec && echo 0 || echo 1)"
+check "ni su carpeta"          "1" "$([[ -d "$TMP/apps/inyec" ]] && echo 0 || echo 1)"
+nueva --repo https://example.test/inyec.git --name inyec --domain inyec.test --aliases 'www.inyec.test bad}name' --yes
+check "new: alias que no vale" "1" "$r"
+check "sin dejar la app"       "1" "$(app_exists inyec && echo 0 || echo 1)"
+nueva --repo https://example.test/inyec.git --name inyec --domain Inyec.TEST --aliases 'WWW.inyec.test,*.inyec.test' --yes
+check "new: en minúsculas"     "inyec.test" "$(campo inyec A_DOMAIN)"
+check "y los alias también"    "www.inyec.test *.inyec.test" "$(campo inyec A_ALIASES)"
+
+# 'orbit domain' pregunta: con la entrada se le da el valor malo.
+render_nginx() { printf 'render %s\n' "$1" >> "$PASOS"; }
+: > "$PASOS"
+ASSUME_YES="no"
+SALIDA="$(run cmd_domain inyec 2>&1 <<<"inyec.test;return 301 http://malo
+")"; r=$?
+ASSUME_YES="yes"
+check "domain: se rechaza"     "1" "$r"
+check "y no se guarda"         "inyec.test" "$(campo inyec A_DOMAIN)"
+check "ni se toca nginx"       "0" "$(grep -c '^render' "$PASOS")"
+ASSUME_YES="no"
+SALIDA="$(run cmd_domain inyec 2>&1 <<<"inyec.test
+www.inyec.test otra;roto
+")"; r=$?
+ASSUME_YES="yes"
+check "domain: alias roto"     "1" "$r"
+check "y no se guarda"         "www.inyec.test *.inyec.test" "$(campo inyec A_ALIASES)"
+
 report

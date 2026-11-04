@@ -87,6 +87,43 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.0] - 2026-11-04
+
+Cinco agujeros de una auditoría del vhost, todos reproducidos con nginx y php-fpm de verdad antes de tocar nada, y todos con su prueba en `nginx_test` —58 comprobaciones nuevas en rojo sin el arreglo—. Ver ARCHITECTURE §18.7c.
+
+### Seguridad — la carpeta PHP de fuera del build se servía casi entera
+
+Una web estática con su `api/` en la raíz del repositorio —un Astro con `dist/` y `api/*.php`, el caso real de §18.7— recibía un `location ^~ /api/` que sólo negaba seis extensiones, y el `^~` apagaba además el snippet de seguridad. Salían con 200: `/api/_lib.php` (ejecutado), cualquier `.php` de `api/vendor/` (el `eval-stdin.php` de phpunit es ejecución remota con un POST), `README.md`, `composer.json` y `.lock`, `vendor/composer/installed.json`, `config.inc` **con su código fuente**, `phpunit.xml.dist`, `deploy.sh`, `backup.sql.gz`, `db.sqlite3`, `env.local`, `x.php~` y `x.php.save`. La documentación de despliegue de ese proyecto daba por hecho un `location ^~ /api/_ { deny all; }` «que Orbit añade», y no lo añadía.
+
+- **Dentro del bloque, todo prohibido salvo lo que se nombra**: se ejecutan los `.php` cuyo nombre no empieza por `_`, se sirven imágenes, CSS, JavaScript y fuentes, y el resto es 404. Nada bajo `vendor/`, `node_modules/`, `tests?/`, `includes?/`, `lib/`, `config/` ni `storage/`, ni nada que empiece por `.` o `_`. `/api/` va a `api/index.php`
+- **Un `.txt` de esa carpeta ya no se sirve.** En una carpeta de código fuente un `.txt` es un `requirements.txt` o unas notas; si hace falta servir algo, que sea un estático o que lo devuelva PHP
+- **El mantenimiento también cubre esos endpoints.** El `if` de la location de fuera no corre cuando la petición acaba en una de dentro: con la web en 503, el formulario seguía procesándose
+- **La web estática servida desde la raíz del repositorio** (`outdir` `.` con PHP) niega ahora `vendor/`, `node_modules/`, `composer.json`/`.lock`, los `.md`, los `_*.php`, los `.php` bajo `lib/`, `includes/`, `config/` y `tests/`, y las copias y volcados (`x.php~`, `config.inc`, `*.sql.gz`)
+
+### Seguridad — se publicaba cualquier carpeta de primer nivel con un `.php`
+
+`_php_outside_dirs` publicaba toda carpeta con un `.php` a dos niveles o menos: `/scripts/migrate.php` se ejecutaba, `/config/keys.json` se servía, y en un monorepo con `outdir` `site/public` y un `contact.php` en `site/` se publicaba `/site/` **desde la raíz de la release**, o sea el código fuente de la web entera.
+
+- **Sólo `api` por defecto**, y las que el repositorio declare con `"php_dirs": ["…"]` en su `orbit.json` (leído de la release en cada vhost, como `shared`; sin `jq`, sólo `api`)
+- Se buscan en la carpeta de la app (el `site/api/` del monorepo), nunca la que es o contiene la carpeta compilada, y sólo si tienen un `.php` que no empiece por `_`
+- Si una carpeta con pinta de endpoints se queda sin publicar, el despliegue lo dice con la línea exacta que hay que añadir. **Si tus endpoints no están en `api/`, esto es un cambio que te afecta**: decláralos
+
+### Corregido — un `nginx -t` fallido dejaba el servidor entero sin configuración válida
+
+`render_nginx` escribía el vhost y lo enlazaba en `sites-enabled` antes de `nginx -t`, y al fallar devolvía 1 sin deshacer nada: ningún otro despliegue, ningún `certbot renew`, y nginx sin arrancar tras un reinicio. Se reproducía con dos `location ^~ /storage/` —el de §18.7 y el de la carpeta publicada— en una estática con un `storage/` con un `.php` dentro, o con un `uploads/` en `dist/` y en la raíz. La tabla del despliegue en ARCHITECTURE decía «aborta con la config anterior intacta» y no era verdad.
+
+- Si `nginx -t` falla, vuelve el vhost anterior (o se quita el enlace si no lo había) y el rechazado se queda al lado con `.rejected`
+- El vhost se genera en un fichero aparte y se mueve después: un fallo a mitad ya no deja uno cortado
+- El duplicado ya no se genera: lo que protege §18.7 no se publica otra vez
+
+### Corregido — los dominios no se validaban
+
+`orbit domain`, `orbit new --domain/--aliases`, `orbit clone` y `orbit redirect add <dominio>` escribían el valor tal cual en `server_name` y en la ruta del certificado. `shop.example.com;x` daba un vhost ilegible y, con lo anterior, el servidor entero caído. Ahora cada nombre se comprueba contra la forma de RFC 1123 (un `*.` delante sólo en los alias), se pasa a minúsculas, se aceptan comas como separador, y lo que no vale se rechaza **antes de guardar o clonar nada**.
+
+### Corregido — las cabeceras de seguridad desaparecían en los estáticos
+
+Un `add_header` dentro de una location anula todos los heredados, así que el `Cache-Control` de CSS, JS, imágenes, `/sw.js`, `/_next/static/`, los estáticos de Django y la página de mantenimiento se llevaba `nosniff`, `X-Frame-Options`, el resto de `orbit-security.conf` y el HSTS. Medido: `/` con todas, `/a.css` con ninguna. Esas location repiten ahora la lista; el HSTS va por `$orbit_hsts`, que sólo rellena el server del 443, así que `/` y el puerto 80 quedan exactamente como estaban. Una prueba compara la lista con la de `install.sh`, y `nginx_test` usa ya el snippet de seguridad de verdad en vez de una copia reducida.
+
 ## [1.3.9] - 2026-11-04
 
 ### Añadido — despliegues con pasos, declarados en el repo

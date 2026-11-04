@@ -472,7 +472,13 @@ El tipo sigue siendo `static` —el 99 % del sitio son ficheros— y lo que se a
 
 **Y si tus endpoints viven fuera de la carpeta compilada, no hace falta moverlos.** Es el caso típico: un Astro con una carpeta `api/` en la raíz del repositorio. `astro build` sólo copia `public/` a `dist/`, así que `api/` se queda fuera y nginx, que sirve `dist/`, devolvería 404 en todos los endpoints con la web viéndose perfecta.
 
-Orbit las sirve desde donde están: cualquier carpeta de primer nivel con `.php` dentro que no esté en la carpeta compilada recibe su propio bloque, y `/api/contact.php` funciona sin tocar el proyecto. No hay que subir nada aparte ni duplicar el `rsync`.
+Orbit la sirve desde donde está: `api/` recibe su propio bloque y `/api/contact.php` funciona sin tocar el proyecto. No hay que subir nada aparte ni duplicar el `rsync`. Si tus endpoints están en otra carpeta, decláralo en el `orbit.json`; si no, el despliegue te avisa de que esa carpeta se queda sin publicar:
+
+```json
+{ "type": "static", "php_dirs": ["api", "formularios"] }
+```
+
+Dentro de esa carpeta **sólo se ejecutan los `.php` y se sirven imágenes, CSS, JavaScript y fuentes**; todo lo demás es 404. Los ficheros y carpetas que empiezan por `_` o `.` no se alcanzan (`_lib.php`, `_smtp.php`: es la convención para lo que se incluye), ni nada bajo `vendor/`, `lib/`, `includes/`, `config/`, `tests/` o `storage/`. Así un `README.md`, el `composer.lock`, un `config.inc` o el `phpunit` de `vendor/` no quedan a la vista. Si la web se sirve desde la raíz del repositorio, se niegan igualmente `vendor/`, `composer.json`/`.lock`, los `.md` y los `_*.php`.
 
 Se puede forzar en los dos sentidos, por si tienes un `.php` en el repo que no quieres que se ejecute:
 
@@ -1458,6 +1464,8 @@ orbit domain mi-web
 ```
 
 Cambia el dominio principal o añade alias. Regenera el vhost y te ofrece reemitir el certificado.
+
+Cada nombre tiene que ser un dominio de verdad —letras, números, guiones y puntos; un `*.` delante sólo en los alias— y se guarda en minúsculas. Lo que no lo es se rechaza antes de tocar nada: un `;` o un espacio en un `server_name` dejaría a nginx sin poder leer la configuración. Y si aun así nginx rechaza el vhost, Orbit devuelve el anterior y deja el rechazado al lado con `.rejected` para que lo mires.
 
 Recuerda crear también el registro A en Cloudflare antes.
 

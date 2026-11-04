@@ -43,13 +43,12 @@ location ^~ /.well-known/acme-challenge/ {
 }
 EOF
 
-cat > "$NG/snippets/orbit-security.conf" <<'EOF'
-add_header X-Content-Type-Options "nosniff" always;
-location = /favicon.ico { access_log off; log_not_found off; }
-location ~ /\.(?!well-known) { deny all; access_log off; log_not_found off; }
-location ~* \.(env|log|sql|sqlite|bak|old|swp|ini|yml|yaml|toml)$ { deny all; }
-location ^~ /.git/ { deny all; }
-EOF
+# El de seguridad se saca de install.sh tal cual, y no una copia reducida: las
+# cabeceras que repite _sec_headers tienen que ser exactamente éstas, y con una
+# copia a mano la prueba compararía el vhost con algo que no existe en ningún
+# servidor.
+sed -n "/^cat > \/etc\/nginx\/snippets\/orbit-security.conf <<'EOF'/,/^EOF/p" \
+  "$ORBIT_ROOT/install.sh" | sed '1d;$d' > "$NG/snippets/orbit-security.conf"
 
 cat > "$NG/snippets/orbit-ssl.conf" <<'EOF'
 ssl_protocols TLSv1.2 TLSv1.3;
@@ -146,7 +145,29 @@ mkdir -p "$AREL/dist" "$AREL/api" "$ASHARED/api/undelivered"
 printf 'la portada compilada\n'                 > "$AREL/dist/index.html"
 printf '<?php echo "endpoint vivo\n"; ?>\n'     > "$AREL/api/contact.php"
 printf '<?php echo "no soy un endpoint\n"; ?>\n' > "$AREL/api/_lib.php"
-printf 'una hoja de estilo\n'                   > "$AREL/api/no-es-codigo.txt"
+printf 'una hoja de estilo\n'                   > "$AREL/api/estilo.css"
+printf 'unas notas\n'                           > "$AREL/api/no-es-codigo.txt"
+printf '<?php echo "indice de la api\n"; ?>\n'  > "$AREL/api/index.php"
+# Lo que trae una carpeta api/ de verdad además de sus endpoints, y que la
+# versión anterior servía con 200 —o ejecutaba— porque dentro del prefijo sólo
+# se negaban seis extensiones. Cada fichero lleva la palabra FUGA para poder
+# comprobar que no sale ni su contenido.
+mkdir -p "$AREL/api/vendor/phpunit/phpunit/src/Util/PHP" "$AREL/api/vendor/composer" \
+         "$AREL/api/lib" "$AREL/api/_privado"
+printf '<?php echo "FUGA eval-stdin\n"; ?>\n'   > "$AREL/api/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"
+printf '[{"name":"FUGA"}]\n'                     > "$AREL/api/vendor/composer/installed.json"
+printf '<?php echo "FUGA lib\n"; ?>\n'          > "$AREL/api/lib/db.php"
+printf '<?php echo "FUGA privado\n"; ?>\n'      > "$AREL/api/_privado/x.php"
+for f in README.md composer.json composer.lock config.inc phpunit.xml.dist deploy.sh \
+         backup.sql.gz db.sqlite3 env.local 'contact.php~' contact.php.save datos.json; do
+  printf 'FUGA %s\n' "$f" > "$AREL/api/$f"
+done
+# Y dos carpetas de primer nivel con PHP que NO son endpoints. La regla de
+# antes publicaba cualquier carpeta con un .php a dos niveles o menos.
+mkdir -p "$AREL/scripts" "$AREL/config"
+printf '<?php echo "FUGA migrate\n"; ?>\n'      > "$AREL/scripts/migrate.php"
+printf '<?php return []; ?>\n'                  > "$AREL/config/app.php"
+printf '{"clave":"FUGA"}\n'                      > "$AREL/config/keys.json"
 # Y dentro, lo que la app escribe en tiempo de ejecución: por el modelo de §4
 # eso vive en shared/, y lo que apunta a shared/ es dato, no se sirve nunca.
 printf 'From: alguien\n\nCV con datos personales\n' > "$ASHARED/api/undelivered/2026.eml"
@@ -156,6 +177,20 @@ ln -sfn "$ASHARED/api/stats.json"  "$AREL/api/stats.json"
 ln -sfn "$AREL" "$TMP/apps/apiweb/current"
 mkapp apiweb static "" "apiweb.test"
 A_TYPE="static"; A_OUTDIR="dist"; A_SPA="no"; A_PHP="yes"; save_app
+
+# El mismo caso en un monorepo: la web vive en site/, compila a site/public, y
+# lleva un contact.php suelto en site/ y su api/ al lado. La regla de antes
+# veía un .php en 'site/' y publicaba '/site/' **desde la raíz de la release**:
+# el código fuente entero de la web. Y su 'api/', que es site/api/, no la veía.
+SREL="$TMP/apps/monophp/releases/r1"
+mkdir -p "$SREL/site/public" "$SREL/site/api" "$SREL/site/src"
+printf 'portada del monorepo\n'                > "$SREL/site/public/index.html"
+printf '<?php echo "FUGA contact\n"; ?>\n'     > "$SREL/site/contact.php"
+printf 'const SECRETO = "FUGA";\n'              > "$SREL/site/src/app.js"
+printf '<?php echo "endpoint del monorepo\n"; ?>\n' > "$SREL/site/api/form.php"
+ln -sfn "$SREL" "$TMP/apps/monophp/current"
+mkapp monophp static "" "monophp.test"
+A_TYPE="static"; A_OUTDIR="site/public"; A_APPDIR="site"; A_SPA="no"; A_PHP="yes"; save_app
 
 # App de Deno, con su código dentro de la release. En Deno y en Bun no hay
 # carpeta compilada: lo que se despliega es el fuente. Si el vhost sirviera
@@ -177,6 +212,20 @@ HREL="$TMP/apps/hibrida/releases/r1"
 mkdir -p "$HREL"
 printf 'portada de hibrida\n' > "$HREL/index.html"
 printf '<?php echo "hola desde php\\n"; echo $_SERVER["REQUEST_METHOD"], "\\n"; ?>\n' > "$HREL/contacto.php"
+printf 'body{}\n' > "$HREL/a.css"
+# Con el docroot en la raíz del repositorio, lo que en otra web se queda fuera
+# del build aquí está a una URL: las dependencias de composer —con el phpunit
+# que ejecuta lo que le manden por POST—, sus .json, los .md y las piezas que
+# se incluyen y no se piden.
+mkdir -p "$HREL/vendor/phpunit/phpunit/src/Util/PHP" "$HREL/lib" "$HREL/assets"
+printf '<?php echo "FUGA eval-stdin\n"; ?>\n' > "$HREL/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"
+printf 'FUGA vendor js\n'                      > "$HREL/vendor/x.js"
+printf '<?php echo "FUGA lib\n"; ?>\n'        > "$HREL/lib/db.php"
+printf '<?php echo "FUGA privado\n"; ?>\n'    > "$HREL/_conexion.php"
+printf 'una librería de js\n'                  > "$HREL/assets/lib.js"
+for f in README.md composer.json composer.lock config.inc 'contacto.php~' contacto.php.save backup.sql.gz; do
+  printf 'FUGA %s\n' "$f" > "$HREL/$f"
+done
 ln -sfn "$HREL" "$TMP/apps/hibrida/current"
 mkdir -p "$TMP/apps/hibrida/shared"
 printf 'volvemos enseguida\n' > "$TMP/apps/hibrida/shared/maintenance.html"
@@ -362,7 +411,7 @@ EOF
   # php-fpm se niega a correr como root, así que el pool va como www-data y el
   # árbol de pruebas tiene que ser legible para él.
   chmod a+rx "$TMP" "$NG" 2>/dev/null || true
-  chmod -R a+rX "$TMP/apps/hibrida" "$TMP/apps/tienda" "$TMP/apps/monolara" 2>/dev/null || true
+  chmod -R a+rX "$TMP/apps/hibrida" "$TMP/apps/tienda" "$TMP/apps/monolara" "$TMP/apps/apiweb" "$TMP/apps/monophp" 2>/dev/null || true
   priv "$PHPFPM" -y "$NG/php-fpm.conf" >/dev/null 2>&1
   [[ -S "$NG/php.sock" ]] || PHPFPM=""
 fi
@@ -395,7 +444,7 @@ else
     > "$NG/fastcgi.conf"
 fi
 
-for app in sincert concert spa proxyapp pyapp hibrida tienda aislada denoapp lara monolara monoweb apiweb; do install_vhost "$app"; done
+for app in sincert concert spa proxyapp pyapp hibrida tienda aislada denoapp lara monolara monoweb apiweb monophp; do install_vhost "$app"; done
 
 # El servidor por defecto, igual que lo escribe install.sh. Va en 000- para que
 # nginx lo vea antes que los vhosts de las apps, que es de donde salía el bug:
@@ -756,10 +805,13 @@ if [[ -n "$PHPFPM" ]]; then
     "$(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/contact.php")"
   check "y no se sirve su fuente" "0" \
     "$(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/contact.php" | grep -c '<?php')"
-  # Un fichero normal de esa carpeta sí se sirve: no es una carpeta prohibida,
-  # es una carpeta que además ejecuta PHP.
-  check "un fichero normal se sirve" "una hoja de estilo" \
-    "$(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/no-es-codigo.txt")"
+  # Un estático de esa carpeta sí se sirve: una imagen o una hoja de estilo del
+  # formulario. Lo demás ya no —ver abajo—, y eso incluye un .txt: en una
+  # carpeta de código fuente, un .txt es un requirements.txt o unas notas.
+  check "un estático se sirve" "una hoja de estilo" \
+    "$(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/estilo.css")"
+  check "un .txt, ya no" "404" \
+    "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/no-es-codigo.txt")"
   # Y lo que vive en shared/: ni el .eml con el CV ni las estadísticas.
   check "el .eml con el CV, 404" "404" \
     "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/undelivered/2026.eml")"
@@ -771,6 +823,152 @@ if [[ -n "$PHPFPM" ]]; then
   check "lo que no existe, 404" "404" \
     "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/no-existe.php")"
 fi
+
+section "Dentro de una carpeta PHP de fuera, todo está prohibido salvo lo que se nombra"
+# Antes, dentro de 'location ^~ /api/' sólo se negaban seis extensiones, y el
+# '^~' apagaba además el snippet de seguridad entero. Todo esto salía con 200:
+# lo medido en una carpeta api/ real. Se mira el código y que no salga el
+# contenido, porque un 404 con cuerpo de otro sitio también sería un fallo.
+if [[ -n "$PHPFPM" ]]; then
+  for ruta in /api/_lib.php /api/_privado/x.php /api/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php \
+              /api/vendor/composer/installed.json /api/lib/db.php /api/README.md /api/composer.json \
+              /api/composer.lock /api/config.inc /api/phpunit.xml.dist /api/deploy.sh /api/backup.sql.gz \
+              /api/db.sqlite3 /api/env.local '/api/contact.php~' /api/contact.php.save /api/datos.json; do
+    check "api: $ruta" "404 0" \
+      "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT$ruta") $(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT$ruta" | grep -c 'FUGA\|no soy un endpoint')"
+  done
+  # El POST es la forma en que se explota el eval-stdin de phpunit.
+  check "api: eval-stdin por POST" "404" \
+    "$(H -X POST --data '<?php echo 1;' -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php")"
+  # Lo que sí tiene que seguir: el índice de la carpeta, por su index.php.
+  check "api: /api/ va a su index.php" "indice de la api" \
+    "$(BODY -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/")"
+  # Y el mantenimiento: un 'if' en la location de fuera no corre cuando la
+  # petición acaba en una de dentro. Con la web en 503, el formulario seguía
+  # procesándose — la sorpresa de las dos de la mañana que el guard de la
+  # location principal ya evitaba.
+  printf 'volvemos enseguida\n' > "$(maint_page apiweb)"; chmod a+r "$(maint_page apiweb)"
+  touch "$(maint_flag apiweb)"
+  check "api: mantenimiento también aquí" "503" \
+    "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT/api/contact.php")"
+  rm -f "$(maint_flag apiweb)"
+fi
+
+section "Sólo se publican las carpetas PHP que se piden"
+# La regla de antes publicaba cualquier carpeta de primer nivel con un .php a
+# dos niveles o menos: '/scripts/migrate.php' se ejecutaba y '/config/' servía
+# sus .json.
+check "scripts/ no tiene bloque" "0" "$(grep -c 'location \^~ /scripts/' "$NG/vhosts/apiweb.conf")"
+check "config/ no tiene bloque"  "0" "$(grep -c 'location \^~ /config/' "$NG/vhosts/apiweb.conf")"
+for ruta in /scripts/migrate.php /config/keys.json /config/app.php; do
+  check "fuera: $ruta" "1" \
+    "$([[ "$(H -H 'Host: apiweb.test' "http://127.0.0.1:$HTTP_PORT$ruta")" != "200" ]] && echo 1 || echo 0)"
+done
+# En el monorepo: '/site/' era el código fuente entero de la web.
+check "monorepo: sin /site/"      "0" "$(grep -c 'location \^~ /site/' "$NG/vhosts/monophp.conf")"
+check "monorepo: api desde site/" "1" \
+  "$(grep -cE "^\s*root $TMP/apps/monophp/current/site;" "$NG/vhosts/monophp.conf")"
+check "monorepo: portada"         "portada del monorepo" \
+  "$(BODY -H 'Host: monophp.test' "http://127.0.0.1:$HTTP_PORT/")"
+for ruta in /site/contact.php /site/src/app.js; do
+  check "monorepo: $ruta" "0" \
+    "$(BODY -H 'Host: monophp.test' "http://127.0.0.1:$HTTP_PORT$ruta" | grep -c FUGA)"
+done
+if [[ -n "$PHPFPM" ]]; then
+  check "monorepo: su api/ funciona" "endpoint del monorepo" \
+    "$(BODY -H 'Host: monophp.test' "http://127.0.0.1:$HTTP_PORT/api/form.php")"
+fi
+# Otra carpeta, sólo si el repositorio la declara en su orbit.json.
+mkdir -p "$AREL/formularios"
+printf '<?php echo "formulario declarado\n"; ?>\n' > "$AREL/formularios/alta.php"
+printf '{"type":"static","php_dirs":["formularios","../fuera","a/b","*"]}\n' > "$AREL/orbit.json"
+load_app apiweb
+OUTSIDE="$(_php_outside_dirs "$(app_current apiweb)" | tr '\n' ' ')"
+if command -v jq >/dev/null; then
+  check "php_dirs declarado"           "api formularios " "$OUTSIDE"
+else
+  # Sin jq no se puede leer la lista: se queda en lo de por defecto, que es lo
+  # seguro, y no en lo declarado.
+  check "php_dirs sin jq, sólo api"    "api " "$OUTSIDE"
+fi
+rm -f "$AREL/orbit.json"
+
+section "Un nombre que ya protege otro bloque no se publica dos veces"
+# Dos 'location ^~' con el mismo prefijo son un vhost que nginx rechaza. Pasaba
+# con una web estática cuyo 'storage/' —que _php_writable_denies protege
+# siempre— llevaba un .php dentro, y con un 'uploads/' en dist/ y en la raíz.
+# Se valida aparte, con su propio nginx -t: dentro de la tanda grande, un vhost
+# roto tumbaría todas las comprobaciones de detrás y no diría cuál.
+DREL2="$TMP/apps/dupweb/releases/r1"
+mkdir -p "$DREL2/dist/uploads" "$DREL2/storage" "$DREL2/uploads" "$DREL2/api"
+printf 'portada\n'           > "$DREL2/dist/index.html"
+printf '<?php echo 1; ?>\n'  > "$DREL2/storage/x.php"
+printf '<?php echo 1; ?>\n'  > "$DREL2/uploads/x.php"
+printf '<?php echo 1; ?>\n'  > "$DREL2/api/x.php"
+printf '{"type":"static","php_dirs":["storage","uploads","api"]}\n' > "$DREL2/orbit.json"
+ln -sfn "$DREL2" "$TMP/apps/dupweb/current"
+mkapp dupweb static "" "dupweb.test"
+A_TYPE="static"; A_OUTDIR="dist"; A_SPA="no"; A_PHP="yes"; save_app
+mkdir -p "$NG/aparte"
+nginx_vhost dupweb | sed -e "s#/etc/nginx/snippets/#$NG/snippets/#g" -e "s#/var/log/nginx/#$NG/logs/#g" \
+  -e "s#/run/php/orbit.sock#$NG/php.sock#g" -e "s/^\( *\)listen 80;/\1listen 127.0.0.1:$HTTP_PORT;/" \
+  -e "/listen \[::\]/d" > "$NG/aparte/dupweb.conf"
+sed "s#include $NG/vhosts/\*.conf;#include $NG/aparte/*.conf;#" "$NG/nginx.conf" > "$NG/aparte.conf"
+nginx -t -c "$NG/aparte.conf" -p "$NG" >"$NG/logs/aparte.out" 2>&1 && r=ok || r=error
+[[ "$r" == ok ]] || sed 's/^/      /' "$NG/logs/aparte.out"
+check "sin prefijos repetidos: nginx -t" "ok" "$r"
+check "un solo /storage/" "1" "$(grep -c 'location \^~ /storage/' "$NG/aparte/dupweb.conf")"
+check "un solo /uploads/" "1" "$(grep -c 'location \^~ /uploads/' "$NG/aparte/dupweb.conf")"
+
+section "Una web estática servida desde la raíz del repositorio"
+# hibrida: A_OUTDIR=".", así que el docroot ES el repositorio.
+if [[ -n "$PHPFPM" ]]; then
+  for ruta in /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php /vendor/x.js /lib/db.php /_conexion.php \
+              /README.md /composer.json /composer.lock /config.inc '/contacto.php~' /contacto.php.save /backup.sql.gz; do
+    check "raíz: $ruta" "404 0" \
+      "$(H -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT$ruta") $(BODY -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT$ruta" | grep -c 'FUGA')"
+  done
+  # Y lo que es de la web sigue en pie: no se le puede quitar a una web estática
+  # su carpeta de JavaScript por llamarse 'lib' en otro sitio.
+  check "raíz: el .php de la web, sí" "hola desde php" \
+    "$(BODY -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/contacto.php" | head -1)"
+  check "raíz: sus estáticos, sí" "una librería de js" \
+    "$(BODY -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/assets/lib.js")"
+fi
+
+section "Las cabeceras de seguridad, también en los estáticos"
+# Un 'add_header' en una location anula todos los heredados. El Cache-Control
+# de los estáticos se llevaba por delante nosniff, X-Frame-Options y el HSTS:
+# medido, '/' con las tres y '/a.css' con ninguna.
+CAB='^(x-content-type-options|x-frame-options|referrer-policy|permissions-policy|cross-origin-opener-policy|strict-transport-security):'
+cabeceras() { curl -skI --noproxy '*' -m 5 "$@" | tr -d '\r' | grep -iE "$CAB" | cut -d: -f1 | tr 'A-Z' 'a-z' | sort | tr '\n' ' '; }
+printf 'body{}\n' > "$TMP/apps/concert/releases/r1/a.css"
+printf 'body{}\n' > "$TMP/apps/sincert/releases/r1/a.css"
+chmod a+r "$TMP/apps/concert/releases/r1/a.css" "$TMP/apps/sincert/releases/r1/a.css"
+RAIZ443="$(cabeceras --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/")"
+check "443: '/' trae las seis"      "6" "$(wc -w <<<"$RAIZ443" | tr -d ' ')"
+check "443: el .css, las mismas"    "$RAIZ443" \
+  "$(cabeceras --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/a.css")"
+check "443: y su Cache-Control"     "1" \
+  "$(curl -skI --noproxy '*' -m 5 --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/a.css" | grep -ci '^cache-control: public, immutable')"
+# Por el 80, '/' no lleva HSTS y el estático tampoco puede llevarlo: el cuerpo
+# del vhost es el mismo en los dos server, y lo que cambia es la variable.
+RAIZ80="$(cabeceras -H 'Host: sincert.test' "http://127.0.0.1:$HTTP_PORT/")"
+check "80: '/' sin HSTS"            "0" "$(grep -c strict <<<"$RAIZ80")"
+check "80: el .css, las mismas"     "$RAIZ80" "$(cabeceras -H 'Host: sincert.test' "http://127.0.0.1:$HTTP_PORT/a.css")"
+check "80 con XFP: el .css igual que '/'" \
+  "$(cabeceras -H 'Host: concert.test' -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$HTTP_PORT/")" \
+  "$(cabeceras -H 'Host: concert.test' -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$HTTP_PORT/a.css")"
+if [[ -n "$PHPFPM" ]]; then
+  check "php: el .css, las mismas que '/'" \
+    "$(cabeceras -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/")" \
+    "$(cabeceras -H 'Host: hibrida.test' "http://127.0.0.1:$HTTP_PORT/a.css")"
+fi
+# La lista de _sec_headers es una copia de la de install.sh (no se puede
+# incluir el snippet: trae 'location'). Si una cambia y la otra no, aquí.
+check "misma lista que install.sh" \
+  "$(grep -oE '^add_header +[A-Za-z-]+ +"[^"]*"' "$NG/snippets/orbit-security.conf" | sed -E 's/ +/ /g' | sort | tr '\n' '|')" \
+  "$(_sec_headers | grep -v Strict-Transport | grep -oE 'add_header +[A-Za-z-]+ +"[^"]*"' | sed -E 's/ +/ /g' | sort | tr '\n' '|')"
 
 section "El código de Deno y Bun no se sirve desde disco"
 # En Deno y en Bun no hay carpeta compilada: la release *es* el código. Si el
@@ -865,5 +1063,53 @@ else
   check "y sigue funcionando"     "la web aislada" \
     "$(BODY -H 'Host: aislada.test' "http://127.0.0.1:$HTTP_PORT/")"
 fi
+
+section "Si nginx rechaza el vhost, el servidor se queda como estaba"
+# Antes, render_nginx escribía el vhost y lo enlazaba en sites-enabled **antes**
+# de 'nginx -t', y al fallar devolvía 1 sin deshacer nada: la configuración del
+# servidor entero quedaba inválida —ningún otro despliegue, ninguna renovación,
+# y nginx sin arrancar tras un reinicio—. Aquí 'nginx -t' es el de verdad,
+# sobre lo que haya en el sites-enabled de las pruebas (lib.sh lo desvía a
+# $TMP), con las mismas rutas traducidas que install_vhost.
+nginx() {
+  if [[ "${1:-}" == "-t" ]]; then
+    local f
+    rm -rf "$NG/rt"; mkdir -p "$NG/rt"
+    for f in "$NGINX_ENABLED"/*; do
+      [[ -e "$f" ]] || continue
+      sed -e "s#/etc/nginx/snippets/#$NG/snippets/#g" -e "s#/var/log/nginx/#$NG/logs/#g" \
+          -e "/listen \[::\]/d" -e "s/^\( *\)listen 80;/\1listen 127.0.0.1:$HTTP_PORT;/" \
+          -e "s/^\( *\)listen 443 ssl\(.*\);/\1listen 127.0.0.1:$HTTPS_PORT ssl\2;/" \
+          "$f" > "$NG/rt/${f##*/}"
+    done
+    sed "s#include $NG/vhosts/\*.conf;#include $NG/rt/*;#" "$NG/nginx.conf" > "$NG/rt.conf"
+    command nginx -t -c "$NG/rt.conf" -p "$NG"
+    return
+  fi
+  command nginx "$@"
+}
+systemctl() { return 0; }
+run render_nginx sincert >/dev/null 2>&1; r=$?
+check "un vhost válido se acepta"   "0" "$r"
+ANTES="$(cat "$(nginx_file sincert)")"
+# Un alias con ';' escrito en la configuración a mano, o por una versión que
+# todavía no validaba los dominios: nginx no puede leer el resultado.
+load_app sincert; A_ALIASES='otra.test;roto'; save_app
+render_nginx sincert >/dev/null 2>&1; r=$?
+check "uno roto se rechaza"         "1" "$r"
+check "el vhost anterior, intacto"  "1" "$([[ "$(cat "$(nginx_file sincert)")" == "$ANTES" ]] && echo 1 || echo 0)"
+check "sigue enlazado"              "1" "$([[ -L "$(nginx_link sincert)" ]] && echo 1 || echo 0)"
+check "y nginx -t sigue pasando"    "0" "$(nginx -t >/dev/null 2>&1; echo $?)"
+check "el rechazado, a la vista"    "1" "$(grep -c 'otra.test;roto' "$(nginx_file sincert).rejected")"
+load_app sincert; A_ALIASES=''; save_app
+# Una app nueva, sin vhost anterior: no se queda ni el enlace ni el fichero.
+mkapp nueva-rota static "" "nueva.test;roto"
+A_OUTDIR="."; save_app
+render_nginx nueva-rota >/dev/null 2>&1; r=$?
+check "nueva y rota: se rechaza"    "1" "$r"
+check "sin enlace"                  "0" "$([[ -e "$(nginx_link nueva-rota)" || -L "$(nginx_link nueva-rota)" ]] && echo 1 || echo 0)"
+check "ni fichero"                  "0" "$([[ -e "$(nginx_file nueva-rota)" ]] && echo 1 || echo 0)"
+check "y nginx -t sigue pasando"    "0" "$(nginx -t >/dev/null 2>&1; echo $?)"
+unset -f nginx systemctl
 
 report
