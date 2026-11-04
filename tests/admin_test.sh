@@ -233,8 +233,11 @@ mkdir -p "$D/pegajoso"; chmod 1777 "$D/pegajoso"
 check "carpeta pegajosa: vale"   "" "$(_paths_unsafe "$ME" "$D/pegajoso")"
 ln -s "$D/bin/orbit" "$D/enlace"
 check "un enlace no cuenta"      "" "$(_paths_unsafe "$ME" "$D/enlace")"
-check "otro dueño"               "$D/bin/orbit" "$(_paths_unsafe 0 "$D/bin/orbit")"
-[[ "$ME" == 0 ]] && check "otro dueño" "$D/bin/orbit" "$(_paths_unsafe 4242 "$D/bin/orbit")"
+# Un dueño que no es el esperado. El uid tiene que ser otro que el de quien
+# ejecuta la tanda: con 0 a secas, en el contenedor Debian de CI —que corre
+# como root— el fichero ES de 0 y la prueba esperaba un aviso que no toca.
+OTRO=$(( ME == 0 ? 4242 : 0 ))
+check "otro dueño"               "$D/bin/orbit" "$(_paths_unsafe "$OTRO" "$D/bin/orbit")"
 # Lo que se mira entero: el binario y cada carpeta por encima, y todo lo que
 # root carga con '.'. notify.conf también: lo carga cada aviso, o sea cada
 # pasada del vigilante que tenga algo que contar.
