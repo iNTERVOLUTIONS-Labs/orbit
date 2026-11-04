@@ -745,7 +745,9 @@ Decláralo y ya está:
 
 Cada entrada se crea en `shared/` la primera vez y se enlaza en cada release, así que tu código las sigue viendo donde siempre (`__DIR__ . '/undelivered'` funciona igual). Si el repositorio trae algo en esa ruta —un fichero de ejemplo, una carpeta con su `.gitignore`— se usa de **semilla** la primera vez y no se vuelve a pisar: lo que edites en producción se queda.
 
-Vale para ficheros y para carpetas, y las rutas son relativas a la raíz del repo. Una ruta que se salga de ahí se descarta y se dice cuál.
+Vale para ficheros y para carpetas, y las rutas son relativas a la raíz del repo. Una ruta que se salga de ahí se descarta y se dice cuál, y también una que pase por un enlace simbólico del repositorio.
+
+**No anides entradas.** Si compartes `data`, todo lo que haya dentro ya está compartido: una entrada `data/db.sqlite` al lado sobra, y Orbit se la salta con un aviso. Antes no se la saltaba, y enlazarla **borraba `shared/data/db.sqlite`** a través del enlace de la carpeta.
 
 **Y de propina, dejan de servirse.** Lo que apunta a `shared/` es dato en tiempo de ejecución, así que Orbit lo niega en nginx: un `.eml` con un currículum dentro de `api/undelivered/` devuelve 404 en vez de descargarse. No hace falta escribir ninguna regla.
 
@@ -1099,6 +1101,8 @@ orbit env unset mi-web API_KEY        # quitar
 ```
 
 El fichero es `/srv/apps/mi-web/shared/.env`: sobrevive a los despliegues y se enlaza dentro de cada release.
+
+**`PORT`, `HOST` y `NODE_ENV` los pone Orbit, y el `.env` no los cambia.** Una app con proceso arranca siempre con `PORT` = su puerto (`orbit port`), `HOST=127.0.0.1` y `NODE_ENV=production`, aunque el `.env` diga otra cosa. Un `PORT=3000` copiado de tu portátil hacía que la app escuchara donde nadie la buscaba —health check fallido y rollback en cada despliegue— y un `HOST=0.0.0.0` la publicaba en internet sin pasar por nginx. El build sí ve lo que pongas en el `.env`; el proceso, no. `orbit env set` te avisa si tocas una de las tres. Para cambiar el puerto: `orbit port mi-web 3010`.
 
 ### Desde un script
 

@@ -156,7 +156,7 @@ check "y no el certificado" "0"       "$(grep -c '^ssl ' "$PASOS")"
 
 nueva --repo https://example.test/ssl.git --name conssl --domain ssl.test \
       --email yo@example.test --yes
-check "guarda el email" "1"           "$(grep -c 'LETSENCRYPT_EMAIL="yo@example.test"' "$CONF_FILE")"
+check "guarda el email" "1"           "$(grep -c "LETSENCRYPT_EMAIL='yo@example.test'" "$CONF_FILE")"
 check "emite certificado" "1"         "$(grep -c '^ssl conssl$' "$PASOS")"
 
 section "Sin terminal tampoco se emite el certificado, y el comando no falla"
@@ -187,6 +187,22 @@ LETSENCRYPT_EMAIL="yo@example.test"
 nueva --repo https://example.test/conmail.git --domain conmail.test
 check "con email sí emite" "1" "$(grep -c '^ssl conmail$' "$PASOS")"
 LETSENCRYPT_EMAIL="$CONF_EMAIL_ANTES"
+
+section "Un primer despliegue que falla a mitad no se da por bueno"
+# 'if ! ( cmd_deploy … )' apagaba errexit para todo el despliegue: con rsync
+# fallando al sacar la release, el despliegue seguía, 'current' apuntaba a una
+# carpeta vacía y el asistente terminaba en verde. El doble falla como fallaría
+# rsync —una orden a mitad que sale con 1— y deja rastro si se sigue adelante.
+cmd_deploy() {
+  printf 'deploy %s\n' "$1" >> "$PASOS"
+  false
+  printf 'siguio sin errexit\n' >> "$PASOS"
+}
+nueva --repo https://example.test/medio.git --domain medio.test --yes
+check "el asistente falla"       "1" "$r"
+check "el despliegue se paró"    "0" "$(grep -c 'siguio sin errexit' "$PASOS")"
+check "y dice qué ha quedado"    "1" "$([[ "$(grep -c 'orbit deploy medio' <<<"$SALIDA")" -ge 1 ]] && echo 1 || echo 0)"
+cmd_deploy()  { printf 'deploy %s\n' "$1" >> "$PASOS"; }
 
 section "Lo que se rechaza antes de clonar"
 # Todas estas tienen que fallar sin haber tocado el disco: descubrir que el

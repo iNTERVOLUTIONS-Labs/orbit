@@ -262,6 +262,25 @@ rm -f "$TMP/etc/apps/"*.conf; rm -rf "$TMP/apps/tienda" "$TMP/apps/simple"
 run cmd_restore --all --yes --deploy </dev/null >/dev/null 2>&1
 check "con --deploy despliega" "2" "$(wc -l < "$DESPLIEGUES")"
 check "en orden"          "simple" "$(head -1 "$DESPLIEGUES")"
+
+# Y si el primero falla, los demás se despliegan igual. Antes 'cmd_deploy' iba
+# en este mismo shell con un '||': su 'die' terminaba el proceso entero, así
+# que 'tienda' no llegaba a intentarse y el recuento de fallos no salía nunca.
+# El doble falla como falla el de verdad —con un 'exit' a mitad— y además
+# comprueba que corre con errexit: un 'false' tiene que pararlo.
+rm -f "$TMP/etc/apps/"*.conf; rm -rf "$TMP/apps/tienda" "$TMP/apps/simple"
+: > "$DESPLIEGUES"
+cmd_deploy() {
+  printf '%s\n' "$1" >> "$DESPLIEGUES"
+  [[ "$1" == "simple" ]] && exit 1
+  false
+  printf 'sin errexit %s\n' "$1" >> "$DESPLIEGUES"
+}
+SALIDA="$(run cmd_restore --all --yes --deploy </dev/null 2>&1)"; r=$?
+check "un despliegue fallido no para los demás" "1" "$(grep -c '^tienda$' "$DESPLIEGUES")"
+check "cada uno corre con errexit"  "0" "$(grep -c 'sin errexit' "$DESPLIEGUES")"
+check "y se cuentan los fallos"     "1" "$(grep -c '2 de 2 despliegues han fallado' <<<"$SALIDA")"
+check "y el comando falla"          "1" "$r"
 unset -f cmd_deploy
 
 section "Las preferencias vuelven, las rutas de este servidor no"
@@ -271,14 +290,38 @@ section "Las preferencias vuelven, las rutas de este servidor no"
 printf 'LETSENCRYPT_EMAIL="yo@example.test"\nKEEP_RELEASES="9"\nWATCH_MAX_TRIES="7"\nBACKUP_KEEP="30"\nAPPS_DIR="/servidor/viejo"\nDEPLOY_USER="otro"\nPHP_VER="7.4"\n' > "$TMP/conf-copia"
 KEEP_RELEASES=5
 _restore_conf "$TMP/conf-copia" >/dev/null
-check "vuelve el email"   "1"  "$(grep -c 'LETSENCRYPT_EMAIL="yo@example.test"' "$CONF_FILE")"
+check "vuelve el email"   "1"  "$(grep -c "LETSENCRYPT_EMAIL='yo@example.test'" "$CONF_FILE")"
 check "y las releases"    "9"  "$KEEP_RELEASES"
-check "y los umbrales"    "1"  "$(grep -c 'WATCH_MAX_TRIES="7"' "$CONF_FILE")"
-check "y las copias"      "1"  "$(grep -c 'BACKUP_KEEP="30"' "$CONF_FILE")"
+check "y los umbrales"    "1"  "$(grep -c "WATCH_MAX_TRIES='7'" "$CONF_FILE")"
+check "y las copias"      "1"  "$(grep -c "BACKUP_KEEP='30'" "$CONF_FILE")"
 # Lo que describe a ESTE servidor se queda como está, pase lo que pase.
 check "APPS_DIR no se toca" "0" "$(grep -c '/servidor/viejo' "$CONF_FILE")"
 check "ni el usuario"     "0"  "$(grep -c 'DEPLOY_USER="otro"' "$CONF_FILE")"
 check "ni la versión de PHP" "0" "$(grep -c 'PHP_VER="7.4"' "$CONF_FILE")"
+
+section "orbit.conf guarda valores, no código"
+# Root carga orbit.conf con 'source' en cada ejecución, temporizadores
+# incluidos. _conf_set lo escribía entre comillas dobles, así que un correo
+# como el de abajo se ejecutaba en cada 'orbit' posterior; y pasaba por sed,
+# donde un '&' o un '|' rompían la línea.
+rm -f "$TMP/pwned"
+_conf_set LETSENCRYPT_EMAIL "ops\$(touch $TMP/pwned)@x.com"
+# shellcheck disable=SC1090  # es el orbit.conf que acaba de escribir la prueba
+( set +u; . "$CONF_FILE" >/dev/null 2>&1; printf '%s' "$LETSENCRYPT_EMAIL" ) > "$TMP/leido"
+check "no se ejecuta al cargarlo"  "0" "$([[ -e "$TMP/pwned" ]] && echo 1 || echo 0)"
+check "y vuelve tal cual"          "ops\$(touch $TMP/pwned)@x.com" "$(cat "$TMP/leido")"
+_conf_set LETSENCRYPT_EMAIL "a&b|c'd@x.com"
+# shellcheck disable=SC1090  # ídem
+check "& | y ' sobreviven"         "a&b|c'd@x.com" "$( set +u; . "$CONF_FILE" >/dev/null 2>&1; printf '%s' "$LETSENCRYPT_EMAIL")"
+check "una sola línea de la clave" "1" "$(grep -c '^LETSENCRYPT_EMAIL=' "$CONF_FILE")"
+check "lo demás sigue ahí"         "1" "$(grep -c "^KEEP_RELEASES='9'" "$CONF_FILE")"
+# Y una copia escrita por esta versión —comillas simples— o por el instalador
+# —un comentario detrás— vuelve con su valor, no con las comillas dentro.
+printf '%s\n' "BACKUP_KEEP='it'\\''s'" 'QUEUE_EVERY="3"         # cada cuántos minutos' > "$TMP/conf-copia2"
+_restore_conf "$TMP/conf-copia2" >/dev/null
+check "comillas simples de la copia" "it's" "$BACKUP_KEEP"
+check "y el comentario no se cuela"  "3"    "$QUEUE_EVERY"
+_conf_set LETSENCRYPT_EMAIL "yo@example.test"
 
 section "Ver lo que hay guardado"
 SALIDA="$(run cmd_backup list 2>&1)"
