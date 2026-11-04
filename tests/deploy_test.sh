@@ -995,7 +995,9 @@ render_nginx() {
 # puente —nginx_vhost pisa la A_PORT global al aplicar el override— y daba
 # por sana una unidad que quizá ni había arrancado; lo cazó la revisión del
 # PR #9, no esta suite, porque nadie miraba a qué puerto se preguntaba.
-curl() { printf 'curl %s\n' "$*" >> "$SEQ"; return 0; }
+# El health check lee el código HTTP (-w), no sólo si curl sale bien: un doble
+# que contesta tiene que decir qué contesta.
+curl() { printf 'curl %s\n' "$*" >> "$SEQ"; [[ "$*" == *http_code* ]] && printf 200; return 0; }
 # El drenaje también se apunta: 'systemctl reload' vuelve cuando entrega la
 # señal, no cuando el cambio está aplicado, así que entre mover nginx y parar
 # el proceso al que ya no apunta tiene que haber una espera. Sin ella las
@@ -1079,7 +1081,7 @@ section "Un puente huérfano no se retira si la canónica no responde"
 # versión, y lo cazó la revisión del PR #9— paraba el único proceso
 # verificado que quedaba. Aquí la canónica calla y el resto responde.
 echo "unidad huérfana" > "$(svc_next_unit fluida)"
-curl() { [[ "$*" == *:3997/* ]] && return 1; return 0; }
+curl() { [[ "$*" == *:3997/* ]] && return 1; [[ "$*" == *http_code* ]] && printf 200; return 0; }
 : > "$SYSCTL_LOG"; : > "$SEQ"
 publish "solape tres"
 run cmd_deploy fluida >/dev/null 2>"$TMP/ov2err"; r=$?
@@ -1097,7 +1099,7 @@ section "Si nginx no recarga la vuelta, el puente se queda sirviendo"
 # doble reproduce exactamente eso: la recarga «falla» sólo al volver al puerto
 # canónico, que es el único momento en el que importa distinguir escrita de
 # aplicada.
-curl() { return 0; }
+curl() { [[ "$*" == *http_code* ]] && printf 200; return 0; }
 render_nginx() {
   nginx_vhost "$1" > "$TMP/vhost-$1.conf"
   local p; p="$(grep -o 'proxy_pass http://127.0.0.1:[0-9]*' "$TMP/vhost-$1.conf" \
@@ -1323,5 +1325,134 @@ JSON
   check "sin la obligatoria, falla"        "1" "$r"
   check "y avisa del próximo despliegue"   "1" "$(grep -c 'se parará antes del build' "$TMP/ck2")"
 fi
+
+section "orbit.json: 'release' corre antes de activar, y si falla no toca nada"
+if ! command -v jq >/dev/null; then
+  echo "  jq no está instalado: me salto release, post_deploy y cron."
+else
+  KORIGIN="$TMP/relorigin"
+  git init -q -b main "$KORIGIN"
+  git -C "$KORIGIN" config user.email orbit@test
+  git -C "$KORIGIN" config user.name Orbit
+  printf 'hola\n' > "$KORIGIN/index.html"
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "release": "printf '%s' \"$MI_VAR\" > release-hecho",
+  "post_deploy": "touch post-hecho" }
+JSON
+  git -C "$KORIGIN" add -A; git -C "$KORIGIN" commit -qm "uno"
+  {
+    A_NAME="conrel"; A_REPO="$KORIGIN"; A_BRANCH="main"; A_DOMAIN="conrel.test"
+    A_ALIASES=""; A_TYPE="static"; A_PKG="pnpm"; A_BUILD=""; A_START=""
+    A_OUTDIR="."; A_SPA="no"; A_PORT=""; A_DOCROOT=""; A_PHP=""; A_SHARED=""
+    A_ENV_FILE=""; A_ENV_SPEC=""
+    A_CREATED="2026-01-01T00:00:00+00:00"; A_LASTDEPLOY=""
+  }
+  save_app
+  KBASE="$TMP/apps/conrel"; mkdir -p "$KBASE/shared"; printf 'MI_VAR=desde-env\n' > "$KBASE/shared/.env"
+  run cmd_deploy conrel >"$TMP/kr1" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/kr1"
+  check "despliega"                         "0" "$r"
+  check "release corrió en la release nueva" "desde-env" "$(cat "$KBASE/current/release-hecho" 2>/dev/null)"
+  check "y post_deploy también"             "1" "$([[ -f "$KBASE/current/post-hecho" ]] && echo 1 || echo 0)"
+  BUENA="$(readlink "$KBASE/current")"; NK="$(releases_desc "$KBASE" | wc -l)"
+
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".", "release": "echo la migración ha fallado >&2; exit 3" }
+JSON
+  git -C "$KORIGIN" commit -qam "rompe"
+  sleep 1
+  run cmd_deploy conrel >"$TMP/kr2" 2>&1; r=$?
+  check "si release falla, el despliegue falla" "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  check "producción sigue en la buena"      "$BUENA" "$(readlink "$KBASE/current")"
+  check "sin dejar la release a medias"     "$NK" "$(releases_desc "$KBASE" | wc -l)"
+  check "y se ve por qué"                   "1" "$(grep -q 'la migración ha fallado' "$TMP/kr2" && echo 1 || echo 0)"
+
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".", "post_deploy": "exit 1" }
+JSON
+  git -C "$KORIGIN" commit -qam "post roto"
+  sleep 1
+  run cmd_deploy conrel >"$TMP/kr3" 2>&1; r=$?
+  check "si post_deploy falla, el despliegue vale" "0" "$r"
+  check "pero lo avisa"                     "1" "$(grep -c "'post_deploy' ha fallado" "$TMP/kr3")"
+
+  section "orbit.json: 'cron' acaba en temporizadores de systemd"
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "cron": [
+    { "name": "portal", "every": "5m", "command": "curl -fsS -H \"X-Token: $TOKEN\" 'https://x.test/api?a=cron&p=50%'" },
+    { "name": "informe", "schedule": "Mon *-*-* 07:00:00", "command": "php informe.php", "timeout": 120 },
+    { "name": "Mal Nombre", "every": "5m", "command": "true" },
+    { "name": "rapida", "every": "10s", "command": "true" }
+  ] }
+JSON
+  git -C "$KORIGIN" commit -qam "cron"
+  sleep 1
+  : > "$SYSCTL_LOG"
+  run cmd_deploy conrel >"$TMP/kc1" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/kc1"
+  check "despliega"                         "0" "$r"
+  PS="$TMP/systemd/orbit-conrel.cron-portal"
+  check "escribe el servicio"               "1" "$([[ -f "$PS.service" ]] && echo 1 || echo 0)"
+  check "cada 5 minutos"                    "1" "$(grep -c '^OnUnitActiveSec=300$' "$PS.timer" 2>/dev/null)"
+  check "sobre current"                     "1" "$(grep -c "^WorkingDirectory=$KBASE/current$" "$PS.service" 2>/dev/null)"
+  check "con el .env de la app"             "1" "$(grep -c "^EnvironmentFile=-$KBASE/shared/.env$" "$PS.service" 2>/dev/null)"
+  check "con \$ y % escapados para systemd" "1" "$(grep -cF 'X-Token: $$TOKEN' "$PS.service" 2>/dev/null)"
+  check "y el %"                            "1" "$(grep -cF 'p=50%%' "$PS.service" 2>/dev/null)"
+  check "la de calendario"                  "1" "$(grep -c '^OnCalendar=Mon \*-\*-\* 07:00:00$' "$TMP/systemd/orbit-conrel.cron-informe.timer" 2>/dev/null)"
+  check "con su timeout"                    "1" "$(grep -c '^TimeoutStartSec=120$' "$TMP/systemd/orbit-conrel.cron-informe.service" 2>/dev/null)"
+  check "un nombre raro se salta"           "1" "$(grep -c 'no vale como nombre' "$TMP/kc1")"
+  check "menos de un minuto no"             "0" "$(find "$TMP/systemd" -name '*cron-rapida*' | wc -l)"
+  check "y se activan"                      "1" "$(grep -c '^enable --now orbit-conrel.cron-portal.timer$' "$SYSCTL_LOG")"
+  SALIDA="$(run cmd_cron conrel 2>&1)"
+  check "orbit cron las lista"              "1" "$(grep -c 'portal' <<<"$SALIDA")"
+
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "cron": [ { "name": "portal", "every": "5m", "command": "true" } ] }
+JSON
+  git -C "$KORIGIN" commit -qam "menos cron"
+  sleep 1
+  run cmd_deploy conrel >"$TMP/kc2" 2>&1
+  check "la que se quita del repo se retira" "0" "$(find "$TMP/systemd" -name '*cron-informe*' | wc -l)"
+  check "y lo dice"                         "1" "$(grep -c 'informe.*ya no está' "$TMP/kc2")"
+  check "la otra se queda"                  "1" "$([[ -f "$PS.timer" ]] && echo 1 || echo 0)"
+  _cron_remove_all conrel
+  check "al borrar la app no queda ninguna"  "0" "$(find "$TMP/systemd" -name 'orbit-conrel.cron-*' | wc -l)"
+
+  section "orbit.json: 'health' y 'limits'"
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".", "health": { "path": "/up", "timeout": 90 },
+  "limits": { "memory": "512M", "cpu": "50%" } }
+JSON
+  git -C "$KORIGIN" commit -qam "health"
+  sleep 1
+  run cmd_deploy conrel >"$TMP/kh1" 2>&1
+  A_HEALTH_PATH=""; load_app conrel
+  check "la ruta queda apuntada"            "/up" "$A_HEALTH_PATH"
+  check "y el plazo"                        "90" "$A_HEALTH_TIMEOUT"
+  check "y los límites"                     "512M 50%" "$A_LIMIT_MEM $A_LIMIT_CPU"
+  check "MemoryMax en la unidad"            "1" "$(_systemd_unit_body orbit-conrel /x 3001 '' | grep -c '^MemoryMax=512M$')"
+  check "CPUQuota en la unidad"             "1" "$(_systemd_unit_body orbit-conrel /x 3001 '' | grep -c '^CPUQuota=50%$')"
+  _read_repo_runtime "$TMP/no-existe"
+  check "sin orbit.json, sin límites"       "" "$(_unit_limits)"
+fi
+
+section "El health check acepta un 4xx, como el de PHP"
+# 'curl -f' fallaba con cualquier 4xx: una API sin ruta en '/' no se podía
+# desplegar nunca.
+unset -f curl
+HC="$TMP/hc.code"; HP="$TMP/hc.port"; printf '404' > "$HC"
+_srv_start "$HC" "$HP"
+for _ in $(seq 50); do [[ -s "$HP" ]] && break; sleep 0.1; done
+HPORT="$(cat "$HP")"
+A_HEALTH_PATH=""
+check "un 404 en / vale"   "0" "$(_health_ok "$HPORT" /; echo $?)"
+printf '401' > "$HC"
+check "un 401 también"     "0" "$(_health_ok "$HPORT" /; echo $?)"
+printf '502' > "$HC"
+check "un 502 no"          "1" "$(_health_ok "$HPORT" /; echo $?)"
+check "nadie escuchando, no" "1" "$(_health_ok 1 /; echo $?)"
 
 report

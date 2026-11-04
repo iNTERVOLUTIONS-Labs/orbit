@@ -720,7 +720,7 @@ Si prefieres no dejarlo a la inferencia, pon un `orbit.json` en la raíz del rep
 }
 ```
 
-Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared` y `env`. `shared` y `env` se vuelven a leer en **cada despliegue**, así que añadir una ruta compartida o una variable al repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
+Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared`, `env`, `release`, `post_deploy`, `health`, `limits` y `cron`. Los seis últimos —y `shared`— se vuelven a leer en **cada despliegue**, así que cambiarlos en el repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
 
 ### `shared`: lo que tu app escribe y no puede vivir en una release
 
@@ -742,6 +742,42 @@ Cada entrada se crea en `shared/` la primera vez y se enlaza en cada release, as
 Vale para ficheros y para carpetas, y las rutas son relativas a la raíz del repo. Una ruta que se salga de ahí se descarta y se dice cuál.
 
 **Y de propina, dejan de servirse.** Lo que apunta a `shared/` es dato en tiempo de ejecución, así que Orbit lo niega en nginx: un `.eml` con un currículum dentro de `api/undelivered/` devuelve 404 en vez de descargarse. No hace falta escribir ninguna regla.
+
+### Despliegues con pasos: `release`, `post_deploy`, `health`, `limits` y `cron`
+
+```json
+{
+  "type": "laravel",
+  "release":     "php artisan migrate --force",
+  "post_deploy": "php artisan queue:restart",
+  "health":      { "path": "/up", "timeout": 90 },
+  "limits":      { "memory": "512M", "cpu": "50%" },
+  "cron": [
+    { "name": "scheduler", "every": "1m",  "command": "php artisan schedule:run" },
+    { "name": "informe",   "schedule": "Mon *-*-* 07:00:00", "command": "php artisan informe", "timeout": 600 }
+  ]
+}
+```
+
+| Clave | Cuándo | Si falla |
+|---|---|---|
+| `release` | Después del build, **antes** de activar la release nueva, con su `.env` y como el usuario de la app. Tiene `RELEASE_TIMEOUT` (600 s) | La release se borra y **producción no se toca** |
+| `post_deploy` | Con la release ya activa y sana | Se avisa; la release se queda |
+| `health` | Ruta (y plazo en segundos, 5–900) del health check, en vez de `/` | — |
+| `limits` | `MemoryMax=` y `CPUQuota=` en la unidad de la app y en sus tareas | El OOM killer elige dentro de la app, no entre todas las del servidor |
+| `cron` | Un `.service` + `.timer` de systemd por tarea, sobre `current` | Lo dice `journalctl -u orbit-<app>.cron-<nombre>` |
+
+**`release` es la fase que Heroku, Fly o Render llaman igual**: el sitio de las migraciones. Lo que no hace es deshacerlas: si la migración se aplica y la release no pasa el health check, el rollback devuelve el código anterior pero no la base de datos anterior. Escríbelas compatibles hacia atrás —añadir una columna en un despliegue y quitar la vieja en el siguiente—, como en cualquier plataforma con release phase.
+
+**El health check acepta cualquier respuesta que no sea un 5xx.** Antes un 404 o un 401 en `/` hacían rollback siempre, y una API sin ruta raíz no se podía desplegar.
+
+**`cron`** acepta `every` (`"5m"`, `"1h"`, `"1d"`; un minuto como mínimo) o `schedule` con la sintaxis de `OnCalendar` de systemd (`"*:0/15"`, `"Mon *-*-* 07:00:00"`), que se valida con `systemd-analyze calendar`. El `command` es una línea de bash con el `.env` de la app cargado. Dos pasadas nunca se solapan (un oneshot no arranca mientras sigue activo). Las tareas se sincronizan **después** de activar la release —una tarea nueva no ejecuta código que aún no sirve— y la que se quita del `orbit.json` se retira en el despliegue siguiente; `orbit remove` se las lleva todas.
+
+```bash
+orbit cron mi-app              # las tareas y cuándo corren
+orbit cron run mi-app informe  # ejecutar una ahora
+orbit cron list mi-app --json  # {"tasks":[{"name","last_run","next_run","result"}]}
+```
 
 ### `env`: las variables que tu app necesita, sin pasos manuales
 

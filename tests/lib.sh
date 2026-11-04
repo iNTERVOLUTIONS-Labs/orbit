@@ -91,6 +91,8 @@ mkdir -p "$NGINX_AVAILABLE" "$NGINX_ENABLED"
 
 mkdir -p "$TMP/systemd"
 svc_unit()           { echo "$TMP/systemd/$(svc_name "$1").service"; }
+# shellcheck disable=SC2034  # la lee el orbit cargado
+CRON_UNIT_DIR="$TMP/systemd"
 svc_next_unit()      { echo "$TMP/systemd/$(svc_next_name "$1").service"; }
 watch_unit()         { echo "$TMP/systemd/orbit-watch.timer"; }
 watch_service()      { echo "$TMP/systemd/orbit-watch.service"; }
