@@ -122,6 +122,12 @@ run cmd_clone origen MAYUS --domain m.test >/dev/null 2>&1; r=$?
 check "nombre en mayúsculas"  "1" "$r"
 run cmd_clone origen otra --opcion-rara >/dev/null 2>&1; r=$?
 check "opción desconocida"    "1" "$r"
+# El dominio acaba en el server_name del vhost: con un ';' nginx no puede leer
+# el fichero, y antes eso tumbaba la configuración del servidor entero.
+run cmd_clone origen otra --domain 'staging.origen.test;x' >"$TMP/e3" 2>&1; r=$?
+check "dominio que no vale"   "1" "$r"
+check "y lo dice"             "1" "$(grep -c 'no es un dominio válido' "$TMP/e3")"
+check "sin dejar rastro"      "0" "$( { app_exists otra || [[ -d "$TMP/apps/otra" ]]; } && echo 1 || echo 0)"
 
 # Una app de tipo 'redirect' no tiene código: clonarla no significa nada.
 mkapp viejo.test redirect "" viejo.test

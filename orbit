@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.3.9"
+ORBIT_VERSION="1.4.0"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -1253,6 +1253,49 @@ default_alias() { # default_alias <dominio>
   [[ "$d" == www.* ]] && return 0
   is_apex_domain "$d" && printf 'www.%s' "$d"
   return 0
+}
+
+# ¿Vale esto como nombre en un 'server_name'? Los dominios acaban escritos tal
+# cual en el vhost —y en la ruta del certificado—, así que lo que no es un
+# nombre de máquina no puede llegar hasta ahí. Antes no se miraba nada: un
+# 'tienda.ejemplo.com;x' escrito en 'orbit domain' producía un vhost que nginx
+# no puede leer, y como ese vhost se quedaba enlazado en sites-enabled, caía la
+# configuración del servidor **entero** — ninguna otra app se desplegaba ni se
+# renovaba ningún certificado, y nginx no arrancaba tras un reinicio.
+#
+# Etiquetas de letras, números y guiones, sin guion en los bordes, al menos dos
+# y 253 caracteres en total: la forma de RFC 1123. Un '*.' delante sólo si se
+# pide ('wild'): en un alias tiene sentido, pero el dominio principal da nombre
+# a la carpeta del certificado, y certbot no la llama '*.x.com'.
+_domain_ok() { # _domain_ok <nombre> [wild] -> 0 si vale
+  local d="$1" re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+  [[ "${2:-}" == wild && "$d" == '*.'* ]] && d="${d#\*.}"
+  (( ${#d} <= 253 )) && [[ "$d" =~ $re ]]
+}
+
+# Normaliza una lista de dominios —minúsculas, sin repetidos, separados por un
+# espacio; también se aceptan comas, que es como los escribe medio mundo— y la
+# deja en la variable que se le diga. Muere con el nombre que no vale **antes
+# de que nadie guarde nada**, que es lo único que evita una app a medio crear.
+_domain_list() { # _domain_list <variable> <lista> [uno]
+  local var="$1" d out=""
+  local -a ds=()
+  read -ra ds <<<"${2//,/ }"
+  for d in "${ds[@]}"; do
+    d="${d,,}"
+    if [[ "${3:-}" == uno ]]; then
+      _domain_ok "$d" \
+        || die "'%s' no es un dominio válido: letras, números, guiones y puntos (ejemplo.com, blog.ejemplo.com)." "$d"
+    else
+      _domain_ok "$d" wild \
+        || die "'%s' no es un dominio válido: letras, números, guiones y puntos (ejemplo.com, blog.ejemplo.com)." "$d"
+    fi
+    [[ " $out " == *" $d "* ]] || out="${out:+$out }$d"
+  done
+  if [[ "${3:-}" == uno && "$out" == *" "* ]]; then
+    die "El dominio principal es uno solo; los demás van en los dominios extra (--aliases)."
+  fi
+  printf -v "$var" '%s' "$out"
 }
 
 # Qué app se queda con un dominio, mirando también los alias; vacío si nadie.
@@ -3323,6 +3366,7 @@ _body_static() {
 cat <<EOF
     root $root;
     index index.html;
+$(_php_root_denies)
 
     location / {
 $(_maint_guard)
@@ -3338,10 +3382,15 @@ $( [[ "$A_SPA" == "yes" ]] && printf '
         expires 1y;
         access_log off;
         add_header Cache-Control "public, immutable";
+$(_sec_headers)
         try_files \$uri =404;
     }
 
-    location = /sw.js { expires off; add_header Cache-Control "no-cache"; }
+    location = /sw.js {
+        expires off;
+        add_header Cache-Control "no-cache";
+$(_sec_headers)
+    }
 $( if [[ "$A_PHP" == "yes" ]]; then _php_location; else _php_deny; fi )
 
     error_page 404 /404.html;
@@ -3360,6 +3409,7 @@ cat <<EOF
         expires 1y;
         access_log off;
         add_header Cache-Control "public, immutable";
+$(_sec_headers)
     }
 
     location /_next/image {
@@ -3403,6 +3453,32 @@ cat <<EOF
 EOF
 }
 
+# Las cabeceras de seguridad, otra vez, para las 'location' que ponen alguna
+# cabecera propia. Es la regla de nginx que más se olvida: un 'add_header'
+# dentro de una location **anula todos los heredados** del server, no se suma a
+# ellos. Así que el 'Cache-Control' de los estáticos se llevaba por delante lo
+# que pone 'orbit-security.conf' y el HSTS del 443: medido, '/' salía con las
+# tres y '/a.css' con ninguna. Un CSS sin 'nosniff' es justo lo que esa
+# cabecera existe para evitar.
+#
+# No se incluye el snippet: además de cabeceras trae 'location', que no se
+# pueden anidar dentro de otra. La lista es la misma que escribe install.sh, y
+# una prueba de nginx_test compara las dos para que no se separen.
+#
+# El HSTS va por variable porque el cuerpo del vhost es el mismo en el 80 y en
+# el 443, y sólo en el 443 se mandaba: cada server le da su valor, y un valor
+# vacío hace que nginx no emita la cabecera. Así '/' sigue exactamente igual.
+_sec_headers() {
+cat <<'EOF'
+        add_header X-Content-Type-Options    "nosniff" always;
+        add_header X-Frame-Options           "SAMEORIGIN" always;
+        add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy        "geolocation=(), microphone=(), camera=(), interest-cohort=()" always;
+        add_header Cross-Origin-Opener-Policy "same-origin-allow-popups" always;
+        add_header Strict-Transport-Security $orbit_hsts always;
+EOF
+}
+
 # El motivo se sirve aparte y la página lo incluye con SSI, de forma que
 # cambiar el mensaje no obliga a tocar la página: el diseño es del usuario y el
 # texto es un fichero de una línea.
@@ -3424,6 +3500,7 @@ cat <<EOF
         # "vuelve luego" en vez de "esta página ya no existe".
         add_header Retry-After 120 always;
         add_header Cache-Control "no-store" always;
+$(_sec_headers)
     }
     location = /maintenance.reason {
         internal;
@@ -3516,6 +3593,7 @@ cat <<EOF
         expires $exp;
         access_log off;
         add_header Cache-Control "public";
+$(_sec_headers)
     }
 EOF
 }
@@ -3653,52 +3731,159 @@ EOF
 # Aquí no hace falta subir nada aparte ni mover el código: se sirven desde donde
 # están. Se busca en la release y no en la configuración, así que una app que ya
 # existía lo tiene en el siguiente despliegue sin volver a detectar nada.
+#
+# **Qué carpetas, y por qué tan pocas.** La primera versión publicaba cualquier
+# carpeta de primer nivel con un .php a dos niveles o menos, y eso es publicar
+# el repositorio por trozos: '/scripts/migrate.php' se ejecutaba, '/config/'
+# servía 'keys.json' y, en un monorepo con la web en 'site/public' y un
+# 'contact.php' en 'site/', salía publicado '/site/' entero — el código fuente
+# de la web, desde la raíz de la release. Nada de eso lo había pedido nadie: la
+# regla adivinaba, y adivinar aquí es decidir qué ve un desconocido.
+#
+# Así que la lista es explícita. 'api' por defecto, porque es el caso real y
+# porque el nombre ya dice «esto es para que lo pida alguien»; cualquier otra
+# carpeta, sólo si el repositorio la declara en su orbit.json:
+#
+#     { "type": "static", "php_dirs": ["api", "formularios"] }
+#
+# Se lee del orbit.json de la release que se va a servir, igual que 'shared'
+# (§18.7b): una lista guardada al crear la app se quedaría atrás en cuanto el
+# repositorio la cambiara. Sin jq, sólo 'api'.
+#
+# Y aun declarada, una carpeta no se publica si es la carpeta compilada o la
+# contiene (el '/site/' de arriba), ni si ya la protege _php_writable_denies:
+# dos 'location ^~' con el mismo prefijo son un vhost que nginx rechaza, y
+# pasaba con un 'storage/' con un .php dentro.
 _php_outside_dirs() { # _php_outside_dirs <release>
-  local rel="$1" out="${A_OUTDIR:-}" d n hit
+  local rel="$1" out="${A_OUTDIR:-}" base n hit skip seen=" "
+  local -a cand=(api)
   [[ -d "$rel" ]] || return 0
   # Sólo tiene sentido cuando lo que sirve nginx es una subcarpeta: si el
   # docroot ya es la raíz del repositorio, esas carpetas se sirven solas.
   [[ -n "$out" && "$out" != "." ]] || return 0
-  for d in "$rel"/*/; do
-    [[ -d "$d" ]] || continue
-    n="${d%/}"; n="${n##*/}"
-    case "$n" in node_modules|vendor|.git|.cache|src|"$out") continue ;; esac
-    # El nombre acaba dentro del vhost: se valida, como en §18.7.
-    [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || continue
-    # -print -quit para no recorrer un árbol entero por gusto, y a variable
+  # Las carpetas se buscan donde vive la app, no en la raíz de la release: en
+  # un monorepo con la web en 'site/', su 'api/' es 'site/api/'.
+  base="$(_app_root "$rel")"
+  [[ -n "${A_APPDIR:-}" && "$A_APPDIR" != "." ]] && out="${out#"$A_APPDIR"/}"
+  # A un array y no a una cadena que se parte después: un "*" en la lista se
+  # expandiría con los ficheros del directorio actual.
+  if [[ -f "$base/orbit.json" ]] && command -v jq >/dev/null; then
+    mapfile -t -O 1 cand < <(jq -r '.php_dirs[]? | strings' "$base/orbit.json" 2>/dev/null || true)
+  fi
+  skip=" $(_php_writable_paths | tr '\n' ' ') "
+  for n in "${cand[@]}"; do
+    # El nombre acaba dentro del vhost, y además tiene que ser una carpeta de
+    # primer nivel: nada de rutas, ni de '.', ni de '..'.
+    [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+    [[ "$out" == "$n" || "$out" == "$n"/* ]] && continue
+    [[ "$skip" == *" $n "* ]] && continue
+    case "$n" in node_modules|vendor) continue ;; esac
+    [[ -d "$base/$n" && ! -L "$base/$n" ]] || continue
+    # Que tenga de verdad un endpoint: un 'api/' de funciones de TypeScript no
+    # es de php-fpm, y publicarlo sería servir su fuente. Los '_*.php' no
+    # cuentan, porque no se ejecutan (ver _php_outside_blocks). Va a variable
     # porque 'find | grep -q' bajo pipefail devuelve 141 y nunca sería cierto.
-    hit="$(find "$d" -maxdepth 2 -name '*.php' -print -quit 2>/dev/null || true)"
-    [[ -n "$hit" ]] && printf '%s\n' "$n"
+    hit="$(find "$base/$n" -maxdepth 2 \( -name vendor -o -name node_modules \) -prune \
+             -o -name '*.php' ! -name '_*' -print -quit 2>/dev/null || true)"
+    [[ -n "$hit" ]] || continue
+    [[ "$seen" == *" $n "* ]] && continue
+    seen+="$n "
+    printf '%s\n' "$n"
   done
   return 0
 }
 
-# El bloque que las publica. 'root' con la raíz de la release —y no 'alias'—
+# El bloque que las publica. 'root' con la carpeta de la app —y no 'alias'—
 # porque el prefijo de la URL y el nombre de la carpeta coinciden: así
 # SCRIPT_FILENAME sale bien sin tocar nada de fastcgi, que es donde se equivoca
 # todo el mundo.
+#
+# **Dentro, todo está prohibido salvo lo que se nombra.** Una carpeta así no es
+# una carpeta compilada: es código fuente del repositorio, tal cual, y la
+# versión anterior la servía con una lista de lo que no —seis extensiones—. Lo
+# medido con una carpeta 'api/' de verdad: '_lib.php' se ejecutaba, cualquier
+# '.php' de 'vendor/' también (el 'eval-stdin.php' de phpunit es ejecución
+# remota con un POST), y el README, el composer.lock, 'installed.json',
+# 'config.inc' con las credenciales en claro, 'deploy.sh', 'backup.sql.gz',
+# 'db.sqlite3' o el 'x.php~' de un editor salían con 200. Una lista de lo que
+# no siempre llega tarde al siguiente nombre; una de lo que sí, no.
+#
+# Así que, en este orden —entre expresiones regulares gana la primera—:
+#   · nada cuyo nombre, o el de una carpeta por el camino, empiece por '.' o
+#     '_': el '_' es la convención de «esto se incluye, no se pide»;
+#   · nada bajo vendor/, node_modules/, tests/, includes/, lib/, config/ o
+#     storage/: dependencias, pruebas y piezas internas, nunca endpoints;
+#   · se ejecuta lo que acaba en '.php', y nada más;
+#   · se sirven imágenes, hojas de estilo, JavaScript y fuentes;
+#   · el resto —y eso incluye '.txt', '.json' o '.md'— es 404.
+# Un .json que devuelva un endpoint no se ve afectado: lo produce PHP.
+#
+# Y van dos cosas que el '^~' apagaba sin decirlo. Las negaciones del snippet
+# de seguridad, porque un prefijo '^~' gana a todas las expresiones regulares
+# del server (§18.7): por eso se repiten aquí. Y el mantenimiento: un 'if' en
+# la location de fuera no corre cuando la petición acaba en una de dentro, así
+# que el formulario seguía mandando correos con la web en 503. Medido; por eso
+# la guarda está dentro de las dos que sirven algo.
 _php_outside_blocks() { # _php_outside_blocks <release>
-  local rel="$1" n
+  local rel="$1" n re base
+  base="$(_app_root "$rel")"
   while read -r n; do
     [[ -n "$n" ]] || continue
+    re="${n//./\\.}"
     cat <<EOF
 
     location ^~ /$n/ {
 $(_maint_guard)
-        root $rel;
-$(_shared_denies "$rel/$n" "$n")
-        location ~ /\\.                { return 404; }
-        location ~* \\.(?:env|log|sql|sqlite|bak|old|swp|ini|yml|yaml|toml|eml)\$ { return 404; }
+        root $base;
+        index index.php;
+$(_shared_denies "$base/$n" "$n")
+        location ~ /[._]               { return 404; }
+        location ~* ^/$re/(?:.+/)?(?:vendor|node_modules|tests?|includes?|lib|config|storage)/ { return 404; }
         location ~ \\.php\$ {
+    $(_maint_guard)
             include snippets/fastcgi-php.conf;
             fastcgi_pass unix:$(php_sock_for "$A_NAME");
             fastcgi_param HTTP_PROXY "";
             fastcgi_read_timeout 120s;
         }
-        try_files \$uri \$uri/ =404;
+        location ~* \\.(?:css|js|mjs|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf)\$ {
+    $(_maint_guard)
+            try_files \$uri =404;
+        }
+        try_files \$uri/ =404;
     }
 EOF
   done < <(_php_outside_dirs "$rel")
+}
+
+# Lo mismo para la web estática que se sirve desde la raíz del repositorio y
+# lleva PHP dentro (A_OUTDIR="."): ahí el docroot **es** el repositorio, así que
+# lo que en otra web se queda fuera del build aquí está a una URL. No se puede
+# negar todo lo que no sea un estático —es una web hecha de ficheros, y sus
+# nombres los elige su autor—, pero sí lo que nunca es una página: las
+# dependencias de composer, con su phpunit ejecutable; los composer.json y
+# .lock, que dicen qué versión vulnerable hay de cada cosa; los .md; las piezas
+# que se incluyen ('_x.php', lib/, includes/, config/, tests/), que no se
+# ejecutan solas; y las copias que deja un editor o un volcado ('x.php~',
+# 'x.php.save', 'config.inc', 'backup.sql.gz').
+#
+# Van al principio del cuerpo porque entre expresiones regulares gana la
+# primera, y la de los estáticos dejaría pasar un '/vendor/x.js'. Las dos
+# carpetas van con '^~', que gana a todas.
+_php_root_denies() {
+  [[ "$A_TYPE" == "static" && "$A_PHP" == "yes" ]] || return 0
+  [[ -z "${A_OUTDIR:-}" || "$A_OUTDIR" == "." ]] || return 0
+cat <<'EOF'
+
+    location ^~ /vendor/       { return 404; }
+    location ^~ /node_modules/ { return 404; }
+    location ~ /_[^/]*\.php$   { return 404; }
+    location ~* ^/(?:.+/)?(?:tests?|includes?|lib|config)/.*\.php$ { return 404; }
+    location ~* /composer\.(?:json|lock)$ { return 404; }
+    location ~* \.(?:md|inc|dist|sh|phar|sqlite3|db|dump)$ { return 404; }
+    location ~* \.(?:sql|sqlite3?|db|dump|tar)\.(?:gz|bz2|xz|zip)$ { return 404; }
+    location ~* \.php[^/]+$    { return 404; }
+EOF
 }
 
 # Lo que dentro de una carpeta publicada apunta a shared/ **no se sirve**, y no
@@ -3766,6 +3951,7 @@ $(_php_location)
         expires 30d;
         access_log off;
         add_header Cache-Control "public";
+$(_sec_headers)
     }
 EOF
 }
@@ -3878,10 +4064,32 @@ _warn_missing_root() {
       # PHP declarado pero ningún .php publicado: casi siempre significa que el
       # fichero está en el repositorio pero el build no lo copia a la carpeta de
       # salida. En Astro y Vite eso se arregla moviéndolo a public/.
-      if [[ "$A_PHP" == "yes" && -d "$d" ]] && ! _has_php "$d"; then
+      # Salvo que lo sirva una carpeta de fuera (_php_outside_dirs): un Astro con
+      # su 'api/' no tiene ni un .php en dist/, y está bien.
+      local publicadas="" n
+      [[ "$A_PHP" == "yes" ]] && publicadas="$(_php_outside_dirs "$root")"
+      if [[ "$A_PHP" == "yes" && -d "$d" && -z "$publicadas" ]] && ! _has_php "$d"; then
         warn "Esta app ejecuta PHP pero no hay ningún .php en %s" "$d"
         info "  El build no lo ha copiado a la carpeta de salida. En Astro y Vite,"
         info "  los ficheros de public/ sí se copian tal cual: prueba a moverlo ahí."
+      fi
+      # Una carpeta con endpoints que antes se publicaba sola y ahora no, porque
+      # sólo 'api' va por defecto: que no se quede en 404 sin decir por qué.
+      # Sólo se mira lo que tiene pinta de endpoint —un .php directamente dentro
+      # y un nombre que no es de herramientas— para no avisar de 'scripts/' en
+      # cada despliegue.
+      if [[ "$A_PHP" == "yes" && "$A_OUTDIR" != "." && -n "$A_OUTDIR" && -d "$root" ]]; then
+        local base outtop="${A_OUTDIR#"${A_APPDIR:-.}"/}"; base="$(_app_root "$root")"
+        outtop="${outtop%%/*}"
+        for n in "$base"/*/; do
+          n="${n%/}"; n="${n##*/}"
+          case "$n" in
+            vendor|node_modules|src|scripts|bin|tools|test|tests|config|lib|includes|database|migrations|"$outtop") continue ;;
+          esac
+          [[ $'\n'"$publicadas"$'\n' == *$'\n'"$n"$'\n'* ]] && continue
+          [[ -n "$(find "$base/$n" -maxdepth 1 -name '*.php' ! -name '_*' -print -quit 2>/dev/null || true)" ]] || continue
+          info "La carpeta %s/ tiene PHP y no se publica. Si son endpoints, decláralo en orbit.json:  \"php_dirs\": [\"%s\"]" "$n" "$n"
+        done
       fi
       ;;
     next)
@@ -3983,6 +4191,7 @@ $absredir
     #    funcionar nunca era la RENOVACIÓN, y el certificado caducaba en
     #    silencio a los 90 días. Lo encontró 'certbot renew --dry-run' contra un
     #    dominio de verdad, no una prueba.
+    set \$orbit_hsts "";
     set \$orbit_https_redir 1;
     if (\$http_x_forwarded_proto = "https") { set \$orbit_https_redir 0; }
     if (\$request_uri ~ ^/\.well-known/acme-challenge/) { set \$orbit_https_redir 0; }
@@ -4004,6 +4213,8 @@ $absredir
     ssl_certificate_key $(cert_key "$A_DOMAIN");
     include /etc/nginx/snippets/orbit-ssl.conf;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    # El mismo valor, para las location que repiten las cabeceras: ver _sec_headers.
+    set \$orbit_hsts "max-age=31536000; includeSubDomains";
 
     include /etc/nginx/snippets/orbit-security.conf;
     access_log $(nginx_log_access "$A_NAME") orbit;
@@ -4020,6 +4231,7 @@ server {
     $listen80v6
     server_name $names;
 $absredir
+    set \$orbit_hsts "";
 
     include /etc/nginx/snippets/orbit-acme.conf;
     include /etc/nginx/snippets/orbit-security.conf;
@@ -4034,16 +4246,35 @@ EOF
   } | sed 's/[[:space:]]*$//' | cat -s
 }
 
+# Si nginx rechaza el vhost, se deja **todo como estaba**: el fichero anterior
+# en su sitio y el enlace como lo encontró. Antes el vhost nuevo se escribía y
+# se enlazaba en sites-enabled, 'nginx -t' fallaba, y la función devolvía 1 sin
+# deshacer nada — así que la configuración del servidor **entero** se quedaba
+# inválida: ninguna otra app se podía desplegar, ningún 'certbot renew' podía
+# recargar, y tras un reinicio nginx no arrancaba y se caían todas las webs.
+# Quien llamaba no podía arreglarlo, porque el fichero bueno ya no existía.
+# Reproducido con un 'location ^~ /storage/' duplicado (§18.7) y con un dominio
+# con ';'. El rechazado se guarda al lado con '.rejected', fuera de
+# sites-enabled, para poder mirarlo.
 render_nginx() {
   local name="$1"
-  local f; f="$(nginx_file "$name")"
-  nginx_vhost "$name" > "$f"
+  local f link prev="" had_link="no"
+  f="$(nginx_file "$name")"; link="$(nginx_link "$name")"
+  if [[ -f "$f" ]]; then prev="$(mktemp)"; cp -p "$f" "$prev"; fi
+  [[ -L "$link" || -e "$link" ]] && had_link="yes"
+  # A un fichero aparte y luego en su sitio: si nginx_vhost muere a mitad, el
+  # vhost que había sigue entero. Redirigido y no capturado con $(…), porque
+  # nginx_vhost tiene que correr en esta shell —deja cargada la app—.
+  nginx_vhost "$name" > "$f.new"
+  mv -f "$f.new" "$f"
   # Aquí y no dentro de nginx_vhost: esa función escribe el vhost por stdout y
   # un warn allí acabaría dentro del fichero de configuración. Las variables
   # A_* siguen cargadas porque nginx_vhost no corre en un subshell.
   _warn_missing_root
-  ln -sfn "$f" "$(nginx_link "$name")"
+  ln -sfn "$f" "$link"
   if nginx -t >/dev/null 2>&1; then
+    [[ -n "$prev" ]] && rm -f "$prev"
+    rm -f "$f.rejected"
     # La configuración ya está escrita y es válida; si la recarga no sale, hay
     # que decirlo, no abortar: el fichero está bien y nginx sigue sirviendo lo
     # anterior. La misma trampa que 'systemctl daemon-reload'. Pero el
@@ -4067,7 +4298,17 @@ render_nginx() {
   else
     NGINX_RELOAD_OK="no"
     NGINX_WORKERS_PRE=""
-    nginx -t
+    # El '|| true' no es opcional: sale con 1 —es lo que se está contando— y
+    # bajo errexit mataría el script antes de deshacer nada.
+    nginx -t || true
+    cp -f "$f" "$f.rejected"
+    if [[ -n "$prev" ]]; then
+      mv -f "$prev" "$f"
+      [[ "$had_link" == "yes" ]] || rm -f "$link"
+    else
+      rm -f "$f" "$link"
+    fi
+    warn "He dejado la configuración de nginx como estaba. El vhost rechazado está en %s" "$f.rejected"
     return 1
   fi
 }
@@ -7497,6 +7738,9 @@ cmd_new() {
   # --aliases '' es una respuesta: significa «ninguno», y no es lo mismo que no
   # haberlo dicho, que es cuando se propone el www.
   [[ "$aliases_set" == "yes" ]] || ask aliases "Dominios extra (separados por espacio)" "$aliases_def"
+  # Aquí y no al guardar: lo siguiente ya crea carpetas y clona.
+  _domain_list domain "$domain" uno
+  _domain_list aliases "$aliases"
 
   # --- clonar para detectar
   local base cache; base="$APPS_DIR/$name"; cache="$base/cache"
@@ -7858,6 +8102,7 @@ cmd_clone() {
 
   [[ -n "$domain" ]] || ask domain "Dominio de la copia" "staging.$origin_domain"
   [[ -n "$domain" ]] || die "Necesito un dominio para la copia"
+  _domain_list domain "$domain" uno
   [[ "$domain" == "$origin_domain" ]] && die "La copia necesita un dominio distinto del original."
   local owner; owner="$(domain_owner "$domain")"
   [[ -n "$owner" ]] && die "El dominio '%s' ya lo sirve la app '%s'" "$domain" "$owner"
@@ -10517,6 +10762,9 @@ _redirect_add_domain() { # <viejo.com> <https://destino> <código>
   local from="$1" dst="$2" code="$3"
   [[ "$from" == *.* && "$from" != */* && "$from" != http* ]] \
     || die "'%s' no parece un dominio. Para una ruta hacen falta tres argumentos: orbit redirect add <app> <origen> <destino>" "$from"
+  # El dominio es aquí también el nombre de la app y del vhost, así que sin
+  # comodín: un '*' en un nombre de fichero no lo quiere nadie.
+  _domain_list from "$from" uno
   [[ "$dst" == http://* || "$dst" == https://* ]] \
     || die "El destino de un dominio debe ser una URL completa, con https:// delante."
   _redir_valid "$dst" || die "El destino no puede llevar espacios, comillas dobles ni ';'."
@@ -12491,6 +12739,9 @@ cmd_domain() {
   load_app "$name"
   ask A_DOMAIN "Dominio principal" "$A_DOMAIN"
   ask A_ALIASES "Dominios extra" "$A_ALIASES"
+  [[ -n "$A_DOMAIN" ]] || die "Necesito un dominio principal."
+  _domain_list A_DOMAIN "$A_DOMAIN" uno
+  _domain_list A_ALIASES "$A_ALIASES"
   save_app
   render_nginx "$name" && ok "Dominios actualizados"
   confirm "¿Emitir/renovar el certificado para %s?" y "$A_DOMAIN" && cmd_ssl "$name"
@@ -13973,6 +14224,11 @@ _i18n_en() {
     ["La carpeta web no existe: %s — nginx servirá 404. ¿Es correcto A_OUTDIR='%s'?"]="The web folder does not exist: %s — nginx will serve 404. Is A_OUTDIR='%s' right?"
     ["No hay index.html en %s — el fallback SPA devolverá 404. ¿Es esta app realmente estática?"]="There is no index.html in %s — the SPA fallback will return 404. Is this app really static?"
     ["Esta app ejecuta PHP pero no hay ningún .php en %s"]="This app runs PHP but there is no .php file in %s"
+    ["La carpeta %s/ tiene PHP y no se publica. Si son endpoints, decláralo en orbit.json:  \"php_dirs\": [\"%s\"]"]="The %s/ folder has PHP and is not published. If those are endpoints, declare it in orbit.json:  \"php_dirs\": [\"%s\"]"
+    ["He dejado la configuración de nginx como estaba. El vhost rechazado está en %s"]="I left the nginx configuration as it was. The rejected vhost is in %s"
+    ["'%s' no es un dominio válido: letras, números, guiones y puntos (ejemplo.com, blog.ejemplo.com)."]="'%s' is not a valid domain: letters, digits, hyphens and dots (example.com, blog.example.com)."
+    ["El dominio principal es uno solo; los demás van en los dominios extra (--aliases)."]="There is only one main domain; the others go in the extra domains (--aliases)."
+    ["Necesito un dominio principal."]="I need a main domain."
     ["  El build no lo ha copiado a la carpeta de salida. En Astro y Vite,"]="  The build did not copy it to the output folder. In Astro and Vite,"
     ["  los ficheros de public/ sí se copian tal cual: prueba a moverlo ahí."]="  files in public/ are copied verbatim: try moving it there."
     ["No encuentro %s/.next — los assets de Next darán 404. ¿Es correcto A_APPDIR='%s'?"]="I can't find %s/.next — Next's assets will 404. Is A_APPDIR='%s' right?"
