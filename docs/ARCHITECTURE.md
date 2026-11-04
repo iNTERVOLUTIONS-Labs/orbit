@@ -125,7 +125,7 @@ Inspirado en Capistrano, adaptado a un solo servidor.
 | 5 | Mover el symlink `current` (operación atómica) | — |
 | 6 | Poner la página de mantenimiento, regenerar la unidad y reiniciar | El testigo se retira con un `trap`. |
 | 7 | Health check: `curl` a `127.0.0.1:PORT` durante 40 s | **Rollback automático** al symlink anterior. |
-| 8 | Regenerar el vhost y `nginx -t` antes de recargar | Aborta con la config anterior intacta. |
+| 8 | Regenerar el vhost y `nginx -t` antes de recargar | Devuelve el vhost anterior (o quita el enlace si no lo había) y aborta. Hasta la 1.4.0 esto **no** era verdad: ver §18.7c. |
 | 9 | Podar releases antiguas, guardar el commit desplegado | — |
 | 10 | Django: comprobar migraciones pendientes y **avisar sin aplicarlas** | Solo avisa. |
 
@@ -1894,7 +1894,7 @@ Cada entrada se crea en `shared/` la primera vez —con lo que traiga el reposit
 
 Su documentación traía cuatro reglas de nginx escritas a mano para taparlo. Aquí salen solas de dónde está cada cosa, y son las mismas cuatro.
 
-Lo que **no** se automatiza, y conviene decirlo: los ficheros de inclusión (`_lib.php`, `_smtp.php`) siguen siendo alcanzables. Denegarlos exigiría dar por hecho que el guion bajo significa «no es un endpoint», y eso es una convención, no un hecho: un proyecto que llame así a un endpoint se encontraría un 404 sin explicación. Bajo Orbit se **ejecutan**, y ejecutarlos no devuelve nada —comprobado, 0 bytes—, así que la diferencia con negarlos es cosmética. En Plesk sí importaba, porque allí podían acabar servidos como fuente.
+Aquí había un párrafo que decía que los ficheros de inclusión (`_lib.php`, `_smtp.php`) se dejaban alcanzables a propósito, porque ejecutarlos «no devuelve nada» y negarlos era cosmético. Era falso por dos lados, y está corregido en §18.7c: un include con efectos al cargarse sí hace cosas al pedirlo, y la propia documentación de despliegue de ese proyecto daba por hecho un `location ^~ /api/_ { deny all; }` «que Orbit añade» — y Orbit no lo añadía.
 
 ### Lo que el `^~` apagaba sin querer, y el 404 que se comía la aplicación
 
@@ -1912,6 +1912,34 @@ La regla estaba exactamente del revés: se aplicaba donde el contenido lo pone e
 **Y los nombres heurísticos se comían rutas vivas.** `uploads`, `upload`, `files` y `media` se emitían **existieran o no** como carpeta, y el bloque no tenía `try_files`, así que nada caía al front controller. En una app cuyo tráfico entero pasa por `index.php` —Laravel— eso cierra cinco prefijos del sitio: `/media/{id}` o `/files/{uuid}/download` respondían **404 de nginx**, sin llegar nunca a la aplicación, y el síntoma no apunta a nginx por ningún lado. Ahora los nombres de la heurística sólo se emiten si la carpeta existe de verdad —`storage` sigue siendo incondicional, porque eso Orbit sí lo sabe— y el bloque termina devolviendo el control al front controller.
 
 **Un tercero, más callado: el nombre del enlace entra en el vhost.** Los nombres descubiertos salen del repositorio, y acaban interpolados dentro de `location ^~ /$p/ {`. Un enlace llamado `mal;dentro` escribe una directiva que nginx no puede leer — y como el vhost se enlaza en `sites-enabled` **antes** del `nginx -t`, a partir de ahí falla la configuración del servidor entero: no se despliega ninguna otra app ni se renueva ningún certificado. Se filtran a `[A-Za-z0-9._-]`.
+
+### 18.7c La carpeta de fuera, cerrada por defecto (1.4.0)
+
+Una auditoría del bloque de arriba encontró que dentro de `location ^~ /api/` **casi todo salía con 200**. Con un Astro de verdad —`dist/` más `api/*.php`—: `_lib.php` se ejecutaba; cualquier `.php` de `api/vendor/` también, y el `eval-stdin.php` de phpunit es ejecución remota con un POST; y se servían el `README.md`, `composer.json` y `.lock`, `vendor/composer/installed.json`, un `config.inc` con las credenciales en claro, `phpunit.xml.dist`, `deploy.sh`, `backup.sql.gz`, `db.sqlite3`, `env.local` y las copias de editor `x.php~` y `x.php.save`. El bloque negaba seis extensiones, y el `^~` apagaba de paso el snippet de seguridad entero (lo de §18.7, otra vez).
+
+Se ha dado la vuelta a la regla: **dentro, todo está prohibido salvo lo que se nombra.** Por orden —entre expresiones regulares gana la primera—:
+
+1. Nada cuyo nombre, o el de una carpeta del camino, empiece por `.` o `_`.
+2. Nada bajo `vendor/`, `node_modules/`, `tests?/`, `includes?/`, `lib/`, `config/` ni `storage/`.
+3. Se ejecuta lo que acaba en `.php`, con la guarda de mantenimiento **dentro**: un `if` en la location de fuera no corre cuando la petición acaba en una de dentro, y el formulario seguía enviando correos con la web en 503.
+4. Se sirven imágenes, CSS, JavaScript y fuentes.
+5. El resto es 404 — incluidos `.txt`, `.json` y `.md`. Un JSON que devuelve un endpoint no se ve afectado, porque lo produce PHP. `/api/` lleva a `api/index.php`.
+
+**Y qué carpetas se publican.** La regla anterior publicaba cualquier carpeta de primer nivel con un `.php` a dos niveles o menos: `/scripts/migrate.php` se ejecutaba, `/config/` servía `keys.json`, y en un monorepo con la web en `site/public` y un `contact.php` en `site/` se publicaba `/site/` **desde la raíz de la release**, o sea el código fuente de la web. Ahora sólo `api` por defecto y lo que el repositorio declare:
+
+```json
+{ "type": "static", "php_dirs": ["api", "formularios"] }
+```
+
+Se lee del `orbit.json` de la release en cada vhost, como `shared`. Las carpetas se buscan en la carpeta de la app (`site/api` en ese monorepo, no `/site/`), nunca se publica la que es o contiene la carpeta compilada, y hace falta un `.php` que no empiece por `_`: un `api/` de funciones de TypeScript no es de php-fpm. Si una carpeta con pinta de endpoints se queda fuera, el despliegue lo dice con la línea exacta que hay que añadir.
+
+**La web estática servida desde la raíz** (`A_OUTDIR="."` con PHP) tiene el mismo problema sin carpeta que cerrar: el docroot es el repositorio. Ahí no se puede negar todo lo que no sea estático —sus nombres los elige su autor—, pero sí lo que nunca es una página: `vendor/` y `node_modules/` enteros, `composer.json` y `.lock`, los `.md`, los `_*.php`, los `.php` bajo `lib/`, `includes/`, `config/` y `tests/`, y las copias y volcados (`x.php~`, `config.inc`, `*.sql.gz`).
+
+**El `nginx -t` que no deshacía nada.** Este mismo bloque, con un `storage/` que llevaba un `.php` dentro, emitía dos `location ^~ /storage/`: el de §18.7 y el de la carpeta publicada. nginx lo rechaza — y `render_nginx` ya había escrito el vhost y lo había enlazado en `sites-enabled`, así que al devolver 1 dejaba **la configuración del servidor entero** inválida: ningún otro despliegue, ningún `certbot renew`, y nginx sin arrancar tras un reinicio. La tabla del §4 decía «aborta con la config anterior intacta» y no era verdad. Ahora se guarda el vhost anterior y se devuelve si `nginx -t` falla (o se quita el enlace si no lo había); el rechazado queda al lado como `.rejected`. Y el duplicado ya no se genera: lo que protege §18.7 no se publica dos veces.
+
+**Los dominios no se validaban.** `orbit domain`, `orbit new --domain/--aliases`, `orbit clone` y `orbit redirect add <dominio>` escribían el valor tal cual en `server_name` y en la ruta del certificado: `tienda.ejemplo.com;x` era un vhost ilegible y, con lo anterior, el servidor entero caído. Ahora cada nombre se comprueba contra la forma de RFC 1123 —un `*.` delante sólo en los alias—, se pasa a minúsculas y se rechaza **antes de guardar nada**.
+
+**Y las cabeceras de seguridad se caían en los estáticos.** Un `add_header` dentro de una location anula todos los heredados del server, así que el `Cache-Control` de los CSS y JS se llevaba `nosniff`, `X-Frame-Options` y el HSTS: `/` salía con las tres y `/a.css` con ninguna. Las location que ponen una cabecera propia repiten ahora la lista de `orbit-security.conf` (no se puede incluir el snippet, porque trae `location`). El HSTS va por la variable `$orbit_hsts`, que el 443 rellena y el 80 deja vacía —nginx no emite una cabecera con valor vacío—, así que `/` queda exactamente como estaba. Una prueba compara la lista con la de `install.sh` para que no se separen.
 
 ## 18.8 Deno y Bun: el stack que no se detecta se publica como código fuente
 
