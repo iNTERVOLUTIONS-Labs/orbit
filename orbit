@@ -299,7 +299,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.2"
+ORBIT_VERSION="1.4.3"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -326,6 +326,10 @@ BUILD_UNFREEZE="no"                       # sólo durante un reintento; nunca se
 # cambiar y el symlink final apuntando a la release de quien acabara último.
 DEPLOY_LOCK_DIR="${DEPLOY_LOCK_DIR:-/var/lib/orbit/locks}"
 DEPLOY_LOCK_WAIT="${DEPLOY_LOCK_WAIT:-900}"  # segundos que se espera al despliegue en curso
+# Con 'orbit autodeploy checks on', cuánto se espera a que aparezca alguna
+# comprobación en un commit que todavía no tiene ninguna, antes de concluir que
+# el repositorio no tiene CI. Ver _ci_gate.
+CHECKS_GRACE="${CHECKS_GRACE:-300}"
 # "no" deja de mirar el .env.example del repo al desplegar (ver _provision_env).
 # Un repo concreto lo apaga con "env": {"example": false} en su orbit.json.
 ENV_EXAMPLE="${ENV_EXAMPLE:-yes}"
@@ -1394,6 +1398,7 @@ ORBIT_APP_FIELDS=(
   A_START A_OUTDIR A_SPA A_PORT A_USER A_DOCROOT A_PYAPP A_APPDIR A_PYMGR A_PYFW
   A_MIGRATE A_STATIC_URL A_STATIC_ROOT A_MEDIA_URL A_MEDIA_ROOT
   A_REDIRECT A_REDIRECT_CODE A_AUTODEPLOY A_AUTOFAIL A_MAINT_AUTO A_QUEUE
+  A_CHECKS A_WATCH_SEEN A_CI_SEEN
   A_PHP A_PNPM_ALLOW A_NODE_HEAP A_SHARED A_ENV_FILE A_ENV_SPEC
   A_HEALTH_PATH A_HEALTH_TIMEOUT A_LIMIT_MEM A_LIMIT_CPU
   A_CREATED A_LASTDEPLOY
@@ -1668,6 +1673,21 @@ _app_state_json() { # _app_state_json [--cert-days]
   printf ',"served":%s'      "$served"
   printf ',"autodeploy":';  _j_bool "$A_AUTODEPLOY"
   printf ',"queue":';       _j_bool "$A_QUEUE"
+  # Añadidos en la 1.4.3. 'lock' es null sin congelación, no un objeto vacío:
+  # lo que no existe es null (§13.1). Dentro, cada campo que no se sepa —un
+  # 'touch' a mano no dice quién— también.
+  printf ',"checks":';      _j_bool "$A_CHECKS"
+  if _lock_read "$A_NAME"; then
+    printf ',"locked":true,"lock":{"at":'
+    if [[ -n "$LOCK_AT" ]]; then _j_str "$LOCK_AT"; else printf 'null'; fi
+    printf ',"by":'
+    if [[ -n "$LOCK_BY" ]]; then _j_str "$LOCK_BY"; else printf 'null'; fi
+    printf ',"reason":'
+    if [[ -n "$LOCK_REASON" ]]; then _j_str "$LOCK_REASON"; else printf 'null'; fi
+    printf '}'
+  else
+    printf ',"locked":false,"lock":null'
+  fi
   printf ',"releases":%s'   "${#rel[@]}"
   printf ',"last_deploy":'
   if [[ -n "$A_LASTDEPLOY" ]]; then _j_str "${A_LASTDEPLOY%% *}"; else printf 'null'; fi
@@ -5356,6 +5376,7 @@ _metrics_record() {
   # Sin app cargada no hay nada que apuntar: pasa cuando 'deploy' aborta al
   # analizar los argumentos, antes de saber de qué app hablamos.
   [[ -n "${A_NAME:-}" ]] || return 0
+  [[ "$DEP_REFUSED" != "yes" ]] || return 0
   local dir; dir="$(dirname "$METRICS_FILE")"
   install -d -m 0755 "$dir" 2>/dev/null || return 0
   local marcas=""
@@ -6037,9 +6058,17 @@ _deploy_env_add() { # _deploy_env_add <CLAVE=valor> <origen>
   DEP_ENV_SET+=("$key=$val")
 }
 
+# El commit que 'deploy --all' ha dejado pasar por la puerta de la CI. Lo pone
+# el lote dentro del subshell de cada despliegue y nadie más: vacío, cmd_deploy
+# despliega la punta de la rama como siempre.
+DALL_PIN=""
+# Un despliegue que se niega antes de empezar —la app está congelada— no es un
+# despliegue fallido, y no se apunta en las métricas como si lo fuera.
+DEP_REFUSED="no"
+
 cmd_deploy() {
   need_root deploy
-  local name="" ref="" pick="no" a
+  local name="" ref="" pick="no" force="no" a
   DEP_ENV_SET=()
   while [[ $# -gt 0 ]]; do
     a="$1"
@@ -6063,6 +6092,7 @@ cmd_deploy() {
         [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
         ref="$2"; [[ "$a" == "--pr" ]] && ref="pr:$2"; shift 2 ;;
       --pick|--elegir) pick="yes"; shift ;;
+      --force|--forzar) force="yes"; shift ;;
       --progress)
         [[ "$JSON" == "yes" ]] || die "orbit deploy: --progress sólo tiene sentido con --json."
         PROGRESS="yes"; shift ;;
@@ -6080,6 +6110,7 @@ cmd_deploy() {
        --env-file F  poner las de un fichero CLAVE=valor antes del build\n\
        --ref <x>     desplegar un commit o rama concretos\n\
        --pr <n>      desplegar un pull request sin fusionarlo\n\
+       --force       desplegar aunque la app esté congelada ('orbit lock')\n\
        --json        el resultado como un objeto, por stdout (también con --all)\n\
        --progress    con --json, un suceso por línea en stderr\n")"
         return 0 ;;
@@ -6110,6 +6141,20 @@ cmd_deploy() {
 
   [[ -n "$name" ]] || name="$(pick_app 'App a desplegar')" || return 0
   load_app "$name"
+  DEP_REFUSED="no"
+  # Antes del cerrojo: una app congelada no tiene por qué esperar a que acabe
+  # otro despliegue para decir que no.
+  if _lock_read "$name"; then
+    if [[ "$force" == "yes" ]]; then
+      warn "«%s» está %s. Despliego igualmente porque has puesto --force; sigue congelada." "$name" "$(_lock_desc)"
+    else
+      DEP_REFUSED="yes"; DEP_ERR="$(_lock_desc)"
+      err "«%s» está %s." "$name" "$(_lock_desc)"
+      info "Para desplegar igualmente:  orbit deploy %s --force" "$name"
+      info "Para levantar la congelación:  orbit unlock %s" "$name"
+      die "Nada tocado: la versión anterior sigue en producción."
+    fi
+  fi
   _app_lock "$name" || { DEP_ERR="$(t "otro despliegue de la app sigue en curso")"
     die "Otro despliegue de '%s' sigue en curso tras %s s. No he tocado nada." "$name" "$DEPLOY_LOCK_WAIT"; }
   _rel_partial_sweep "$name"
@@ -6185,9 +6230,36 @@ cmd_deploy() {
       || { DEP_ERR="$(t "no pude clonar el repositorio")"
            die "Clone fallido. Revisa la URL o ejecuta 'orbit github'."; }
   fi
+  # El commit que 'deploy --all' ha comprobado con la CI, si la rama ha avanzado
+  # entre la pregunta y este fetch: lo nuevo no ha pasado por la puerta, y se
+  # desplegará en la pasada siguiente, cuando le toque.
+  if [[ -n "$DALL_PIN" && -z "$ref" ]] && \
+     [[ "$(as_deploy "git -C '$cache' rev-parse HEAD")" != "$DALL_PIN" ]]; then
+    as_deploy "git -C '$cache' cat-file -e '${DALL_PIN}^{commit}'" 2>/dev/null || {
+      DEP_ERR="$(t "el commit comprobado por la CI ya no está en la rama")"
+      die "La rama ha cambiado mientras comprobaba la CI y el commit %s ya no está. Lo intento en la próxima pasada." "${DALL_PIN:0:7}"; }
+    as_deploy "cd '$cache' && git reset --hard '$DALL_PIN' -q && git clean -fdq -e node_modules"
+    info "La rama ha avanzado mientras comprobaba la CI: despliego %s, que es el que ha pasado." "${DALL_PIN:0:7}"
+  fi
   local sha; sha="$(as_deploy "git -C '$cache' rev-parse --short HEAD")"
   local msg; msg="$(as_deploy "git -C '$cache' log -1 --pretty=%s" | head -c 60)"
   info "commit {b}%s{r} · %s" "$sha" "$msg"
+  # A mano la CI no manda —lo has pedido tú—, pero si la app la espera para
+  # desplegarse sola, desplegar un commit rojo sin decirlo sería esconder lo
+  # que la puerta existe para enseñar. Son dos llamadas a la API, que en un
+  # despliegue no se notan; y sólo en las apps que lo han pedido. Desde
+  # 'deploy --all' no se repite: la puerta ya ha preguntado.
+  if [[ "$A_CHECKS" == "yes" && -z "$DALL_PIN" ]]; then
+    local ci_slug=""
+    if ci_slug="$(_gh_slug "$A_REPO")"; then
+      _ci_state "$ci_slug" "$(as_deploy "git -C '$cache' rev-parse HEAD")"
+      case "$CI_STATE" in
+        failure) warn "La CI de este commit ha fallado (%s). Lo despliego porque lo has pedido tú." "$CI_WHY" ;;
+        pending) info "La CI de este commit todavía no ha terminado (%s)." "$CI_WHY" ;;
+        error)   info "No he podido preguntar a GitHub por la CI de este commit: %s" "$CI_WHY" ;;
+      esac
+    fi
+  fi
   DEP_SHA="$sha"; DEP_SUBJ="$msg"
   _dprog code ok
 
@@ -6862,6 +6934,382 @@ deployable_apps() {
   return 0
 }
 
+# ═══════════════════════════════════════ puertas del despliegue ═══════════
+# Tres razones para que una pasada de 'deploy --all' no despliegue una app que
+# sí tiene commits nuevos, y las tres son decisiones de alguien y no fallos:
+#
+#   · está congelada        orbit lock <app>                    (Capistrano/Deployer: deploy:lock)
+#   · el cambio no le toca  "watch": [...] en el orbit.json     (Vercel: ignored build step)
+#   · la CI no está verde   orbit autodeploy checks on <app>    (Render/Railway: wait for CI)
+#
+# Las tres viven fuera de cmd_deploy, en la pasada, porque las tres responden a
+# «¿le toca desplegarse sola?», y un 'orbit deploy <app>' a mano no hace esa
+# pregunta: lo has pedido tú. La única que también mira el despliegue a mano es
+# la congelación, que existe justo para eso, y se salta con --force.
+
+# ── congelar ─────────────────────────────────────────────────────────────
+# Un fichero al lado de la configuración y no unos campos dentro de ella, por
+# tres motivos que salen de cómo se usa:
+#
+#   · **Una congelación se pone mientras algo pasa**, y lo que más pasa es un
+#     despliegue largo. cmd_deploy carga la configuración al empezar y la
+#     guarda entera al terminar (save_app): unos campos A_LOCK_* puestos a
+#     mitad de un build de tres minutos se habrían borrado al acabar, sin
+#     ruido. Un fichero aparte no lo toca nadie más que lock y unlock.
+#   · **'orbit clone' no la hereda sin tener que acordarse**: copia la
+#     configuración, y esto no está en ella.
+#   · **Las copias no la llevan.** _backup_one guarda app.conf y la global se
+#     lleva orbit.conf y notify.conf: esto no entra. Es a propósito. Una
+#     congelación es una decisión sobre la producción de ESTE servidor en
+#     ESTE momento («no se toca hasta el lunes»), y una copia envejece:
+#     restaurarla semanas después en otra máquina traería una congelación que
+#     nadie recuerda, bloqueando el 'restore --all --deploy' que la saca del
+#     pozo. Restaurar sobre una app que sigue aquí no borra la suya: no se toca.
+#
+# Se lee con 'cat' (principio 5) y nunca con 'source': son líneas clave=valor
+# que se recorren en bash. Lo que manda es que el fichero exista —un 'touch' a
+# mano también congela—; el contenido es para contar quién y por qué.
+app_lockfile() { echo "$APPS_CONF/$1.lock"; }
+
+LOCK_AT=""; LOCK_BY=""; LOCK_REASON=""
+# Sin forks: lo llama _app_state_json una vez por app en 'list --json', que es
+# el contrato del que vive Orbit Desktop (§13.6d). Por eso compone la ruta a
+# mano en vez de capturar app_lockfile.
+_lock_read() { # _lock_read <app>  -> 0 si está congelada; deja LOCK_AT, LOCK_BY, LOCK_REASON
+  local f="$APPS_CONF/$1.lock" l
+  LOCK_AT=""; LOCK_BY=""; LOCK_REASON=""
+  [[ -f "$f" ]] || return 1
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    case "$l" in
+      at=*)     LOCK_AT="${l#at=}" ;;
+      by=*)     LOCK_BY="${l#by=}" ;;
+      reason=*) LOCK_REASON="${l#reason=}" ;;
+    esac
+  done < "$f"
+  return 0
+}
+
+# Quién, para la línea «congelada por X». Orbit se eleva solo con sudo, así que
+# root a secas diría siempre «root»; quien lo pidió está en SUDO_USER.
+_lock_who() {
+  local w="${SUDO_USER:-}"
+  [[ -n "$w" && "$w" != "root" ]] || w="$(id -un 2>/dev/null || echo root)"
+  printf '%s' "${w//[^A-Za-z0-9._-]/}"
+}
+
+_lock_write() { # _lock_write <app> <motivo>
+  local f; f="$(app_lockfile "$1")"
+  install -d -m 0755 "$APPS_CONF"
+  # Temporal y mv: un lector a mitad de la escritura vería un fichero que
+  # existe —o sea, congelada— pero sin quién ni por qué.
+  {
+    printf '# %s\n' "$(t "Despliegues congelados. Se levanta con:  orbit unlock %s" "$1")"
+    printf 'at=%s\nby=%s\nreason=%s\n' "$(date -Iseconds)" "$(_lock_who)" "$2"
+  } > "$f.tmp"
+  chmod 0644 "$f.tmp"
+  mv -f "$f.tmp" "$f"
+}
+
+# La frase que acompaña a una congelación donde se enseña. Con la app ya leída
+# por _lock_read.
+_lock_desc() {
+  local cuando="${LOCK_AT:+$(_hace "$LOCK_AT")}"
+  if [[ -n "$LOCK_REASON" ]]; then
+    t "congelada desde %s por %s: %s" "${cuando:-?}" "${LOCK_BY:-?}" "$LOCK_REASON"
+  else
+    t "congelada desde %s por %s" "${cuando:-?}" "${LOCK_BY:-?}"
+  fi
+}
+
+cmd_lock() { # orbit lock <app> [-m "motivo"]
+  need_root lock
+  local name="" reason="" a
+  while (( $# )); do
+    a="$1"
+    case "$a" in
+      -m|--message|--motivo|--reason)
+        [[ $# -ge 2 ]] || die "orbit lock: «%s» necesita un valor." "$a"
+        reason="$2"; shift 2 ;;
+      -h|--help|help|ayuda)
+        printf '%b' "$(t "  uso: orbit lock <app> [-m \"motivo\"]\n       orbit unlock <app>\n\
+       Congela los despliegues de la app: el autodespliegue y 'deploy --all'\n\
+       la saltan, y 'orbit deploy' a mano necesita --force. El rollback sigue\n\
+       permitido: es la salida de emergencia.\n")"
+        return 0 ;;
+      -*) die "orbit lock: no entiendo «%s»." "$a" ;;
+      *)
+        if [[ -z "$name" ]]; then name="$a"
+        elif [[ -z "$reason" ]]; then reason="$a"
+        else die "orbit lock: sobra «%s»." "$a"; fi
+        shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || name="$(pick_app 'App a congelar')" || return 0
+  load_app "$name"
+  [[ "$A_TYPE" == "redirect" ]] && die "'%s' es una redirección: no tiene código que desplegar." "$A_NAME"
+  # Una línea y con tope: acaba en un fichero que se lee con 'cat', en un
+  # aviso y dentro del contrato JSON.
+  reason="${reason//[$'\r\n\t']/ }"; reason="${reason:0:200}"
+  local habia="no"; _lock_read "$name" && habia="yes"
+  _lock_write "$name" "$reason"
+  if [[ "$habia" == "yes" ]]; then
+    ok "«%s» ya estaba congelada; queda con el motivo nuevo" "$name"
+  else
+    ok "«%s» congelada: no se desplegará hasta 'orbit unlock %s'" "$name" "$name"
+  fi
+  info "El autodespliegue y 'deploy --all' la saltan; a mano hace falta 'orbit deploy %s --force'." "$name"
+  info "El rollback sigue permitido: es la salida de emergencia."
+  logline "lock $name $reason"
+}
+
+cmd_unlock() { # orbit unlock <app>
+  need_root unlock
+  local name="${1:-}"
+  case "$name" in
+    -h|--help|help|ayuda) printf "%s\n" "$(t "  uso: orbit unlock <app>")"; return 0 ;;
+    -*) die "orbit unlock: no entiendo «%s»." "$name" ;;
+  esac
+  [[ $# -le 1 ]] || die "orbit unlock: sobra «%s»." "$2"
+  [[ -n "$name" ]] || name="$(pick_app 'App a descongelar')" || return 0
+  load_app "$name"
+  if ! _lock_read "$name"; then
+    info "«%s» no estaba congelada." "$name"
+    return 0
+  fi
+  rm -f "$(app_lockfile "$name")"
+  ok "«%s» descongelada: vuelve a desplegarse con normalidad" "$name"
+  [[ "$A_AUTODEPLOY" == "yes" ]] && \
+    info "Si su rama ha avanzado, el autodespliegue la desplegará en la próxima pasada."
+  logline "unlock $name"
+}
+
+# ── rutas vigiladas ──────────────────────────────────────────────────────
+# En un monorepo, un commit en 'frontend/' no tiene por qué redesplegar la API
+# de 'backend/'. El repositorio lo declara en su orbit.json:
+#
+#   { "type": "node", "appdir": "backend", "watch": ["backend/", "packages/shared/"] }
+#
+# y la pasada del autodespliegue (y 'deploy --all --if-changed') sólo despliega
+# si entre el commit desplegado y el nuevo cambia algo dentro de esas rutas.
+# 'orbit deploy <app>' a mano despliega siempre: lo has pedido tú.
+#
+# Las reglas, todas hacia el mismo lado —**ante la duda, desplegar**—, porque
+# el fallo de esta función no se ve: una web que se queda con la versión vieja
+# sin que nada lo diga es exactamente el silencio de §4.
+#
+#   · Las rutas son **siempre relativas a la raíz del repositorio**, también
+#     en el orbit.json de una subcarpeta. Al revés que 'shared', que se
+#     recoloca: aquéllas son rutas de la release donde escribe la app, éstas
+#     son rutas de un 'git diff', que habla en las del repositorio. Y lo que
+#     más se vigila en un monorepo —un 'packages/' hermano de la app— no se
+#     podría nombrar desde la subcarpeta sin un '..', que no se admite.
+#   · Se vigilan siempre, aunque no se nombren, los orbit.json y la carpeta de
+#     la app (A_APPDIR). Olvidarse de poner la propia carpeta es el error
+#     evidente, y su síntoma sería no desplegar nunca.
+#   · Sin "watch", o con una lista vacía, no se filtra nada. Con una ruta que
+#     no vale (absoluta, con '..', que no es una cadena), tampoco: se avisa y
+#     se despliega. Ignorar sólo la mala estrecharía en silencio lo vigilado.
+#   · Si no se puede saber qué ha cambiado —no hay caché, el commit desplegado
+#     ya no está en ella tras un force-push, falla el fetch, hay un despliegue
+#     en curso—, se despliega.
+#   · La lista se lee del commit **nuevo**: es el repositorio el que manda, y
+#     un PR que añade una ruta vigilada vale desde ese mismo commit.
+#
+# Lo que se compara es el árbol desplegado contra el nuevo ('git diff A B'), no
+# los mensajes ni la lista de commits: es lo que de verdad cambiaría en
+# producción, y sale bien también cuando la rama se ha reescrito.
+WATCH_NOTE=""
+
+_watch_match() { # _watch_match <fichero> <ruta…>  -> 0 si alguna ruta lo cubre
+  local f="$1" p; shift
+  for p in "$@"; do
+    [[ "$f" == "$p" || "$f" == "$p/"* ]] && return 0
+  done
+  return 1
+}
+
+# Las rutas de "watch" de un orbit.json (su contenido por stdin), una por línea
+# y ya normalizadas. Una primera línea '+' dice que la clave existe, y un '!'
+# marca una entrada que no vale; así una sola llamada a jq basta para las tres
+# respuestas («no hay», «hay estas», «hay una mala»).
+_watch_decl() {
+  jq -r 'if type == "object" and has("watch") then "+",
+           (if (.watch | type) == "array"
+            then .watch[] | (if type == "string" then gsub("[\r\n]"; "!") else "!" end)
+            else "!" end)
+         else empty end' 2>/dev/null || true
+}
+
+_watch_diff() { # _watch_diff <caché> <sha nuevo> <sha desplegado>  -> ficheros, separados por NUL
+  local cache="$1" nuevo="$2" viejo="$3" fd
+  # Con el cerrojo del despliegue y sin esperar: la caché es la misma que usa
+  # 'orbit deploy', y un fetch cruzado con su 'reset --hard' puede dejarle una
+  # referencia bloqueada. Si hay un despliegue en curso, que decida él.
+  install -d -m 0755 "$DEPLOY_LOCK_DIR" 2>/dev/null || return 1
+  exec {fd}>"$DEPLOY_LOCK_DIR/$A_NAME.lock" || return 1
+  flock -n "$fd" || return 1
+  # --no-write-fetch-head: el despliegue con --ref lee FETCH_HEAD justo
+  # después de su propio fetch, y éste no puede pisárselo.
+  as_deploy "git -C '$cache' fetch -q --no-write-fetch-head --depth 50 origin '$A_BRANCH'" >/dev/null 2>&1 || return 1
+  as_deploy "git -C '$cache' cat-file -e '$nuevo^{commit}' && git -C '$cache' cat-file -e '$viejo^{commit}'" >/dev/null 2>&1 || return 1
+  as_deploy "git -C '$cache' diff --name-only --no-renames -z '$viejo' '$nuevo'" 2>/dev/null || return 1
+}
+
+# -> 0 si hay que desplegar, 1 si los cambios no tocan nada vigilado. Con la app
+# cargada. Si concluye que no, lo apunta en A_WATCH_SEEN —el par «nuevo
+# desplegado»— para no repetir el fetch cada minuto mientras el remoto siga ahí.
+# El par y no sólo el nuevo: si alguien despliega otra cosa a mano, la
+# comparación de antes ya no vale, y con el par deja de coincidir sola.
+_watch_gate() { # _watch_gate <sha nuevo>
+  local new="$1" dep cache
+  WATCH_NOTE=""
+  dep="$(_deployed_sha)"
+  cache="$APPS_DIR/$A_NAME/cache"
+  [[ "$dep" =~ ^[0-9a-f]{4,40}$ && "$new" =~ ^[0-9a-f]{40}$ && -d "$cache/.git" ]] || return 0
+  command -v jq >/dev/null || return 0
+  if [[ "$A_WATCH_SEEN" == "$new $dep" ]]; then WATCH_NOTE="seen"; return 1; fi
+
+  local files="" rc=0
+  # La forma entera de §10: se llama desde un '||' del bucle, donde errexit va
+  # apagado, y cada paso de _watch_diff ya devuelve su fallo a mano.
+  files="$(_watch_diff "$cache" "$new" "$dep" | tr '\0' '\n')" || rc=$?
+  (( rc == 0 )) || { WATCH_NOTE="unknown"; return 0; }
+
+  local -a paths=()
+  local hay="no" mala="no" l desc
+  for desc in orbit.json ${A_APPDIR:+"$A_APPDIR/orbit.json"}; do
+    [[ "$desc" == "./orbit.json" ]] && continue
+    while IFS= read -r l; do
+      [[ "$l" == "+" ]] && { hay="yes"; continue; }
+      l="${l#./}"; while [[ "$l" == */ ]]; do l="${l%/}"; done
+      [[ -n "$l" ]] || l="."
+      if _safe_relpath "$l"; then paths+=("$l"); else mala="yes"; fi
+    done < <(as_deploy "git -C '$cache' show '$new:$desc'" 2>/dev/null | _watch_decl)
+  done
+  [[ "$hay" == "yes" ]] || return 0
+  if [[ "$mala" == "yes" ]]; then
+    warn "orbit.json de «%s»: 'watch' trae rutas que no son del repositorio; despliego sin filtrar." "$A_NAME"
+    return 0
+  fi
+  (( ${#paths[@]} )) || return 0
+  local p
+  for p in "${paths[@]}"; do [[ "$p" == "." ]] && return 0; done
+  paths+=(orbit.json)
+  [[ -n "$A_APPDIR" && "$A_APPDIR" != "." ]] && paths+=("$A_APPDIR")
+
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if _watch_match "$f" "${paths[@]}"; then WATCH_NOTE="$f"; return 0; fi
+  done <<<"$files"
+  A_WATCH_SEEN="$new $dep"; save_app
+  return 1
+}
+
+# ── esperar a la CI ──────────────────────────────────────────────────────
+# Con 'orbit autodeploy checks on <app>', la pasada sólo despliega un commit
+# cuyas comprobaciones de GitHub —check runs de Actions y de cualquier app, y
+# los commit statuses de los CI de fuera— han terminado todas bien. Se pregunta
+# con el gh del usuario de despliegue, que es la sesión de este servidor.
+#
+#   success   todas en verde (o neutras, o saltadas)        desplegar
+#   pending   alguna sin terminar                           esperar a la pasada siguiente
+#   failure   alguna ha fallado                             no desplegar; avisar una vez
+#   none      el commit no tiene ninguna                    desplegar, pasada la gracia
+#   error     no he podido preguntar                        no desplegar; avisar; la pasada falla
+#
+# «No he podido preguntar» no despliega: es una puerta que alguien pidió, y
+# abrirla porque gh ha perdido la sesión sería exactamente lo contrario de lo
+# que pidió. Y hace fallar la pasada, por lo mismo que un remoto mudo (§4): si
+# no, el autodespliegue se pararía en verde y sin que nadie se enterase.
+#
+# «Ninguna» sí despliega, pero no a la primera. GitHub tarda unos segundos en
+# registrar las comprobaciones de un push, y una pasada que llegue en ese hueco
+# vería un commit sin CI: desplegaría justo lo que la puerta existe para
+# retener. Se apunta cuándo se vio el commit sin comprobaciones (A_CI_SEEN) y
+# hasta CHECKS_GRACE segundos después cuenta como pendiente. Un repositorio sin
+# CI de verdad se despliega con ese retraso, y se dice.
+CI_STATE=""; CI_WHY=""
+
+_gh_slug() { # _gh_slug <url del repo>  -> dueño/repo, o 1 si no es de GitHub
+  local u="${1%/}"; u="${u%.git}"
+  [[ "$u" =~ ^(https?://([^@/]+@)?github\.com/|ssh://([^@/]+@)?github\.com/|[A-Za-z0-9._-]+@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$ ]] || return 1
+  printf '%s/%s' "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}"
+}
+
+# Una llamada a la API como deploy. --paginate porque un monorepo con matrices
+# pasa de las 100 comprobaciones por commit; y con tope de tiempo, porque esto
+# corre en un temporizador y una API colgada no puede colgar la pasada entera.
+_gh_api() { # _gh_api <ruta> <filtro jq>
+  as_deploy "timeout 20 gh api --paginate $(printf '%q' "$1") --jq $(printf '%q' "$2")"
+}
+
+_ci_state() { # _ci_state <dueño/repo> <sha>  -> CI_STATE y CI_WHY
+  local slug="$1" sha="$2" out rc st name l
+  local -a rojas=() pend=()
+  local total=0
+  CI_STATE="error"; CI_WHY=""
+  [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || { CI_WHY="$(t "no sé qué commit preguntar")"; return 0; }
+  # Las dos fuentes con la misma forma, «estado nombre»: las check runs
+  # (Actions y casi todo lo moderno) y los statuses (lo que publican Jenkins,
+  # Buildkite o un CI propio). Un commit puede tener de las dos.
+  local q_runs='.check_runs[] | "\(if .status != "completed" then "pending" elif (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") then "success" else "failure" end) \(.name)"'
+  local q_stat='.statuses[] | "\(if .state == "success" then "success" elif .state == "pending" then "pending" else "failure" end) \(.context)"'
+  local ruta q
+  for ruta in "check-runs?per_page=100" "status"; do
+    q="$q_runs"; [[ "$ruta" == status ]] && q="$q_stat"
+    rc=0; out="$(_gh_api "repos/$slug/commits/$sha/$ruta" "$q" 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+      # La primera línea con algo: gh dice qué ha pasado ahí («HTTP 404»,
+      # «gh auth login»…). Sin tokens: gh no los imprime en sus errores.
+      CI_WHY="$(printf '%s\n' "$out" | grep -m1 -v '^[[:space:]]*$' || true)"
+      [[ -n "$CI_WHY" ]] || CI_WHY="$(t "gh ha salido con código %s" "$rc")"
+      CI_WHY="${CI_WHY:0:200}"
+      return 0
+    fi
+    while IFS= read -r l; do
+      st="${l%% *}"; name="${l#* }"
+      case "$st" in
+        success) total=$((total + 1)) ;;
+        pending) total=$((total + 1)); pend+=("$name") ;;
+        failure) total=$((total + 1)); rojas+=("$name") ;;
+        *) continue ;;   # lo que imprima un .bashrc delante no es una comprobación
+      esac
+    done <<<"$out"
+  done
+  local IFS=","
+  if (( ${#rojas[@]} )); then CI_STATE="failure"; CI_WHY="${rojas[*]}"
+  elif (( ${#pend[@]} )); then CI_STATE="pending"; CI_WHY="${pend[*]}"
+  elif (( total == 0 )); then CI_STATE="none"
+  else CI_STATE="success"; fi
+  CI_WHY="${CI_WHY//,/, }"; CI_WHY="${CI_WHY:0:200}"
+  return 0
+}
+
+# -> 0 desplegar, 1 esperar, 2 la CI ha fallado, 3 no he podido preguntar. Con
+# la app cargada.
+_ci_gate() { # _ci_gate <sha>
+  local sha="$1" slug now seen_sha seen_t
+  slug="$(_gh_slug "$A_REPO")" || {
+    CI_STATE="error"; CI_WHY="$(t "el repositorio no está en GitHub")"; return 3; }
+  _ci_state "$slug" "$sha"
+  case "$CI_STATE" in
+    success) return 0 ;;
+    pending) return 1 ;;
+    failure) return 2 ;;
+    none)
+      now="$(date +%s)"
+      seen_sha="${A_CI_SEEN%% *}"; seen_t="${A_CI_SEEN##* }"
+      if [[ "$seen_sha" != "$sha" || ! "$seen_t" =~ ^[0-9]+$ ]]; then
+        A_CI_SEEN="$sha $now"; save_app; seen_t="$now"
+      fi
+      (( now - seen_t >= CHECKS_GRACE )) && return 0
+      CI_WHY="$(t "el commit aún no tiene comprobaciones; espero %s s por si la CI está arrancando" "$CHECKS_GRACE")"
+      return 1 ;;
+    *) return 3 ;;
+  esac
+}
+
 # ═════════════════════════════ el contrato por lotes ══════════════════════
 # 'deploy --all' recorre varias apps y de cada una sale uno de seis finales, no
 # uno: desplegada, fallida, sin cambios, con el remoto mudo, con la rama
@@ -6905,6 +7353,10 @@ _dall_prog() { # _dall_prog <app> <estado>
 _dall_json() { # _dall_json [entrada…]
   local -a e=("$@")
   local d=0 f=0 u=0 r=0 g=0 k=0 x
+  # Los cinco de las puertas (1.4.3) van detrás y con su propio recuento: los
+  # campos se añaden, nunca se renombran (§13.1), y un cliente que sólo
+  # conociera los seis de antes sigue sumando bien los suyos.
+  local lk=0 ig=0 cp=0 cf=0 cu=0
   for x in "${e[@]:-}"; do
     case "$x" in
       *'"status":"deployed"'*)    d=$((d+1)) ;;
@@ -6913,15 +7365,22 @@ _dall_json() { # _dall_json [entrada…]
       *'"status":"unreachable"'*) r=$((r+1)) ;;
       *'"status":"gone"'*)        g=$((g+1)) ;;
       *'"status":"skipped"'*)     k=$((k+1)) ;;
+      *'"status":"locked"'*)      lk=$((lk+1)) ;;
+      *'"status":"ignored"'*)     ig=$((ig+1)) ;;
+      *'"status":"ci_pending"'*)  cp=$((cp+1)) ;;
+      *'"status":"ci_failed"'*)   cf=$((cf+1)) ;;
+      *'"status":"ci_unknown"'*)  cu=$((cu+1)) ;;
     esac
   done
   local lista=""
   for x in "${e[@]:-}"; do [[ -n "$x" ]] && lista="${lista:+$lista,}$x"; done
-  printf '{"schema":%s,"apps":[%s],"total":%s,' "$JSON_SCHEMA" "$lista" "$(( d+f+u+r+g+k ))"
+  printf '{"schema":%s,"apps":[%s],"total":%s,' "$JSON_SCHEMA" "$lista" "$(( d+f+u+r+g+k+lk+ig+cp+cf+cu ))"
   printf '"deployed":%s,"failed":%s,"unchanged":%s,"unreachable":%s,"gone":%s,"skipped":%s,' \
     "$d" "$f" "$u" "$r" "$g" "$k"
+  printf '"locked":%s,"ignored":%s,"ci_pending":%s,"ci_failed":%s,"ci_unknown":%s,' \
+    "$lk" "$ig" "$cp" "$cf" "$cu"
   printf '"ok":%s,"duration_s":%s}\n' \
-    "$([[ $f -eq 0 && $r -eq 0 && $g -eq 0 ]] && printf 'true' || printf 'false')" \
+    "$([[ $f -eq 0 && $r -eq 0 && $g -eq 0 && $cu -eq 0 ]] && printf 'true' || printf 'false')" \
     "$(( SECONDS - DALL_T0 ))"
   return 0
 }
@@ -6961,13 +7420,30 @@ cmd_deploy_all() { # cmd_deploy_all [--if-changed] [--auto] [--quiet] [--progres
   fi
 
   [[ "$quiet" == "yes" ]] || title "Desplegando %s aplicaciones" "${#names[@]}"
-  local n sha rc ok_n=0 fail_n=0 skip_n=0 mute_n=0
+  local n sha rc ok_n=0 fail_n=0 skip_n=0 mute_n=0 lock_n=0 ci_n=0 ciu_n=0 pin gate
   local -a failed=()
   for n in "${names[@]}"; do
     load_app "$n"
-    if [[ "$only_changed" == "yes" ]]; then
-      rc=0; _pending_sha || rc=$?
-      sha="$PENDING_SHA"
+    sha=""; pin=""
+    # Congelada: antes que nada, y también sin --if-changed. Ni siquiera se
+    # pregunta al remoto: la respuesta no cambiaría lo que se hace.
+    if _lock_read "$n"; then
+      lock_n=$((lock_n + 1))
+      [[ "$quiet" == "yes" ]] || info "%s está %s; no la despliego." "$n" "$(_lock_desc)"
+      entradas+=("$(_dall_entry "$n" locked "$(_lock_desc)")"); _dall_prog "$n" locked
+      continue
+    fi
+    # La CI necesita saber qué commit mirar, así que con la puerta puesta se
+    # pregunta al remoto también en un 'deploy --all' a secas.
+    if [[ "$only_changed" == "yes" || "$A_CHECKS" == "yes" ]]; then
+      rc=0
+      if [[ "$only_changed" == "yes" ]]; then
+        _pending_sha || rc=$?
+        sha="$PENDING_SHA"
+      else
+        _remote_head || rc=$?
+        sha="$REMOTE_SHA"
+      fi
       case "$rc" in
         1) skip_n=$((skip_n + 1))
            entradas+=("$(_dall_entry "$n" unchanged "")"); _dall_prog "$n" unchanged
@@ -7000,6 +7476,50 @@ cmd_deploy_all() { # cmd_deploy_all [--if-changed] [--auto] [--quiet] [--progres
         continue
       fi
     fi
+    # Sólo en las pasadas que buscan cambios: un 'deploy --all' a secas es
+    # «despliégalas todas», y ahí no hay cambio que filtrar.
+    if [[ "$only_changed" == "yes" ]]; then
+      gate=0; _watch_gate "$sha" || gate=$?
+      if (( gate != 0 )); then
+        skip_n=$((skip_n + 1))
+        # Una vez por commit nuevo, no en cada pasada mientras el remoto siga ahí.
+        [[ "$WATCH_NOTE" == "seen" ]] || \
+          info "%s: los commits nuevos no tocan las rutas vigiladas; no la despliego." "$n"
+        entradas+=("$(_dall_entry "$n" ignored "$(t "sin cambios en las rutas vigiladas")")")
+        _dall_prog "$n" ignored
+        continue
+      fi
+    fi
+    if [[ "$A_CHECKS" == "yes" ]]; then
+      gate=0; _ci_gate "$sha" || gate=$?
+      case "$gate" in
+        0) # Se despliega exactamente el commit que ha pasado, aunque la rama
+           # avance entre esta pregunta y el fetch del despliegue.
+           pin="$sha"
+           [[ "$CI_STATE" == "none" ]] && \
+             info "%s: el commit no tiene comprobaciones en GitHub; lo despliego." "$n"
+           [[ "$auto" == "yes" ]] && _watch_mark "ci:$n" ok info "$(t "La CI de «%s» vuelve a estar en verde" "$n")" ;;
+        1) ci_n=$((ci_n + 1))
+           [[ "$quiet" == "yes" ]] || info "%s: esperando a la CI · %s" "$n" "$CI_WHY"
+           entradas+=("$(_dall_entry "$n" ci_pending "$CI_WHY")"); _dall_prog "$n" ci_pending
+           continue ;;
+        2) ci_n=$((ci_n + 1))
+           [[ "$quiet" == "yes" ]] || warn "%s: la CI del commit %s ha fallado (%s); no lo despliego." "$n" "${sha:0:7}" "$CI_WHY"
+           entradas+=("$(_dall_entry "$n" ci_failed "$CI_WHY")"); _dall_prog "$n" ci_failed
+           # El estado lleva el commit: si el siguiente también falla, es
+           # otra transición y merece su aviso; si no lo llevara, el segundo
+           # commit rojo pasaría callado.
+           [[ "$auto" == "yes" ]] && _watch_mark "ci:$n" "ci-fallo:${sha:0:7}" warn \
+             "$(t "La CI del commit %s de «%s» ha fallado (%s): no lo despliego. Se desplegará el siguiente que pase." "${sha:0:7}" "$n" "$CI_WHY")"
+           continue ;;
+        *) ci_n=$((ci_n + 1)); ciu_n=$((ciu_n + 1))
+           err "%s: no he podido preguntar a GitHub por la CI · %s" "$n" "$CI_WHY"
+           entradas+=("$(_dall_entry "$n" ci_unknown "$CI_WHY")"); _dall_prog "$n" ci_unknown
+           [[ "$auto" == "yes" ]] && _watch_mark "ci:$n" sin-ci warn \
+             "$(t "No puedo consultar la CI de «%s», así que no se desplegará sola: %s" "$n" "$CI_WHY")"
+           continue ;;
+      esac
+    fi
     # En un subshell: cmd_deploy aborta con 'die' y no debe llevarse por
     # delante el resto de la pasada.
     #
@@ -7026,9 +7546,9 @@ cmd_deploy_all() { # cmd_deploy_all [--if-changed] [--auto] [--quiet] [--progres
       # La salida del despliegue se recoge para meterla dentro del lote; lo que
       # va a stderr —los pasos de --progress y lo que se le cuenta a una
       # persona— sigue su camino sin tocarlo.
-      salida="$( set -Eeuo pipefail; JSON="yes"; _ui_route; cmd_deploy "$n" )"
+      salida="$( set -Eeuo pipefail; JSON="yes"; _ui_route; DALL_PIN="$pin"; cmd_deploy "$n" )"
     else
-      ( set -Eeuo pipefail; cmd_deploy "$n" ) >/dev/null 2>&1
+      ( set -Eeuo pipefail; DALL_PIN="$pin"; cmd_deploy "$n" ) >/dev/null 2>&1
     fi
     rc=$?
     set -e
@@ -7055,15 +7575,19 @@ cmd_deploy_all() { # cmd_deploy_all [--if-changed] [--auto] [--quiet] [--progres
     # cumplía sola porque este resumen nunca convivía con el contrato.
     printf "\n  %s" "$(t "%s correctas · %s fallidas · %s sin cambios" "$ok_n" "$fail_n" "$skip_n")" >&$UI_FD
     (( mute_n )) && printf "%s" "$(t " · %s sin contacto" "$mute_n")" >&$UI_FD
+    (( lock_n )) && printf "%s" "$(t " · %s congeladas" "$lock_n")" >&$UI_FD
+    (( ci_n ))   && printf "%s" "$(t " · %s retenidas por la CI" "$ci_n")" >&$UI_FD
     printf "\n\n" >&$UI_FD
     (( fail_n )) && info "Revisa el detalle con:  orbit deploy <app>"
     (( mute_n )) && info "Un remoto que no contesta no es «sin cambios»: esas apps no se están actualizando."
+    (( ciu_n ))  && info "Sin respuesta de GitHub no se despliega nada que espere a la CI: mira 'orbit github status'."
   fi
   [[ "$JSON" == "yes" ]] && _dall_json "${entradas[@]}"
   # No poder preguntar cuenta como fallo de la pasada: con el temporizador,
   # eso deja la unidad en rojo en 'systemctl status orbit-autodeploy' en vez
-  # de terminar en verde sin haber hecho nada.
-  (( fail_n == 0 && mute_n == 0 ))
+  # de terminar en verde sin haber hecho nada. Y vale igual para la CI: una
+  # puerta que no puede preguntar no abre, y eso tiene que verse.
+  (( fail_n == 0 && mute_n == 0 && ciu_n == 0 ))
 }
 
 # ══════════════════════════════ métricas de despliegue ════════════════════
@@ -7711,6 +8235,13 @@ cmd_rollback() {
   local name="${1:-}" target="${2:-}"
   [[ -n "$name" ]] || name="$(pick_app 'App a revertir')" || return 0
   load_app "$name"
+  # La congelación NO frena el rollback, y es a propósito. Congelar es «que no
+  # llegue código nuevo a producción»; volver atrás sólo pone una release que
+  # ya sirvió, con el código que ya estuvo ahí. Y es la salida de emergencia:
+  # una congelación que la bloqueara obligaría a levantarla justo en mitad de
+  # un incidente, que es el peor momento para decidir nada — y convertiría una
+  # medida de prudencia en lo que impide arreglar la avería.
+  _lock_read "$name" && info "«%s» está %s; el rollback sí se permite." "$name" "$(_lock_desc)"
   _app_lock "$name" || die "Otro despliegue de '%s' sigue en curso tras %s s. No he tocado nada." "$name" "$DEPLOY_LOCK_WAIT"
   # Antes de listar: una release a medias de un despliegue muerto no puede
   # ofrecerse como destino.
@@ -8430,6 +8961,12 @@ cmd_clone() {
   # encuentre, y quien clona una app espera una copia mirando, no trabajando.
   A_AUTODEPLOY="no"; A_AUTOFAIL=""; A_QUEUE="no"
   A_LASTDEPLOY=""
+  # Lo que la pasada apuntó del original no dice nada de la copia. La espera a
+  # la CI (A_CHECKS) sí se hereda: no despliega nada por sí sola, sólo frena, y
+  # si algún día se enciende el automático en el staging, lo prudente es que
+  # frene igual que el original. La congelación no viaja: vive fuera de la
+  # configuración (ver app_lockfile), y es del original y de este momento.
+  A_WATCH_SEEN=""; A_CI_SEEN=""
   # shellcheck disable=SC2034  # save_app la lee por nombre
   A_CREATED="$(date -Iseconds)"
   save_app
@@ -9865,6 +10402,10 @@ cmd_list() {
   _t "sin vhost"; W_NOVHOST="$I18N_MSG"
   _t "no";       SSL_NO="${RED}$I18N_MSG${R}"
   _t "sí";       SSL_SI="${GRN}$I18N_MSG${R}"
+  # La congelación no es un estado de lo que se sirve —una app congelada sigue
+  # atendiendo igual— y por eso no compite por la columna ESTADO: va detrás de
+  # todo, donde no descuadra nada.
+  local W_LOCKED; _t "congelada"; W_LOCKED="  ${YEL}$I18N_MSG${R}"
   local n
   for n in $names; do
     load_app "$n"
@@ -9910,7 +10451,8 @@ cmd_list() {
     local pad state; printf -v pad '%-9s' "$word"; state="$color$pad$R"
     local ssl="$SSL_NO"
     has_cert "$A_DOMAIN" && ssl="$SSL_SI"
-    printf "  %-16s %-8s %-30s %-7s %b %b\n" "$A_NAME" "$A_TYPE" "$A_DOMAIN" "${A_PORT:--}" "$state" "$ssl"
+    local lk=""; [[ -f "$APPS_CONF/$n.lock" ]] && lk="$W_LOCKED"
+    printf "  %-16s %-8s %-30s %-7s %b %b%b\n" "$A_NAME" "$A_TYPE" "$A_DOMAIN" "${A_PORT:--}" "$state" "$ssl" "$lk"
   done
   echo
 }
@@ -9942,6 +10484,9 @@ cmd_info() {
   printf "%s\n" "$(t "  Ruta          %s" "$(app_dir "$name")")"
   printf "%s\n" "$(t "  Último deploy %s" "${A_LASTDEPLOY:-$(t "nunca")}")"
   printf "%s\n" "$(t "  Releases      %s" "$(releases_desc "$(app_dir "$name")" | wc -l)")"
+  [[ "$A_CHECKS" == "yes" ]] && \
+    printf "%s\n" "$(t "  CI            se espera a que esté en verde para desplegarse sola")"
+  _lock_read "$name" && printf "${YEL}%s${R}\n" "$(t "  Despliegues   %s" "$(_lock_desc)")"
   echo
 }
 
@@ -11710,13 +12255,29 @@ EOF
 # Una línea de estado. Espera que load_app ya haya cargado la app, y que el
 # estado del vigilante esté leído si se quiere ver el remoto mudo.
 _autodeploy_line() { # _autodeploy_line <app>
-  local remoto="${WS_STATE[remoto:$1]:-ok}"
+  local remoto="${WS_STATE[remoto:$1]:-ok}" ci="${WS_STATE[ci:$1]:-ok}"
+  # La congelación primero: es lo que decide, aunque el remoto esté bien.
+  if _lock_read "$1"; then
+    printf "  ${YEL}%s${R} %-18s %s ${D}%s${R}\n" "$G_MID" "$1" "$A_BRANCH" "($(_lock_desc))"
+    return 0
+  fi
   if [[ "$remoto" == "sin-contacto" ]]; then
     printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" "$1" "$A_BRANCH" "$(t "(no consigo hablar con el remoto)")"
     return 0
   fi
   if [[ "$remoto" == "sin-rama" ]]; then
     printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" "$1" "$A_BRANCH" "$(t "(esa rama ya no existe en el remoto)")"
+    return 0
+  fi
+  # Los dos estados de la CI que paran el automático, y sólo si la app sigue
+  # esperándola: tras un 'checks off' el estado viejo se queda en el fichero
+  # del vigilante, y enseñarlo sería acusar a una puerta que ya no existe.
+  if [[ "$A_CHECKS" == "yes" && "$ci" == "sin-ci" ]]; then
+    printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" "$1" "$A_BRANCH" "$(t "(no consigo preguntar a GitHub por la CI)")"
+    return 0
+  fi
+  if [[ "$A_CHECKS" == "yes" && "$ci" == ci-fallo:* ]]; then
+    printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" "$1" "$A_BRANCH" "$(t "(la CI del commit %s ha fallado; espero uno que pase)" "${ci#ci-fallo:}")"
     return 0
   fi
   if [[ -n "$A_AUTOFAIL" ]]; then
@@ -11739,7 +12300,7 @@ _autodeploy_enabled_apps() {
 
 cmd_autodeploy() {
   need_root autodeploy
-  _subcmd autodeploy status app "enable|on disable|off every|cada once|--once status" "$@"
+  _subcmd autodeploy status app "enable|on disable|off every|cada once|--once status checks|ci" "$@"
   local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
   local name="${1:-}"
   case "$sub" in
@@ -11787,6 +12348,46 @@ cmd_autodeploy() {
         ok "Guardado: se comprobará cada %s min cuando actives alguna app" "$mins"
       fi
       logline "autodeploy every $mins" ;;
+    checks)
+      # orbit autodeploy checks on|off <app>, en cualquier orden; sin on ni
+      # off, dice cómo está.
+      local modo="" a
+      name=""
+      for a in "$@"; do
+        case "$a" in
+          on|yes|si|sí|enable)  modo="on" ;;
+          off|no|disable)       modo="off" ;;
+          *) [[ -z "$name" ]] || die "uso: orbit autodeploy checks on|off <app>"; name="$a" ;;
+        esac
+      done
+      [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
+      load_app "$name"
+      case "$modo" in
+        "")
+          if [[ "$A_CHECKS" == "yes" ]]; then
+            info "«%s» sólo se despliega sola con la CI de GitHub en verde." "$name"
+          else
+            info "«%s» se despliega sola sin mirar la CI. Para esperarla:  orbit autodeploy checks on %s" "$name" "$name"
+          fi ;;
+        on)
+          [[ "$A_TYPE" == "redirect" ]] && die "'%s' es una redirección: no tiene código que desplegar." "$A_NAME"
+          local slug
+          slug="$(_gh_slug "$A_REPO")" \
+            || die "Sólo sé preguntar por la CI a GitHub, y el repositorio de «%s» no está ahí: %s" "$name" "$A_REPO"
+          A_CHECKS="yes"; save_app
+          ok "«%s» sólo se desplegará sola con la CI de %s en verde" "$name" "$slug"
+          info "Pendiente, espera a la pasada siguiente; en rojo, no se despliega y se avisa una vez."
+          info "Vale también para 'orbit deploy --all'. 'orbit deploy %s' a mano despliega igual, y avisa si está en rojo." "$name"
+          # Se avisa y se guarda igual: la puerta está para frenar, y sin
+          # sesión frena —no despliega nada— hasta que se arregle.
+          _gh_ok || warn "gh no tiene sesión para '%s': mientras no la tenga, «%s» no se desplegará sola. Conéctalo con 'orbit github'." "$DEPLOY_USER" "$name"
+          [[ "$A_AUTODEPLOY" == "yes" ]] || info "Para que se despliegue sola:  orbit autodeploy enable %s" "$name"
+          logline "autodeploy checks on $name" ;;
+        off)
+          A_CHECKS="no"; A_CI_SEEN=""; save_app
+          ok "«%s» ya no espera a la CI para desplegarse" "$name"
+          logline "autodeploy checks off $name" ;;
+      esac ;;
     once)
       cmd_deploy_all --auto ;;
     status)
@@ -13181,7 +13782,7 @@ cmd_remove() {
   else
     info "Los ficheros siguen en %s. Bórralos con 'rm -rf' o repite con --purge." "$(app_dir "$name")"
   fi
-  rm -f "$(app_conf "$name")"
+  rm -f "$(app_conf "$name")" "$(app_lockfile "$name")"
   # El usuario del aislamiento es de esta app y de nadie más, así que se va
   # con ella — pero SOLO con ella: sin --purge las releases y el .env se
   # quedan, y borrar a su único dueño los dejaría huérfanos bajo un UID
@@ -13374,6 +13975,7 @@ cmd_status() {
     else
       printf "  ${BLU}%s${R} %-18s %s ${D}%s${R}\n" "$G_ON" "$n" "$A_DOMAIN" "$(t "(estática)")"
     fi
+    _lock_read "$n" && printf "    ${YEL}%s${R}\n" "$(_lock_desc)"
   done
   echo
 }
@@ -13554,6 +14156,24 @@ _doctor_collect() {
       sin-rama)     _doc error "remote:${subj#remoto:}" \
         "$(t "La rama configurada de «%s» ya no existe en el remoto" "${subj#remoto:}")" "$fix" ;;
     esac
+  done
+  # La puerta de la CI que no puede preguntar no abre: es el mismo «no se
+  # despliega sola y no se ve en la web» que el remoto mudo. Sólo en las apps
+  # que siguen esperando a la CI; el estado de una que ya no, es historia.
+  local cn
+  for subj in "${!WS_STATE[@]}"; do
+    [[ "$subj" == ci:* && "${WS_STATE[$subj]}" == "sin-ci" ]] || continue
+    cn="${subj#ci:}"
+    app_exists "$cn" || continue
+    [[ "$(load_app "$cn"; printf '%s' "$A_CHECKS")" == "yes" ]] || continue
+    _doc error "ci:$cn" "$(t "No consigo preguntar a GitHub por la CI de «%s»: no se despliega sola" "$cn")" \
+      "$(t "compruébalo con:  orbit github status")"
+  done
+  # Una congelación no es un problema —alguien la ha decidido—, pero olvidarla
+  # sí, y su síntoma es una web que no se actualiza sin decir por qué.
+  for cn in $(app_names); do
+    _lock_read "$cn" || continue
+    _doc info "lock:$cn" "$(t "«%s» está %s" "$cn" "$(_lock_desc)")" "$(t "se levanta con:  orbit unlock %s" "$cn")"
   done
 
   # Unidades escritas antes de que la unidad declarara su propio HOME. Con
@@ -14305,6 +14925,10 @@ cat <<EOF
     autodeploy enable|disable|status <app>
                             Deploy on its own whenever the branch moves
     autodeploy every <min>  How often the remote is checked
+    autodeploy checks on|off <app>
+                            Deploy on its own only with GitHub CI green
+    lock <app> [-m "reason"]
+                            Freeze deploys (unlock lifts it; rollback still works)
     queue enable|disable|run|status <app>
                             Process a Laravel queue on a timer
     queue every <min>       How often the queue is emptied
@@ -14398,6 +15022,10 @@ cat <<EOF
     autodeploy enable|disable|status <app>
                             Desplegar sola cuando avance la rama
     autodeploy every <min>  Cada cuánto se mira el remoto
+    autodeploy checks on|off <app>
+                            Desplegarse sola sólo con la CI de GitHub en verde
+    lock <app> [-m "motivo"]
+                            Congelar los despliegues (unlock lo levanta; el rollback sigue)
     queue enable|disable|run|status <app>
                             Procesar la cola de un Laravel por temporizador
     queue every <min>       Cada cuánto se vacía la cola
@@ -14720,7 +15348,7 @@ _i18n_en() {
     ["El build de %s ha fallado y se ha reintentado solo tras arreglarlo."]="The build of %s failed and was retried on its own after being fixed."
     ["orbit deploy: «%s» necesita un valor."]="orbit deploy: «%s» needs a value."
     ["orbit deploy: --progress sólo tiene sentido con --json."]="orbit deploy: --progress only makes sense with --json."
-    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --env K=V     poner una variable en el .env antes del build (repetible)\\n       --env-file F  poner las de un fichero CLAVE=valor antes del build\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --env K=V     set a variable in the .env before the build (repeatable)\\n       --env-file F  set the KEY=value lines of a file before the build\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
+    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --env K=V     poner una variable en el .env antes del build (repetible)\\n       --env-file F  poner las de un fichero CLAVE=valor antes del build\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --force       desplegar aunque la app esté congelada ('orbit lock')\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --env K=V     set a variable in the .env before the build (repeatable)\\n       --env-file F  set the KEY=value lines of a file before the build\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --force       deploy even if the app is frozen ('orbit lock')\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
     ["orbit deploy: no entiendo «%s». Mira 'orbit deploy --help'."]="orbit deploy: I don't understand «%s». See 'orbit deploy --help'."
     ["orbit deploy: sobra «%s»."]="orbit deploy: «%s» is one argument too many."
     ["con --json hay que decir qué app desplegar"]="with --json you have to say which app to deploy"
@@ -15569,6 +16197,74 @@ _i18n_en() {
     ["«--lang» necesita un idioma detrás. Son: %s."]="«--lang» needs a language after it. They are: %s."
     ["'orbit %s' no tiene salida JSON. La tienen: %s."]="'orbit %s' has no JSON output. These do: %s."
     ["Comando desconocido: %s"]="Unknown command: %s"
+    # ── puertas del despliegue (1.4.3): congelar, rutas vigiladas, CI ──
+    ["«%s» está %s. Despliego igualmente porque has puesto --force; sigue congelada."]="«%s» is %s. Deploying anyway because you passed --force; it stays frozen."
+    ["«%s» está %s."]="«%s» is %s."
+    ["Para desplegar igualmente:  orbit deploy %s --force"]="To deploy anyway:  orbit deploy %s --force"
+    ["Para levantar la congelación:  orbit unlock %s"]="To lift the freeze:  orbit unlock %s"
+    ["el commit comprobado por la CI ya no está en la rama"]="the commit checked by CI is no longer on the branch"
+    ["La rama ha cambiado mientras comprobaba la CI y el commit %s ya no está. Lo intento en la próxima pasada."]="The branch changed while I was checking CI and commit %s is gone. I will try on the next pass."
+    ["La rama ha avanzado mientras comprobaba la CI: despliego %s, que es el que ha pasado."]="The branch moved while I was checking CI: deploying %s, which is the one that passed."
+    ["La CI de este commit ha fallado (%s). Lo despliego porque lo has pedido tú."]="CI failed for this commit (%s). Deploying it because you asked for it."
+    ["La CI de este commit todavía no ha terminado (%s)."]="CI has not finished for this commit yet (%s)."
+    ["No he podido preguntar a GitHub por la CI de este commit: %s"]="I could not ask GitHub about this commit's CI: %s"
+    ["Despliegues congelados. Se levanta con:  orbit unlock %s"]="Deploys frozen. Lift it with:  orbit unlock %s"
+    ["congelada desde %s por %s: %s"]="frozen %s by %s: %s"
+    ["congelada desde %s por %s"]="frozen %s by %s"
+    ["orbit lock: «%s» necesita un valor."]="orbit lock: «%s» needs a value."
+    ["  uso: orbit lock <app> [-m \"motivo\"]\\n       orbit unlock <app>\\n       Congela los despliegues de la app: el autodespliegue y 'deploy --all'\\n       la saltan, y 'orbit deploy' a mano necesita --force. El rollback sigue\\n       permitido: es la salida de emergencia.\\n"]="  usage: orbit lock <app> [-m \"reason\"]\\n       orbit unlock <app>\\n       Freezes the app's deploys: autodeploy and 'deploy --all' skip it,\\n       and a manual 'orbit deploy' needs --force. Rollback is still\\n       allowed: it is the emergency exit.\\n"
+    ["orbit lock: no entiendo «%s»."]="orbit lock: I do not understand «%s»."
+    ["orbit lock: sobra «%s»."]="orbit lock: «%s» is one too many."
+    ["App a congelar"]="App to freeze"
+    ["«%s» ya estaba congelada; queda con el motivo nuevo"]="«%s» was already frozen; it now has the new reason"
+    ["«%s» congelada: no se desplegará hasta 'orbit unlock %s'"]="«%s» frozen: it will not deploy until 'orbit unlock %s'"
+    ["El autodespliegue y 'deploy --all' la saltan; a mano hace falta 'orbit deploy %s --force'."]="Autodeploy and 'deploy --all' skip it; by hand you need 'orbit deploy %s --force'."
+    ["El rollback sigue permitido: es la salida de emergencia."]="Rollback is still allowed: it is the emergency exit."
+    ["  uso: orbit unlock <app>"]="  usage: orbit unlock <app>"
+    ["orbit unlock: no entiendo «%s»."]="orbit unlock: I do not understand «%s»."
+    ["orbit unlock: sobra «%s»."]="orbit unlock: «%s» is one too many."
+    ["App a descongelar"]="App to unfreeze"
+    ["«%s» no estaba congelada."]="«%s» was not frozen."
+    ["«%s» descongelada: vuelve a desplegarse con normalidad"]="«%s» unfrozen: it deploys normally again"
+    ["Si su rama ha avanzado, el autodespliegue la desplegará en la próxima pasada."]="If its branch has moved, autodeploy will deploy it on the next pass."
+    ["orbit.json de «%s»: 'watch' trae rutas que no son del repositorio; despliego sin filtrar."]="orbit.json of «%s»: 'watch' has paths that are not inside the repository; deploying without filtering."
+    ["no sé qué commit preguntar"]="I do not know which commit to ask about"
+    ["gh ha salido con código %s"]="gh exited with code %s"
+    ["el repositorio no está en GitHub"]="the repository is not on GitHub"
+    ["el commit aún no tiene comprobaciones; espero %s s por si la CI está arrancando"]="the commit has no checks yet; waiting %s s in case CI is starting"
+    ["%s está %s; no la despliego."]="%s is %s; not deploying it."
+    ["%s: los commits nuevos no tocan las rutas vigiladas; no la despliego."]="%s: the new commits do not touch the watched paths; not deploying it."
+    ["sin cambios en las rutas vigiladas"]="no changes in the watched paths"
+    ["%s: el commit no tiene comprobaciones en GitHub; lo despliego."]="%s: the commit has no checks on GitHub; deploying it."
+    ["La CI de «%s» vuelve a estar en verde"]="CI for «%s» is green again"
+    ["%s: esperando a la CI · %s"]="%s: waiting for CI · %s"
+    ["%s: la CI del commit %s ha fallado (%s); no lo despliego."]="%s: CI failed for commit %s (%s); not deploying it."
+    ["La CI del commit %s de «%s» ha fallado (%s): no lo despliego. Se desplegará el siguiente que pase."]="CI failed for commit %s of «%s» (%s): not deploying it. The next one that passes will be deployed."
+    ["%s: no he podido preguntar a GitHub por la CI · %s"]="%s: I could not ask GitHub about CI · %s"
+    ["No puedo consultar la CI de «%s», así que no se desplegará sola: %s"]="I cannot query CI for «%s», so it will not deploy on its own: %s"
+    [" · %s congeladas"]=" · %s frozen"
+    [" · %s retenidas por la CI"]=" · %s held by CI"
+    ["Sin respuesta de GitHub no se despliega nada que espere a la CI: mira 'orbit github status'."]="Without an answer from GitHub nothing that waits for CI is deployed: see 'orbit github status'."
+    ["«%s» está %s; el rollback sí se permite."]="«%s» is %s; rollback is allowed."
+    ["congelada"]="frozen"
+    ["  CI            se espera a que esté en verde para desplegarse sola"]="  CI            waits for it to be green before deploying on its own"
+    ["  Despliegues   %s"]="  Deploys       %s"
+    ["(no consigo preguntar a GitHub por la CI)"]="(cannot ask GitHub about CI)"
+    ["(la CI del commit %s ha fallado; espero uno que pase)"]="(CI failed for commit %s; waiting for one that passes)"
+    ["uso: orbit autodeploy checks on|off <app>"]="usage: orbit autodeploy checks on|off <app>"
+    ["«%s» sólo se despliega sola con la CI de GitHub en verde."]="«%s» only deploys on its own with GitHub CI green."
+    ["«%s» se despliega sola sin mirar la CI. Para esperarla:  orbit autodeploy checks on %s"]="«%s» deploys on its own without looking at CI. To wait for it:  orbit autodeploy checks on %s"
+    ["Sólo sé preguntar por la CI a GitHub, y el repositorio de «%s» no está ahí: %s"]="I only know how to ask GitHub about CI, and the repository of «%s» is not there: %s"
+    ["«%s» sólo se desplegará sola con la CI de %s en verde"]="«%s» will only deploy on its own with CI of %s green"
+    ["Pendiente, espera a la pasada siguiente; en rojo, no se despliega y se avisa una vez."]="Pending, it waits for the next pass; red, it is not deployed and you are told once."
+    ["Vale también para 'orbit deploy --all'. 'orbit deploy %s' a mano despliega igual, y avisa si está en rojo."]="It also applies to 'orbit deploy --all'. A manual 'orbit deploy %s' deploys anyway, and warns if it is red."
+    ["gh no tiene sesión para '%s': mientras no la tenga, «%s» no se desplegará sola. Conéctalo con 'orbit github'."]="gh has no session for '%s': until it does, «%s» will not deploy on its own. Connect it with 'orbit github'."
+    ["Para que se despliegue sola:  orbit autodeploy enable %s"]="To make it deploy on its own:  orbit autodeploy enable %s"
+    ["«%s» ya no espera a la CI para desplegarse"]="«%s» no longer waits for CI to deploy"
+    ["No consigo preguntar a GitHub por la CI de «%s»: no se despliega sola"]="I cannot ask GitHub about CI for «%s»: it does not deploy on its own"
+    ["compruébalo con:  orbit github status"]="check it with:  orbit github status"
+    ["«%s» está %s"]="«%s» is %s"
+    ["se levanta con:  orbit unlock %s"]="lift it with:  orbit unlock %s"
   )
 }
 
@@ -15647,6 +16343,8 @@ main() {
     maintenance|mant) cmd_maintenance "$@" ;;
     clone|copy)     cmd_clone "$@" ;;
     rollback)       cmd_rollback "$@" ;;
+    lock|freeze|congelar)       cmd_lock "$@" ;;
+    unlock|unfreeze|descongelar) cmd_unlock "$@" ;;
     list|ls)        cmd_list ;;
     info|show)      cmd_info "$@" ;;
     top)            cmd_top "$@" ;;

@@ -74,6 +74,8 @@ orbit new                  Añadir una web nueva
 orbit deploy [app]         Actualizar (git pull + build + reinicio)
 orbit deploy --all         Actualizar todas, con resumen
 orbit autodeploy enable    Desplegar sola al hacer push, sin webhooks
+orbit autodeploy checks on Desplegarse sola sólo con la CI de GitHub en verde
+orbit lock <app> [-m …]    Congelar los despliegues (unlock lo levanta)
 orbit queue enable <app>   Vaciar la cola de un Laravel por temporizador
 orbit clone <app> <nuevo>  Duplicar una app para montar un staging
 orbit rollback [app]       Volver a una versión anterior

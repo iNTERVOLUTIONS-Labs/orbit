@@ -87,6 +87,30 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.3] - 2026-11-04
+
+Tres puertas para que el autodespliegue y `deploy --all` **no** desplieguen una app que sí tiene commits nuevos: lo que otras herramientas llaman `deploy:lock` (Capistrano, Deployer), *ignored build step* o *watch paths* (Vercel, Render) y *wait for CI* (Render, Railway). Sin demonios ni webhooks: todo ocurre en la misma pasada del temporizador. Ver ARCHITECTURE §4.
+
+### Añadido — `orbit lock <app> [-m "motivo"]` y `orbit unlock <app>`
+
+Congela los despliegues. El autodespliegue y `deploy --all` la saltan; `orbit deploy <app>` se niega diciendo quién, cuándo y por qué, y cómo forzarlo (`--force`, que despliega esa vez y deja la congelación puesta). **El rollback sigue permitido**: es la salida de emergencia, y una congelación que la bloqueara obligaría a levantarla en mitad de un incidente. Se ve en `list`, `info`, `status`, `autodeploy status`, `doctor` y en `state.locked` / `state.lock` del contrato.
+
+Vive en `/etc/orbit/apps/<app>.lock` y no en la configuración, porque `cmd_deploy` reescribe la configuración entera al terminar y se habría llevado por delante una congelación puesta a mitad de un build. Por lo mismo `orbit clone` no la hereda, y las copias de seguridad no la llevan a propósito: es una decisión sobre la producción de este servidor en este momento. Un despliegue que se niega no se apunta en las métricas como fallido.
+
+### Añadido — `"watch"` en el `orbit.json`: rutas vigiladas para monorepos
+
+`{"watch": ["backend/", "packages/shared/"]}` hace que la pasada (y `deploy --all --if-changed`) sólo despliegue si el árbol nuevo difiere del **desplegado** dentro de esas rutas. Las rutas son de la raíz del repositorio, también en el `orbit.json` de una subcarpeta; los `orbit.json` y la carpeta de la app se vigilan siempre. Toda duda se resuelve desplegando: sin caché, commit desplegado desaparecido por un force-push, fetch fallido, despliegue en curso, o una ruta con `..` (se avisa y no se filtra). Lo concluido se apunta como el par «nuevo desplegado» y no se vuelve a traer cada minuto. A mano, y con `deploy --all` a secas, se despliega siempre.
+
+### Añadido — `orbit autodeploy checks on|off <app>`: esperar a la CI de GitHub
+
+Con la puerta puesta, sólo se despliega un commit cuyas check runs **y** commit statuses han terminado bien (neutras y saltadas valen), preguntando con el `gh` del usuario de despliegue. Pendiente espera sin avisar; en rojo no despliega y avisa **una vez por commit**; si no se puede preguntar —sin sesión, sin red, repositorio que no es de GitHub— **no despliega**, avisa y la pasada sale en rojo, como con un remoto mudo. Un commit sin ninguna comprobación espera `CHECKS_GRACE` (300 s) por si GitHub todavía no las ha registrado, y luego despliega. Y se despliega **el commit que pasó**, no la punta: si la rama avanza entre la pregunta y el fetch, el despliegue se queda en el comprobado. `orbit deploy <app>` a mano no espera, pero avisa si ese commit está en rojo.
+
+### Contrato — cinco finales nuevos en `deploy --all --json`
+
+`locked`, `ignored`, `ci_pending`, `ci_failed` y `ci_unknown`, cada uno con su recuento; los seis de antes no cambian. `ok` sigue siendo la regla del código de salida, ahora también `false` con alguna `ci_unknown`. `info --json` y `list --json` ganan `state.checks`, `state.locked` y `state.lock` (`{at, by, reason}` o `null`), y la configuración `checks`, `watch_seen` y `ci_seen`.
+
+`tests/gates_test.sh`, 190 comprobaciones contra repositorios git de verdad y un `gh` de mentira que pasa el filtro `--jq` por el jq real; cada puerta probada también rompiéndola a propósito en el código (26 mutaciones, las 26 en rojo).
+
 ## [1.4.2] - 2026-11-04
 
 Lo que quedaba de la auditoría anterior y una pasada adversarial más sobre lo de 1.3.7–1.4.1. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código).
