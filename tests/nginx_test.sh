@@ -473,7 +473,90 @@ else
     > "$NG/fastcgi.conf"
 fi
 
-for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp; do install_vhost "$app"; done
+# --- la release anterior sigue contestando por sus recursos -----------------
+# Un visitante cargó el HTML de la release A; se despliega la B. Su navegador
+# sigue pidiendo los chunks con hash de A, y en B no existen. Lo que se fija
+# aquí es que los recursos caen a A —y SÓLO los recursos—: una ruta nunca sale
+# de la anterior, ni nada que la activa niegue, ni PHP. La web va en una
+# subcarpeta del monorepo para que la ruta de la anterior se componga igual
+# que la de la activa.
+SKA="$TMP/apps/skew/releases/A"; SKB="$TMP/apps/skew/releases/B"
+mkdir -p "$SKA/site/dist/_astro" "$SKB/site/dist/_astro" "$SKA/site/dist/vieja"
+printf 'portada A\n'                 > "$SKA/site/dist/index.html"
+printf 'portada B\n'                 > "$SKB/site/dist/index.html"
+printf 'B no existe\n'               > "$SKB/site/dist/404.html"
+printf 'chunk de A\n'                > "$SKA/site/dist/_astro/a.Ab12.js"
+printf 'chunk de B\n'                > "$SKB/site/dist/_astro/b.Cd34.js"
+printf 'estilo de A\n'               > "$SKA/site/dist/_astro/comun.css"
+printf 'estilo de B\n'               > "$SKB/site/dist/_astro/comun.css"
+# Lo que sólo existe en A y no puede salir por ningún lado: una página (que
+# para la activa no existe), un .env, un fichero oculto con extensión de
+# recurso, un .php con el fuente, y un service worker viejo.
+printf 'pagina vieja de A\n'         > "$SKA/site/dist/vieja/index.html"
+printf 'pagina vieja de A\n'         > "$SKA/site/dist/suelta.html"
+printf 'SECRETO=FUGA\n'              > "$SKA/site/dist/.env"
+printf 'FUGA oculto\n'               > "$SKA/site/dist/.oculto.js"
+printf '<?php echo "FUGA"; ?>\n'     > "$SKA/site/dist/viejo.php"
+printf 'FUGA sw viejo\n'             > "$SKA/site/dist/sw.js"
+ln -sfn "$SKB" "$TMP/apps/skew/current"
+ln -sfn "$SKA" "$TMP/apps/skew/previous"
+mkapp skew static "" "skew.test"
+A_TYPE="static"; A_OUTDIR="site/dist"; A_APPDIR="site"; A_SPA="no"; save_app
+
+# La misma situación en una SPA, que es la que más chunks carga a demanda. Sin
+# 404.html, para fijar de paso que un .js que falta no recibe el index.html.
+SPA_A="$TMP/apps/spaskew/releases/A"; SPA_B="$TMP/apps/spaskew/releases/B"
+mkdir -p "$SPA_A/dist/assets" "$SPA_B/dist/assets"
+printf 'shell A\n'                   > "$SPA_A/dist/index.html"
+printf 'shell B\n'                   > "$SPA_B/dist/index.html"
+printf 'lazy de A\n'                 > "$SPA_A/dist/assets/ruta-x9.js"
+ln -sfn "$SPA_B" "$TMP/apps/spaskew/current"
+ln -sfn "$SPA_A" "$TMP/apps/spaskew/previous"
+mkapp spaskew static "" "spaskew.test"
+A_TYPE="static"; A_OUTDIR="dist"; A_SPA="yes"; save_app
+
+# Next sirve sus chunks desde disco por un alias, y ahí la anterior tiene que
+# entrar sin 'alias' —una named location no lo admite—. En un monorepo, para
+# que la ruta lleve A_APPDIR.
+NXA="$TMP/apps/nextapp/releases/A"; NXB="$TMP/apps/nextapp/releases/B"
+mkdir -p "$NXA/apps/web/.next/static/chunks" "$NXB/apps/web/.next/static/chunks"
+printf 'next chunk A\n'              > "$NXA/apps/web/.next/static/chunks/a1.js"
+printf 'next chunk B\n'              > "$NXB/apps/web/.next/static/chunks/b2.js"
+printf 'FUGA\n'                      > "$NXA/apps/web/.next/static/chunks/.oculto.js"
+ln -sfn "$NXB" "$TMP/apps/nextapp/current"
+ln -sfn "$NXA" "$TMP/apps/nextapp/previous"
+mkapp nextapp next "$BACKPORT" "nextapp.test"
+A_TYPE="next"; A_APPDIR="apps/web"; save_app
+
+# Django con ManifestStaticFilesStorage: los nombres llevan hash, igual que un
+# bundle. La anterior de pyapp trae una hoja que la activa ya no tiene.
+PYOLD="$TMP/apps/pyapp/releases/r0"
+mkdir -p "$PYOLD/staticfiles/css"
+printf 'hoja de la anterior\n'       > "$PYOLD/staticfiles/css/app.4f2e.css"
+ln -sfn "$PYOLD" "$TMP/apps/pyapp/previous"
+
+# Y las webs con PHP: la anterior de apiweb tiene un recurso dentro de api/ —
+# un prefijo '^~', que ya no mira la anterior— y uno de verdad en dist/; la de
+# hibrida, un .php y un vendor/ que la activa no tiene.
+AOLD="$TMP/apps/apiweb/releases/r0"
+mkdir -p "$AOLD/dist/_astro" "$AOLD/api"
+printf 'recurso de la anterior\n'    > "$AOLD/dist/_astro/v.js"
+printf 'FUGA api vieja\n'            > "$AOLD/api/viejo.js"
+ln -sfn "$AOLD" "$TMP/apps/apiweb/previous"
+HOLD="$TMP/apps/hibrida/releases/r0"
+mkdir -p "$HOLD/vendor"
+printf '<?php echo "EJECUTADO de la anterior\n"; ?>\n' > "$HOLD/viejo.php"
+printf 'FUGA vendor viejo\n'         > "$HOLD/vendor/viejo.js"
+ln -sfn "$HOLD" "$TMP/apps/hibrida/previous"
+
+# Una app con proceso que no contesta: nada escucha en el puerto 1. Una con su
+# página de error y otra sin ella, que tiene que dar el mismo código.
+mkapp caida node 1 "caida.test"
+_errpage_ensure caida
+mkapp caidasin node 1 "caidasin.test"
+
+for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp \
+           skew spaskew nextapp caida caidasin; do install_vhost "$app"; done
 
 # El servidor por defecto, igual que lo escribe install.sh. Va en 000- para que
 # nginx lo vea antes que los vhosts de las apps, que es de donde salía el bug:
@@ -1122,6 +1205,121 @@ else
   check "y sigue funcionando"     "la web aislada" \
     "$(BODY -H 'Host: aislada.test' "http://127.0.0.1:$HTTP_PORT/")"
 fi
+
+section "Los recursos de la release anterior siguen sirviéndose"
+SK=(-H 'Host: skew.test')
+SKU="http://127.0.0.1:$HTTP_PORT"
+check "chunk de la anterior"         "200"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "y es el de la anterior"       "chunk de A"   "$(BODY "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "el de la activa, igual"       "chunk de B"   "$(BODY "${SK[@]}" "$SKU/_astro/b.Cd34.js")"
+# Si los dos lo tienen, manda la activa: la anterior es un repuesto.
+check "si están los dos, la activa"  "estilo de B"  "$(BODY "${SK[@]}" "$SKU/_astro/comun.css")"
+# El de la anterior es tan inmutable como el de la activa —lleva hash—, y
+# lleva las mismas cabeceras de seguridad.
+SKH="$(curl -sI --noproxy '*' -m 5 "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "con caché inmutable"          "1" "$(grep -ci '^cache-control: public, immutable' <<<"$SKH")"
+check "y con nosniff"                "1" "$(grep -ci '^x-content-type-options: nosniff' <<<"$SKH")"
+check "la portada es la activa"      "portada B"    "$(BODY "${SK[@]}" "$SKU/")"
+# Lo que no se puede servir de la anterior, aunque esté ahí.
+check "una ruta, nunca de la anterior" "404"        "$(H "${SK[@]}" "$SKU/vieja/")"
+check "ni un .html"                  "404"          "$(H "${SK[@]}" "$SKU/suelta.html")"
+check "sale el 404.html de la activa" "B no existe" "$(BODY "${SK[@]}" "$SKU/vieja/")"
+check "un recurso que no está en ninguna" "404"     "$(H "${SK[@]}" "$SKU/_astro/nada.js")"
+check "también con su 404.html"      "B no existe"  "$(BODY "${SK[@]}" "$SKU/_astro/nada.js")"
+check ".env de la anterior"          "403"          "$(H "${SK[@]}" "$SKU/.env")"
+check "un oculto con extensión de recurso" "403"    "$(H "${SK[@]}" "$SKU/.oculto.js")"
+check "un .php de la anterior"       "404"          "$(H "${SK[@]}" "$SKU/viejo.php")"
+check "y su fuente no sale"          "0" "$(BODY "${SK[@]}" "$SKU/viejo.php" | grep -c FUGA)"
+check "un service worker viejo, no"  "404"          "$(H "${SK[@]}" "$SKU/sw.js")"
+
+# En una SPA, igual para los recursos; y las rutas siguen siendo del shell de
+# la activa, no del de la anterior.
+SP=(-H 'Host: spaskew.test')
+check "spa: chunk de la anterior"    "lazy de A"    "$(BODY "${SP[@]}" "$SKU/assets/ruta-x9.js")"
+check "spa: las rutas, a la activa"  "shell B"      "$(BODY "${SP[@]}" "$SKU/una/ruta")"
+check "spa: un .js que falta"        "404"          "$(H "${SP[@]}" "$SKU/assets/nada.js")"
+# Antes el 404 volvía a entrar por 'location /' y caía en el fallback: el .js
+# que faltaba se contestaba con el index.html entero.
+check "y no es el index.html"        "0" "$(BODY "${SP[@]}" "$SKU/assets/nada.js" | grep -c 'shell')"
+
+# Next: el alias de /_next/static/ con la anterior detrás.
+NX=(-H 'Host: nextapp.test')
+check "next: chunk de la anterior"   "next chunk A" "$(BODY "${NX[@]}" "$SKU/_next/static/chunks/a1.js")"
+check "next: el de la activa"        "next chunk B" "$(BODY "${NX[@]}" "$SKU/_next/static/chunks/b2.js")"
+check "next: en ninguna, 404"        "404"          "$(H "${NX[@]}" "$SKU/_next/static/chunks/nada.js")"
+check "next: oculto, no"             "403"          "$(H "${NX[@]}" "$SKU/_next/static/chunks/.oculto.js")"
+check "next: el resto, al proceso"   "respuesta del backend" "$(BODY "${NX[@]}" "$SKU/")"
+
+# Django: el hash de ManifestStaticFilesStorage, igual.
+check "django: hoja de la anterior"  "hoja de la anterior" \
+  "$(BODYS py.test "https://py.test:$HTTPS_PORT/static/css/app.4f2e.css")"
+check "django: la de la activa"      "body{color:red}" \
+  "$(BODYS py.test "https://py.test:$HTTPS_PORT/static/css/app.css")"
+
+# Con PHP: lo que protege un prefijo '^~' no mira la anterior, y un .php de la
+# anterior no se ejecuta ni se sirve.
+check "apiweb: recurso de la anterior" "recurso de la anterior" \
+  "$(BODY -H 'Host: apiweb.test' "$SKU/_astro/v.js")"
+check "apiweb: dentro de api/, no"   "404" "$(H -H 'Host: apiweb.test' "$SKU/api/viejo.js")"
+check "hibrida: vendor/ de la anterior, no" "404" "$(H -H 'Host: hibrida.test' "$SKU/vendor/viejo.js")"
+check "hibrida: un .php de la anterior, no" "404" "$(H -H 'Host: hibrida.test' "$SKU/viejo.php")"
+check "hibrida: ni se ejecuta"       "0" "$(BODY -H 'Host: hibrida.test' "$SKU/viejo.php" | grep -c 'EJECUTADO')"
+
+# Y cuando la poda se lleva la anterior, el enlace queda colgando y el recurso
+# es un 404 normal: nada que limpiar en nginx.
+rm -rf "$SKA"
+check "podada la anterior, 404"      "404"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "y la activa sigue igual"      "chunk de B"   "$(BODY "${SK[@]}" "$SKU/_astro/b.Cd34.js")"
+
+section "La página de 404 de la web"
+check "estática: ruta inventada"     "no encontrado" \
+  "$(BODY -H 'Host: sincert.test' "$SKU/una/ruta/inventada")"
+# Pedirla por su nombre es pedir una página que existe.
+check "el 404.html a secas, 200"     "200" "$(H -H 'Host: sincert.test' "$SKU/404.html")"
+# El formato de carpetas: 404/index.html en vez de 404.html.
+mkdir -p "$TMP/apps/spaskew/releases/B/dist/404"
+printf 'carpeta 404\n' > "$TMP/apps/spaskew/releases/B/dist/404/index.html"
+check "con 404/index.html también"   "carpeta 404" "$(BODY "${SP[@]}" "$SKU/assets/nada.js")"
+check "con su código"                "404"         "$(H "${SP[@]}" "$SKU/assets/nada.js")"
+check "y la SPA sigue con su shell"  "shell B"     "$(BODY "${SP[@]}" "$SKU/otra/ruta")"
+check "con 200"                      "200"         "$(H "${SP[@]}" "$SKU/otra/ruta")"
+
+section "Cuando la app no contesta"
+check "502, no otro código"          "502" "$(H -H 'Host: caida.test' "$SKU/")"
+check "con la página de Orbit"       "1"   "$(BODY -H 'Host: caida.test' "$SKU/" | grep -c '<h1>.*no responde ahora mismo')"
+check "y no la de nginx"             "0"   "$(BODY -H 'Host: caida.test' "$SKU/" | grep -ci 'bad gateway')"
+CH="$(curl -sI --noproxy '*' -m 5 -H 'Host: caida.test' "$SKU/cualquier/ruta")"
+check "sin caché"                    "1"   "$(grep -ci '^cache-control: no-store' <<<"$CH")"
+check "con las cabeceras de seguridad" "1" "$(grep -ci '^x-frame-options: sameorigin' <<<"$CH")"
+# Sin la página —alguien la borró— el código es el mismo. Con un 'rewrite' a
+# secas, como la de mantenimiento, el fichero que falta lo convertía en 404.
+check "sin página, sigue siendo 502" "502" "$(H -H 'Host: caidasin.test' "$SKU/")"
+# Lo que contesta la app pasa tal cual: un 404 del proceso no es de Orbit.
+check "el 404 de la app, intacto"    "404" "$(H -H 'Host: proxy.test' -H 'X-Forwarded-Proto: https' "$SKU/no-existe")"
+check "y sin la página de la web"    "0"   "$(BODY -H 'Host: proxy.test' -H 'X-Forwarded-Proto: https' "$SKU/no-existe" | grep -c 'no encontrado')"
+
+section "El mantenimiento puesto a mano, sin página"
+# El principio 3: el testigo se puede poner con un 'touch' sin Orbit. Si la
+# página no existía, el 'rewrite' que la buscaba convertía el 503 en un 404
+# para toda la web.
+: > "$TMP/apps/caidasin/shared/maintenance.on" 2>/dev/null \
+  || { mkdir -p "$TMP/apps/caidasin/shared"; : > "$TMP/apps/caidasin/shared/maintenance.on"; }
+check "sigue siendo 503"             "503" "$(H -H 'Host: caidasin.test' "$SKU/")"
+check "con su Retry-After"           "1"   "$(curl -sI --noproxy '*' -m 5 -H 'Host: caidasin.test' "$SKU/" | grep -ci '^retry-after: 120')"
+rm -f "$TMP/apps/caidasin/shared/maintenance.on"
+check "y al quitarlo, vuelve el 502" "502" "$(H -H 'Host: caidasin.test' "$SKU/")"
+
+section "Pasar del límite es un 429, no el mantenimiento"
+# 40 r/s con 80 de ráfaga: 200 peticiones seguidas por la misma conexión lo
+# rebasan seguro. Antes salía un 503 —el del mantenimiento, con su página y su
+# Retry-After de dos minutos— o un 404 si la página no existía.
+LIM="$(for _ in $(seq 200); do printf 'url = "%s/"\n' "$SKU"; done \
+  | curl -s --noproxy '*' -m 20 -H 'Host: caida.test' -o /dev/null -w '%{http_code}\n' -K - 2>/dev/null || true)"
+check "alguna llega al límite"       "1" "$([[ "$(grep -c '^429$' <<<"$LIM")" -gt 0 ]] && echo 1 || echo 0)"
+check "y ninguna sale como 503"      "0" "$(grep -c '^503$' <<<"$LIM")"
+# Y tampoco como 404: sin página de mantenimiento —una app que no ha estado
+# nunca en mantenimiento no la tiene— el 503 acababa en eso. Medido.
+check "ni como 404"                  "0" "$(grep -c '^404$' <<<"$LIM")"
 
 section "Si nginx rechaza el vhost, el servidor se queda como estaba"
 # Antes, render_nginx escribía el vhost y lo enlazaba en sites-enabled **antes**

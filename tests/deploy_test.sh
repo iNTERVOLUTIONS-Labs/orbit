@@ -108,6 +108,9 @@ save_app
 
 BASE="$TMP/apps/web"
 current_release() { basename "$(readlink -f "$BASE/current")"; }
+# Lo que nginx consulta cuando un recurso no está en la activa (ver
+# _prev_location): la release que servía justo antes. Vacío si no hay.
+previous_release() { [[ -L "$BASE/previous" ]] && basename "$(readlink "$BASE/previous")"; }
 count_releases()  { releases_desc "$BASE" | wc -l; }
 
 section "Primer despliegue"
@@ -120,6 +123,7 @@ check ".env enlazado" "$TMP/apps/web/shared/.env" "$(readlink "$BASE/current/.en
 load_app web
 check "guarda el commit" "1" "$(grep -c "$(git -C "$ORIGIN" rev-parse --short HEAD)" <<<"$A_LASTDEPLOY")"
 check "deja rastro en el log" "1" "$(grep -c '^.* deploy web ' "$TMP/orbit.log")"
+check "sin anterior, sin 'previous'" "" "$(previous_release)"
 
 section "Segundo despliegue"
 sleep 1   # las releases se nombran por segundo
@@ -130,6 +134,8 @@ check "termina bien" "0" "$r"
 check "sirve la version dos" "version dos" "$(cat "$BASE/current/index.html")"
 check "dos releases" "2" "$(count_releases)"
 check "release nueva" "no" "$([[ "$(current_release)" == "$FIRST" ]] && echo si || echo no)"
+# El HTML que un visitante cargó de la primera pide los recursos de la primera.
+check "'previous' es la que servía"  "$FIRST" "$(previous_release)"
 
 section "Build fallido: producción intacta"
 sleep 1
@@ -239,17 +245,23 @@ done
 check "conserva KEEP_RELEASES" "2" "$(count_releases)"
 check "sirve la ultima" "version cinco" "$(cat "$BASE/current/index.html")"
 check "la activa no se poda" "1" "$([[ -d "$BASE/current/" ]] && echo 1 || echo 0)"
+check "ni la anterior"      "1" "$([[ -d "$BASE/previous/" ]] && echo 1 || echo 0)"
 
 # Tras un rollback a una release vieja, la poda por nombre se llevaba justo la
 # que servía antes del despliegue: la más vieja de todas. Es el destino natural
 # del siguiente 'orbit rollback', y desaparecía.
 VIEJA="$(releases_desc "$BASE" | tail -1)"
+HUIDA="$(current_release)"
 run cmd_rollback web "$VIEJA" >/dev/null 2>&1
 check "rollback a la más vieja" "$VIEJA" "$(current_release)"
+# Tras un rollback, los navegadores con HTML abierto son los de la release de
+# la que se huye: ésa es la anterior ahora, no la de antes de ella.
+check "'previous', la que se deja"  "$HUIDA" "$(previous_release)"
 sleep 1; publish "version tras rollback"
 run cmd_deploy web >/dev/null 2>&1
 check "la que servía antes sobrevive a la poda" "1" \
   "$([[ -d "$BASE/releases/$VIEJA" ]] && echo 1 || echo 0)"
+check "y es la anterior"            "$VIEJA" "$(previous_release)"
 check "y la nueva sirve" "version tras rollback" "$(cat "$BASE/current/index.html")"
 
 section "Dos despliegues en el mismo segundo"
@@ -310,6 +322,7 @@ sleep 1; publish "dos"; run cmd_deploy web >/dev/null 2>&1
 DOS="$(current_release)"
 run cmd_rollback web "$UNO" >"$TMP/rb1" 2>&1; r=$?
 check "vuelve a la nombrada" "0"   "$r"
+check "y 'previous' es de la que viene" "$DOS" "$(previous_release)"
 check "y sirve aquello"   "uno"    "$(cat "$BASE/current/index.html")"
 check "queda en el log"   "1"      "$(grep -c " rollback web $UNO\$" "$TMP/orbit.log")"
 
@@ -317,6 +330,7 @@ check "queda en el log"   "1"      "$(grep -c " rollback web $UNO\$" "$TMP/orbit
 # reiniciar el servicio y recargar nginx por nada es peor que no hacer nada.
 run cmd_rollback web "$UNO" >"$TMP/rb2" 2>&1; r=$?
 check "a la activa, no hace nada" "0" "$r"
+check "ni con 'previous'"         "$DOS" "$(previous_release)"
 check "y lo dice"         "1"      "$(grep -c 'ya está sirviendo' "$TMP/rb2")"
 
 run cmd_rollback web 19990101-000000 >"$TMP/rb3" 2>&1; r=$?
@@ -651,6 +665,7 @@ run cmd_deploy tienda >"$TMP/lar3" 2>&1; r=$?
 check "con la web viva, despliega" "0" "$r"
 check "y lo dice"                  "1" "$(grep -c 'La web responde' "$TMP/lar3")"
 BUENA="$(basename "$(readlink -f "$LBASE/current")")"
+LPREV="$(readlink "$LBASE/previous")"
 
 # Y con la web devolviendo 500, se deshace el symlink.
 echo 500 > "$CODEFILE"
@@ -661,6 +676,9 @@ run cmd_deploy tienda >"$TMP/lar4" 2>&1; r=$?
 cp "$SYSCTL_LOG" "$TMP/sysctl-rb"
 check "con la web rota, aborta"    "1" "$r"
 check "y vuelve a la anterior"     "$BUENA" "$(basename "$(readlink -f "$LBASE/current")")"
+# Y 'previous' como estaba: si apuntara a la rota, la trampa de salida la
+# borraría por debajo y los recursos de la de antes darían 404.
+check "y 'previous' como estaba"   "$LPREV" "$(readlink "$LBASE/previous")"
 # La rota no se queda: ocuparía un hueco de KEEP_RELEASES y saldría en
 # 'orbit rollback' como destino. Se sabe cuál era por el objeto que no hay, así
 # que se cuenta: la más reciente tiene que seguir siendo la buena.
@@ -998,15 +1016,20 @@ check "dice donde fallo"    "service" "$(jq -r '.failed_step' < "$TMP/js1")"
 check "y lo explica"        "1"      "$(jq -r '.error' < "$TMP/js1" | grep -c 'no había release anterior')"
 
 # Con una release anterior si se restaura, y entonces si se dice.
-unset -f curl                       # este despliegue tiene que salir bien
+# Que conteste de verdad: con el curl de verdad y nadie en el puerto, este
+# despliegue también fallaba y volvía a la primera, y la comprobación de abajo
+# —que sólo miraba que 'current' existiera— salía verde igual.
+curl() { [[ "$*" == *http_code* ]] && printf 200; return 0; }
 JSON="no"; _ui_route
-run cmd_deploy nueva >/dev/null 2>&1
-check "la segunda vez si despliega" "1" "$([[ -L "$TMP/apps/nueva/current" ]] && echo 1 || echo 0)"
+run cmd_deploy nueva >/dev/null 2>&1; r=$?
+check "la segunda vez si despliega" "0" "$r"
+NPREV="$(readlink "$TMP/apps/nueva/previous")"
 curl() { return 1; }                # y ahora vuelve a no responder
 JSON="yes"; _ui_route
 NANTES="$(releases_desc "$TMP/apps/nueva" | wc -l)"
 run cmd_deploy nueva >"$TMP/js2" 2>/dev/null
 check "ahora si hay rollback" "true" "$(jq -r '.rolled_back' < "$TMP/js2")"
+check "y 'previous' vuelve a lo que era" "$NPREV" "$(readlink "$TMP/apps/nueva/previous")"
 # Tras volver a la anterior, la que no respondió sobra: antes se quedaba, y
 # unas cuantas seguidas llenaban KEEP_RELEASES hasta podar la última buena.
 check "y la que no respondió se borra" "$NANTES" "$(releases_desc "$TMP/apps/nueva" | wc -l)"
@@ -1158,7 +1181,11 @@ render_nginx() {
 }
 : > "$SYSCTL_LOG"; : > "$SEQ"
 publish "solape cuatro"
+FANTES="$(readlink "$TMP/apps/fluida/current")"
 run cmd_deploy fluida >"$TMP/ov3out" 2>&1; r=$?
+# El symlink sí se movió —con el puente verificado— y con él 'previous', que
+# es lo que nginx consulta para el HTML que el proceso viejo acaba de servir.
+check "'previous' es la que servía" "$FANTES" "$(readlink "$TMP/apps/fluida/previous")"
 check "el despliegue no se da por bueno" "1" "$r"
 check "el puente no se paró"      "0" "$(grep -c '^stop orbit-fluida-next$' "$SYSCTL_LOG")"
 check "su unidad sigue escrita"   "1" "$([[ -f "$(svc_next_unit fluida)" ]] && echo 1 || echo 0)"
@@ -1166,6 +1193,27 @@ check "y se pide recargar nginx"  "1" "$(grep -c 'systemctl reload nginx' "$TMP/
 # El huérfano que acaba de quedarse lo recogería el despliegue siguiente; aquí
 # se recoge a mano para no contaminar lo que venga detrás.
 rm -f "$(svc_next_unit fluida)"
+
+section "Reinicio sin corte: si nginx no acepta el puente, 'previous' vuelve a lo que era"
+# El symlink se ha movido —y 'previous' con él— justo antes de mandarle el
+# tráfico al puente. Si esa recarga no sale, 'current' vuelve a la anterior, y
+# 'previous' tiene que volver también: apuntando a la release que se descarta,
+# la trampa de salida no podría borrarla y los recursos de la de antes darían
+# 404 a quien tuviera su HTML abierto.
+render_nginx() {
+  nginx_vhost "$1" > "$TMP/vhost-$1.conf"
+  NGINX_RELOAD_OK="yes"; [[ -n "$NGINX_PORT_OVERRIDE" ]] && NGINX_RELOAD_OK="no"
+  return 0
+}
+FCUR="$(readlink -f "$TMP/apps/fluida/current")"
+FPREV="$(readlink "$TMP/apps/fluida/previous")"
+FN="$(releases_desc "$TMP/apps/fluida" | wc -l)"
+publish "solape cinco"
+run cmd_deploy fluida >"$TMP/ov5out" 2>&1; r=$?
+check "no se da por bueno"          "1"        "$r"
+check "current vuelve atrás"        "$FCUR"    "$(readlink -f "$TMP/apps/fluida/current")"
+check "'previous' como estaba"      "$FPREV"   "$(readlink "$TMP/apps/fluida/previous")"
+check "y la descartada no se queda" "$FN"      "$(releases_desc "$TMP/apps/fluida" | wc -l)"
 NGINX_RELOAD_OK="yes"
 unset -f curl; unset -f needs_svc; unset -f journalctl; unset -f sleep; unset -f free_port
 systemctl() {
