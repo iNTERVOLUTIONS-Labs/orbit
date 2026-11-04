@@ -479,7 +479,7 @@ check "estática sin fallback" "si" "$r"
 
 # --- arrancar nginx --------------------------------------------------------
 chmod 711 "$TMP"; chmod -R a+rX "$NG" "$TMP/apps" "$TMP/back"
-nginx -c "$NG/nginx.conf" -p "$NG" 2>>"$NG/logs/error.log"
+command nginx -c "$NG/nginx.conf" -p "$NG" 2>>"$NG/logs/error.log"
 started=$?
 # La limpieza pasa por 'priv' porque el php-fpm de la sección de aislamiento
 # lo arranca root: su pid y sus logs son suyos, y ni el kill ni el rm saldrían
@@ -600,7 +600,7 @@ section "El diagnóstico lo detecta en un servidor antiguo"
 NGINX_DEFAULT_CONF="$TMP/000-orbit-default"
 printf 'server {\n    listen 80 default_server;\n    server_name _;\n}\n' > "$NGINX_DEFAULT_CONF"
 DOC_LEVEL=(); DOC_ID=(); DOC_MSG=(); DOC_FIX=()
-nginx -t >/dev/null 2>&1   # el resto del diagnóstico no importa aquí
+command nginx -t >/dev/null 2>&1   # el resto del diagnóstico no importa aquí
 _doc_default() {           # sólo la parte que se está probando
   if [[ ! -f "$NGINX_DEFAULT_CONF" ]]; then
     _doc error default-server "sin servidor por defecto" "orbit nginx-rebuild"
