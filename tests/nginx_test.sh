@@ -479,6 +479,7 @@ check "estática sin fallback" "si" "$r"
 
 # --- arrancar nginx --------------------------------------------------------
 chmod 711 "$TMP"; chmod -R a+rX "$NG" "$TMP/apps" "$TMP/back"
+# shellcheck disable=SC2218  # es el nginx de verdad; el doble se define más abajo, a propósito
 command nginx -c "$NG/nginx.conf" -p "$NG" 2>>"$NG/logs/error.log"
 started=$?
 # La limpieza pasa por 'priv' porque el php-fpm de la sección de aislamiento
@@ -600,6 +601,7 @@ section "El diagnóstico lo detecta en un servidor antiguo"
 NGINX_DEFAULT_CONF="$TMP/000-orbit-default"
 printf 'server {\n    listen 80 default_server;\n    server_name _;\n}\n' > "$NGINX_DEFAULT_CONF"
 DOC_LEVEL=(); DOC_ID=(); DOC_MSG=(); DOC_FIX=()
+# shellcheck disable=SC2218  # es el nginx de verdad; el doble se define más abajo, a propósito
 command nginx -t >/dev/null 2>&1   # el resto del diagnóstico no importa aquí
 _doc_default() {           # sólo la parte que se está probando
   if [[ ! -f "$NGINX_DEFAULT_CONF" ]]; then
