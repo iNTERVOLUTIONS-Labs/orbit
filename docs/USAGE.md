@@ -1602,6 +1602,36 @@ Emite o renueva el certificado de Let's Encrypt. Con el token de Cloudflare guar
 
 La renovación automática ya está configurada mediante el temporizador de certbot. No hay que hacer nada.
 
+Un alias comodín (`*.midominio.com`) entra en el certificado, pero sólo por DNS: sin token, Orbit se niega antes de llamar a certbot y te dice que ejecutes `orbit cf-token`.
+
+### Probar hoy la renovación de dentro de dos meses
+
+```bash
+orbit ssl mi-web --dry-run
+```
+
+La emisión casi nunca es lo que falla: falla la **renovación**, sesenta días después y sin nadie mirando, porque entre medias se borró el token, cambió el DNS o algo se come el reto. Esto ejecuta exactamente lo que hará el temporizador de certbot —`certbot renew --dry-run` con la configuración que tiene guardada— contra el entorno de pruebas de Let's Encrypt. No guarda ningún certificado ni toca nginx. Si la app todavía no tiene certificado, prueba la emisión con los mismos argumentos que usaría `orbit ssl`.
+
+Además te dice por qué método renovará y si el certificado ha dejado de cubrir algún alias que añadiste después. Tarda lo que tarde la validación (unos 40 segundos por DNS, por la espera de propagación). El entorno de pruebas tiene límite de frecuencia, así que no lo metas en un bucle; `orbit doctor` no lo lanza solo, pero sí comprueba sin salir de la máquina que la configuración de renovación existe y que el fichero del token y la carpeta del reto siguen ahí.
+
+### Certificado de origen de Cloudflare
+
+```bash
+orbit ssl mi-web --origin            # ECDSA; --rsa si lo necesitas
+orbit ssl mi-web --origin-cert origen.pem --origin-key origen.key   # uno hecho en el panel
+```
+
+Un certificado que firma Cloudflare para tu servidor, válido **15 años**, para el modo SSL/TLS **Full (strict)**. Sólo lo acepta Cloudflare: un visitante que llegue directo a tu IP vería un error de certificado. Por eso Orbit pregunta a la API, antes de nada, si cada nombre de la app pasa por el proxy (nube naranja), y si alguno no pasa o no tiene registro **no sigue** sin `--force`.
+
+- La clave se genera en el servidor y no sale nunca: a Cloudflare sólo va la petición firmada.
+- Necesita que el token tenga el permiso **Zone → SSL and Certificates → Edit**. La plantilla «Edit zone DNS» no lo trae; si falta, Orbit te dice exactamente dónde añadirlo. Editar el permiso no cambia el token, así que no hay que volver a guardarlo.
+- Se guarda en `/etc/ssl/orbit/<app>/` (`cert.pem`, `key.pem` en `0600` y un `origin.info` legible con lo que se pidió). Si nginx no acepta el certificado nuevo, se queda el de antes.
+- El certificado de Let's Encrypt que tuviera la app se retira con `certbot delete`, para que el temporizador no siga renovando algo que no se sirve.
+- Entra en las copias de seguridad, con su clave: uno nuevo necesitaría el token, que no viaja en la copia.
+- Para volver a Let's Encrypt, `orbit ssl mi-web` a secas: pregunta, emite, y sólo cuando nginx ha aceptado el vhost nuevo retira el de origen.
+
+`orbit info` y `--json` (`cert_type`: `letsencrypt`, `origin` o `null`) dicen cuál tiene cada app, y `orbit doctor` avisa si un dominio con certificado de origen resuelve a una IP que no es de Cloudflare.
+
 ## Eliminar una app
 
 ```bash
@@ -1610,7 +1640,7 @@ orbit remove mi-web
 
 Te pide escribir el nombre para confirmar. Después pregunta aparte si quieres borrar también los ficheros de `/srv/apps`.
 
-Los certificados no se borran, por si vuelves a usar el dominio.
+Los certificados de Let's Encrypt no se borran, por si vuelves a usar el dominio. El certificado de origen de Cloudflare sí se borra con `--purge`: es de la app, y su clave no tiene que quedarse en el disco sin dueño. Sin `--purge` se aparta a `/etc/ssl/orbit/.<app>.eliminada.*` —y se dice dónde—, porque si se quedara en su sitio una app nueva con el mismo nombre lo serviría sin cubrir sus dominios.
 
 ---
 
@@ -2123,6 +2153,7 @@ sudo bash install.sh --lang en
 /etc/orbit/orbit.conf                 configuración global (incluido ORBIT_LANG)
 /etc/orbit/apps/<app>.conf            configuración de cada web
 /etc/orbit/cloudflare.ini             token de Cloudflare, solo root
+/etc/ssl/orbit/<app>/                 certificado de origen de Cloudflare y su clave, solo root
 /srv/apps/<app>/                      código, releases y datos compartidos
 /etc/nginx/sites-available/orbit-*    vhosts generados
 /etc/systemd/system/orbit-*.service   servicios de las apps
