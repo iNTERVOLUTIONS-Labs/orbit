@@ -720,7 +720,7 @@ Si prefieres no dejarlo a la inferencia, pon un `orbit.json` en la raíz del rep
 }
 ```
 
-Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared` y `env`. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
+Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared` y `env`. `shared` y `env` se vuelven a leer en **cada despliegue**, así que añadir una ruta compartida o una variable al repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
 
 ### `shared`: lo que tu app escribe y no puede vivir en una release
 
@@ -792,7 +792,7 @@ Y si no hay nadie al teclado —`--yes`, autodeploy, CI—, las que había que p
 
 El fichero se crea con `0640` y propiedad del usuario de despliegue, y como está bajo `shared/`, nginx ya lo niega.
 
-`orbit env get|set|unset|list` trabaja sobre ese mismo fichero, el que declara la release activa: el despliegue lo deja apuntado en la configuración de la app. Si la app viene de una versión anterior a la 1.3.9, el primer despliegue con la nueva lo apunta; hasta entonces `orbit env` sigue escribiendo en `shared/.env`.
+`orbit env get|set|unset|list` trabaja sobre ese mismo fichero, el que declara la release activa: el despliegue lo deja apuntado en la configuración de la app. Si la app viene de una versión anterior a la 1.3.7, el primer despliegue con la nueva lo apunta; hasta entonces `orbit env` sigue escribiendo en `shared/.env`.
 
 Y no se escribe a través de enlaces simbólicos. `shared/` es del usuario de despliegue a propósito —la app escribe ahí—, así que una app comprometida podría cambiar su `.env` por un enlace a un fichero del sistema; la provisión corre como root, de modo que seguirlo reescribiría ese fichero y le cambiaría el dueño. Se comprueba el fichero y cada directorio del camino, y si hay un enlace se avisa y no se toca nada.
 
