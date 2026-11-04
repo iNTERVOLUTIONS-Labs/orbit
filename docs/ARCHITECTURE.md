@@ -181,6 +181,35 @@ El aviso, como en el vigilante, se manda una vez —al fallar—, no en cada cic
 
 `--auto` implica además el filtro por app: solo se miran las que tienen `A_AUTODEPLOY='yes'`. Sin ese filtro, activar el automático en una app desplegaría también cualquier otra cuya rama avanzara, que es justo lo contrario de un permiso por app. Un `orbit deploy --all --if-changed` a mano sí las mira todas, e ignora `A_AUTOFAIL`: si lo pides tú, es que quieres reintentar.
 
+### Las tres puertas: congelar, rutas vigiladas y CI (1.4.3)
+
+Las tres son lo que otras herramientas ya traen —el `deploy:lock` de Capistrano y Deployer, el «ignored build step» y las *watch paths* de Vercel y Render, el «wait for CI» de Render y Railway— y las tres responden a la misma pregunta: **¿a esta app le toca desplegarse sola?** Por eso viven en la pasada (`cmd_deploy_all`) y no en `cmd_deploy`: un `orbit deploy <app>` a mano no hace esa pregunta, porque lo has pedido tú. La única que también frena el despliegue a mano es la congelación, que existe justo para eso, y se salta con `--force`.
+
+El orden dentro de la pasada es de la más barata a la más cara, y no es estético: **congelada** (leer un fichero; ni se pregunta al remoto) → remoto (`ls-remote`) → commit roto conocido → **rutas vigiladas** (un fetch a la caché) → **CI** (dos llamadas a la API). Si una ya dice que no, las de detrás no se pagan.
+
+**La congelación es un fichero, `/etc/orbit/apps/<app>.lock`, y no unos campos de la configuración.** La primera versión del diseño la metía en `ORBIT_APP_FIELDS` —un sitio, legible, y gratis en `info --json`— y se descartó por cómo se usa: una congelación se pone *mientras algo pasa*, y lo que más pasa es un despliegue largo. `cmd_deploy` carga la configuración al empezar y la reescribe entera al terminar, así que unos campos puestos a mitad de un build de tres minutos desaparecían al acabar, sin ruido. El fichero aparte sólo lo tocan `lock` y `unlock`. De paso, `orbit clone` no la hereda sin tener que acordarse, y **las copias de seguridad no la llevan** —a propósito—: es una decisión sobre la producción de este servidor en este momento, y restaurada semanas después en otra máquina bloquearía el `restore --all --deploy` con un motivo que nadie recuerda. Lo que congela es que el fichero exista: un `touch` a mano vale, y entonces quién y cuándo son `null`.
+
+**El rollback no se congela.** Congelar es «que no llegue código nuevo a producción»; volver atrás pone una release que ya sirvió. Y es la salida de emergencia: una congelación que la bloqueara obligaría a levantarla en mitad de un incidente, que es convertir una medida de prudencia en lo que impide arreglar la avería. Un despliegue que se niega por la congelación tampoco se apunta en las métricas: no ha fallado, no ha empezado.
+
+**Las rutas vigiladas fallan hacia desplegar.** El fallo de esta función no se ve —una web que se queda con la versión vieja sin decirlo es el silencio de «sin cambios» contra «no he podido preguntar», otra vez—, así que todas las dudas se resuelven desplegando: sin caché, sin el commit desplegado (un force-push), con el fetch fallando, con un despliegue en curso sobre la misma caché, con una ruta mal escrita. Ignorar sólo la ruta mala estrecharía lo vigilado en silencio; con una mala no se filtra nada y se dice. Se vigilan siempre los `orbit.json` y la carpeta de la app, porque olvidarse de nombrar la propia es el error evidente y su síntoma sería no desplegar nunca.
+
+Tres decisiones de forma:
+
+- **Las rutas son del repositorio, no de la app**, también en el `orbit.json` de una subcarpeta. Es al revés que `shared`, que se recoloca, y tiene motivo: aquéllas son rutas de la release donde escribe la app, éstas son rutas de un `git diff`; y lo que más se vigila en un monorepo —un `packages/` hermano— no se podría nombrar desde la subcarpeta sin un `..`, que no se admite.
+- **Se compara el árbol desplegado con el nuevo** (`git diff --name-only A B`), no la lista de commits ni el último visto. Es lo que de verdad cambiaría en producción, sale bien cuando la rama se ha reescrito, y hace que un cambio saltado (`docs/`) llegue con el siguiente que sí toca algo, en el mismo árbol.
+- **Lo que se concluye se apunta como un par**, «nuevo desplegado», en `A_WATCH_SEEN`: mientras el remoto siga en ese commit no se vuelve a hacer el fetch cada minuto. El par y no sólo el nuevo, para que un despliegue a mano de otra cosa lo invalide solo.
+
+El fetch va con el cerrojo del despliegue tomado **sin esperar** y con `--no-write-fetch-head`: la caché es la de `cmd_deploy`, y un `orbit deploy --ref` lee `FETCH_HEAD` justo después de su propio fetch.
+
+**La CI es una puerta que alguien pidió, y una puerta que no puede preguntar no abre.** Sin sesión de `gh`, sin red o con un repositorio que no es de GitHub, la app no se despliega, se avisa una vez (`_watch_mark "ci:<app>"`) y la pasada sale en rojo, por lo mismo que un remoto mudo: si no, el automático se pararía en verde. En rojo se avisa **una vez por commit** —el estado del vigilante lleva el SHA dentro, `ci-fallo:<sha>`; sin él, un segundo commit rojo pasaría callado— y en pendiente se espera sin avisar. Se mira lo que GitHub llama check runs (Actions y casi todo lo moderno) **y** los statuses (Jenkins, Buildkite, un CI propio); el `state` combinado de la API de statuses no sirve, porque dice `pending` cuando no hay ninguno.
+
+Dos cosas salieron de pensarlo despacio y no estaban en el encargo:
+
+- **«El commit no tiene comprobaciones» no puede desplegar a la primera.** GitHub tarda unos segundos en registrar los check runs de un push, y el temporizador pasa cada minuto: una pasada que cayera en ese hueco vería un commit sin CI y desplegaría justo lo que la puerta existe para retener. Se apunta cuándo se vio el commit sin comprobaciones (`A_CI_SEEN`) y durante `CHECKS_GRACE` segundos (300) cuenta como pendiente. Un repositorio sin CI de verdad se despliega con ese retraso, y se dice.
+- **Se despliega el commit que ha pasado, no la punta.** Entre la pregunta a la API y el fetch de `cmd_deploy` alguien puede empujar otro commit, y desplegar la punta sería desplegar uno que nadie ha comprobado. La pasada fija el SHA (`DALL_PIN`) y el despliegue, si la rama ha avanzado, se queda en él; el nuevo se mira en la pasada siguiente. La prueba lo fija empujando un commit desde dentro del `gh` de mentira, y comprueba además que la carrera ha ocurrido: si el doble no empujara nada, pasaría igual sin el arreglo.
+
+`orbit deploy <app>` a mano no espera a la CI, pero si la app la tiene puesta pregunta y **avisa** si el commit está en rojo: son dos llamadas a la API en un comando que tarda decenas de segundos, y desplegar un rojo sin decirlo sería esconder lo que la puerta existe para enseñar.
+
 ### Por qué `cache/` más `rsync` y no un clon por release
 
 Un `git clone` por despliegue en un repo con historia es lento y descarga lo mismo una y otra vez. Un clon persistente que se actualiza con `fetch` y luego se copia con `rsync --delete` reduce un despliegue típico a unos pocos segundos de red. El coste es un directorio extra por app.
@@ -1114,6 +1143,7 @@ Dos detalles que importan:
 | `maintenance_test.sh` | el 503 servido por nginx de verdad, la cabecera `Retry-After`, que la validación de certbot sigue pasando y que un despliegue abortado no deja la web cerrada | `nginx` |
 | `env_test.sh` | ida y vuelta del `.env` con valores que llevan `$`, comillas y espacios; compatibilidad con lo escrito por versiones anteriores | nada |
 | `autodeploy_test.sh` | `deploy --all`, detección de commits nuevos con repos git reales, permiso por app, commit roto que no se reintenta y remoto mudo avisado una sola vez | `git`, `rsync` |
+| `gates_test.sh` | las tres puertas de §4 con repos git reales: congelar (deploy, `--force`, rollback, lote, clon, copia, `remove`), rutas vigiladas (diff contra lo desplegado, rutas de la raíz, lo que se vigila siempre, dudas que despliegan) y la CI con un `gh` de mentira que pasa el `--jq` por jq de verdad, incluida la carrera del commit fijado | `git`, `rsync`, `jq` |
 | `watch_test.sh` | transiciones de estado, protección contra bucles de reinicio, recuperación, filtrado por nivel y ausencia de avisos repetidos | nada |
 | `redirect_test.sh` | reglas de ruta y dominios enteros, con nginx sirviéndolas de verdad: códigos, cadena de consulta, orden de evaluación y `Location` relativo | `nginx` |
 | `python_test.sh` | proyecto Django real: venv, `collectstatic`, lectura de los ajustes, avisos y `orbit migrate`; y arranque real de Flask y FastAPI con el comando generado | `git`, `rsync`, red |
@@ -1311,6 +1341,18 @@ unreachable  no he podido preguntarle al remoto
 gone         la rama configurada ya no existe
 skipped      este commit ya rompió el build; se espera al siguiente
 ```
+
+Desde la 1.4.3 son **once**: las tres puertas de §4 añaden cinco, sin tocar los seis de antes —los campos se añaden, nunca se renombran—, cada uno con su recuento al lado de los otros:
+
+```
+locked       la app está congelada ('orbit lock'); 'error' lleva quién, cuándo y por qué
+ignored      hay commits nuevos, pero no tocan las rutas vigiladas ("watch")
+ci_pending   la CI de ese commit no ha terminado, o todavía no ha aparecido
+ci_failed    la CI de ese commit ha fallado
+ci_unknown   no he podido preguntarle a GitHub por la CI
+```
+
+`ci_unknown` cuenta como fallo de la pasada —`ok:false` y código de salida 1—, por la misma regla que `unreachable`: una puerta que no puede preguntar no abre, y eso tiene que verse. Las otras cuatro no: son decisiones de alguien, no averías.
 
 Los recuentos van desglosados por los seis y no agrupados en «correctas / fallidas». Y `ok` es **la misma regla que el código de salida** —ni fallos ni apps sin contacto—, para que un cliente que mire el objeto y otro que mire el código de salida no puedan discrepar nunca.
 
