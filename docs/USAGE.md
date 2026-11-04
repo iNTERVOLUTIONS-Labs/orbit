@@ -40,7 +40,7 @@ Y si no te acuerdas de los subcomandos de alguno, `--help` los lista:
 
 ```bash
 orbit autodeploy --help
-# uso: orbit autodeploy <enable|disable|every|once|status> [app]
+# uso: orbit autodeploy <enable|disable|every|once|status|checks> [app]
 ```
 
 ## Crear una app sin asistente
@@ -215,7 +215,7 @@ Y para olvidar lo aprendido por una app, borra el valor en `/etc/orbit/apps/<app
 ## Desplegar todas de una vez
 
 ```bash
-orbit deploy --all                # todas, pase lo que pase
+orbit deploy --all                # todas, pase lo que pase (menos las congeladas)
 orbit deploy --all --if-changed   # solo las que tengan commits nuevos
 ```
 
@@ -302,6 +302,74 @@ Con muchas apps en automático puede interesarte subirlo: es una petición de re
 El intervalo va escrito **dentro** de la unidad de systemd, así que cambiarlo en `/etc/orbit/orbit.conf` a mano no basta. `orbit autodeploy every` reescribe la unidad y reinicia el temporizador; si editas el fichero por tu cuenta, `orbit autodeploy status` te avisa de que la unidad se ha quedado atrás.
 
 **Configura los avisos antes.** Un despliegue automático que falla sin avisar es peor que no tenerlo, porque crees que tu web está actualizada y no lo está. `orbit autodeploy enable` te lo recuerda si no tienes ningún canal.
+
+## Cuándo no se despliega sola: congelar, rutas vigiladas y CI
+
+Tres formas de decirle a la pasada del autodespliegue —y a `orbit deploy --all`— que una app con commits nuevos **no** se despliega todavía. Las tres son decisiones tuyas, no averías, y ninguna pone la pasada en rojo salvo una: no poder preguntarle a GitHub.
+
+### Congelar los despliegues
+
+```bash
+orbit lock mi-web -m "Black Friday: nada hasta el lunes"
+orbit unlock mi-web
+```
+
+Mientras está congelada:
+
+- el autodespliegue y `orbit deploy --all` **la saltan**, con o sin `--if-changed`;
+- `orbit deploy mi-web` **se niega**, diciendo quién la congeló, cuándo y por qué — y cómo forzarlo:
+
+```
+  ✗ «mi-web» está congelada desde hace 2 h por dave: Black Friday: nada hasta el lunes.
+  · Para desplegar igualmente:  orbit deploy mi-web --force
+  · Para levantar la congelación:  orbit unlock mi-web
+```
+
+- `orbit deploy mi-web --force` despliega esa vez, y **la congelación sigue**;
+- **`orbit rollback` sí funciona.** Es la salida de emergencia: congelar es «que no llegue código nuevo», y volver atrás sólo pone una release que ya estuvo sirviendo. Una congelación que lo impidiera te obligaría a levantarla en mitad de un incidente.
+
+Se ve en `orbit list` (al final de la fila), en `orbit info`, en `orbit status`, en `orbit autodeploy status` y en `orbit doctor`; y en `orbit info --json` y `list --json` como `state.locked` y `state.lock` (`{at, by, reason}`, o `null`).
+
+Se guarda en `/etc/orbit/apps/mi-web.lock`, al lado de la configuración y legible con `cat`. Un `touch` de ese fichero también congela. **No viaja**: `orbit clone` no la copia y las copias de seguridad no la llevan, porque es una decisión sobre la producción de este servidor en este momento, y una copia restaurada semanas después la traería sin que nadie recordara por qué.
+
+### Rutas vigiladas en un monorepo
+
+Si tu repositorio tiene la API en `backend/` y la web en `frontend/`, un commit que sólo toca la web no tiene por qué redesplegar la API. Dilo en el `orbit.json`:
+
+```json
+{ "type": "node", "appdir": "backend", "watch": ["backend/", "packages/shared/"] }
+```
+
+La pasada del autodespliegue y `deploy --all --if-changed` comparan el árbol **desplegado** con el nuevo y sólo despliegan si cambia algo dentro de esas rutas. Si no, la app sale como `ignored` («sin cambios en las rutas vigiladas») y en la siguiente pasada ni siquiera se vuelve a mirar.
+
+- Las rutas son **relativas a la raíz del repositorio**, también si el `orbit.json` está en la carpeta de la app: es lo que te deja nombrar un `packages/` hermano.
+- Siempre se vigilan, aunque no las nombres, los `orbit.json` y la carpeta de la app (`appdir`).
+- Sin `watch`, o con la lista vacía, se despliega todo, como siempre. Una ruta absoluta o con `..` no se acepta: se avisa y **se despliega sin filtrar**.
+- Si no se puede saber qué ha cambiado —el commit desplegado ya no está tras un force-push, falla el fetch—, se despliega.
+- `orbit deploy mi-web` a mano, y `deploy --all` sin `--if-changed`, despliegan siempre.
+
+### Esperar a que la CI esté en verde
+
+```bash
+orbit autodeploy checks on mi-web
+orbit autodeploy checks off mi-web
+```
+
+Con esto, la pasada sólo despliega un commit cuyas comprobaciones de GitHub —las de Actions y las de cualquier otro CI que publique su estado en el commit— han terminado todas bien. Se pregunta con el `gh` del usuario de despliegue, el de `orbit github`.
+
+| La CI dice | Qué hace la pasada | Estado |
+|---|---|---|
+| todo en verde (o neutro, o saltado) | despliega **ese commit**, aunque la rama haya avanzado mientras preguntaba | `deployed` |
+| alguna sin terminar | espera a la pasada siguiente, sin avisar | `ci_pending` |
+| alguna en rojo | no despliega; te avisa **una vez por commit** | `ci_failed` |
+| el commit no tiene ninguna | espera `CHECKS_GRACE` segundos (300) por si la CI está arrancando, y luego despliega | `ci_pending` → `deployed` |
+| no he podido preguntar (sin sesión, sin red, el repo no es de GitHub) | **no despliega**, avisa y la pasada sale en rojo | `ci_unknown` |
+
+Vale también para `orbit deploy --all`. `orbit deploy mi-web` a mano despliega igual —lo has pedido tú—, pero te avisa si la CI de ese commit está en rojo.
+
+### En el contrato por lotes
+
+`orbit deploy --all --json` gana cinco finales, con su recuento cada uno: `locked`, `ignored`, `ci_pending`, `ci_failed` y `ci_unknown`. `ok` sigue siendo la misma regla que el código de salida, y ahora también es `false` con alguna `ci_unknown`.
 
 ## Quién visita tu web
 
@@ -726,7 +794,7 @@ Si prefieres no dejarlo a la inferencia, pon un `orbit.json` en la raíz del rep
 }
 ```
 
-Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared`, `env`, `release`, `post_deploy`, `health`, `limits` y `cron`. Los seis últimos —y `shared`— se vuelven a leer en **cada despliegue**, así que cambiarlos en el repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
+Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared`, `watch`, `env`, `release`, `post_deploy`, `health`, `limits` y `cron`. Los seis últimos —y `shared` y `watch`— se vuelven a leer en **cada despliegue**, así que cambiarlos en el repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
 
 ### `shared`: lo que tu app escribe y no puede vivir en una release
 
