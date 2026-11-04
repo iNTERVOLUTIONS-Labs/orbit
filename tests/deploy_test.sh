@@ -1435,6 +1435,9 @@ JSON
   check "y los límites"                     "512M 50%" "$A_LIMIT_MEM $A_LIMIT_CPU"
   check "MemoryMax en la unidad"            "1" "$(_systemd_unit_body orbit-conrel /x 3001 '' | grep -c '^MemoryMax=512M$')"
   check "CPUQuota en la unidad"             "1" "$(_systemd_unit_body orbit-conrel /x 3001 '' | grep -c '^CPUQuota=50%$')"
+  check "el plazo vale en el despliegue"     "90" "$(_deploy_health_secs 40)"
+  A_HEALTH_TIMEOUT=10
+  check "pero no acorta el de por defecto"  "40" "$(_deploy_health_secs 40)"
   _read_repo_runtime "$TMP/no-existe"
   check "sin orbit.json, sin límites"       "" "$(_unit_limits)"
 fi
