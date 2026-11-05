@@ -112,6 +112,13 @@ queue_service()      { echo "$TMP/systemd/orbit-queue.service"; }
 QUEUE_LOCK_DIR="$TMP/locks"
 # shellcheck disable=SC2034  # ídem: el cerrojo de despliegue
 DEPLOY_LOCK_DIR="$TMP/locks"
+# Y los certificados de origen, que viven en /etc/ssl/orbit: una prueba no
+# puede escribir una clave privada ahí, ni leer la de una app de verdad que se
+# llame como la suya. Lo mismo para lo que certbot guarda de cada renovación.
+# shellcheck disable=SC2034  # las lee el 'orbit' cargado
+ORIGIN_CERT_DIR="$TMP/origin-certs"
+# shellcheck disable=SC2034
+LE_RENEWAL_DIR="$TMP/le-renewal"
 
 # 'orbit' activa errexit. En las pruebas queremos seguir ejecutando después de
 # un fallo esperado para poder contarlo, así que lo desactivamos a propósito.

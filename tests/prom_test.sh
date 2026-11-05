@@ -254,6 +254,19 @@ if command -v openssl >/dev/null; then
     promtool check metrics < "$PROMDIR/orbit.prom" >"$TMP/pt" 2>&1; r=$?
     check "promtool acepta la pasada entera" "0" "$r"
   fi
+  # Con un certificado de origen de Cloudflare (1.4.7) el vhost sirve ése y no
+  # el de Let's Encrypt que pudiera quedar: la caducidad publicada tiene que
+  # ser la suya, o Grafana avisaría de un certificado que ya no sirve nadie y
+  # callaría el que sí.
+  mkdir -p "$ORIGIN_CERT_DIR/web"
+  command openssl req -x509 -newkey rsa:2048 -nodes -keyout "$ORIGIN_CERT_DIR/web/key.pem" \
+    -out "$ORIGIN_CERT_DIR/web/cert.pem" -days 5475 -subj "/CN=web.test" >/dev/null 2>&1
+  fin_origen="$(date -d "$(command openssl x509 -enddate -noout -in "$ORIGIN_CERT_DIR/web/cert.pem" | cut -d= -f2)" +%s)"
+  declare -A CERT_END=()
+  run _watch_run >/dev/null 2>&1
+  check "con origen, su caducidad" "$fin_origen" "$(valor "$PROMDIR/orbit.prom" 'orbit_cert_expiry_timestamp_seconds{app="web",domain="web.test"}')"
+  rm -rf "${ORIGIN_CERT_DIR:?}/web"
+  declare -A CERT_END=()
   # Lo guardado es de la pasada. cert_days_left vuelve a leer: en un mismo
   # proceso puede haber un 'orbit ssl' entre medias, y un «no hay» de antes de
   # emitir el certificado seguiría diciéndolo después.

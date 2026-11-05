@@ -553,7 +553,13 @@ La validación HTTP-01 exige que Let's Encrypt alcance tu servidor por el puerto
 
 DNS-01 con la API de Cloudflare evita todo eso. Crea un registro TXT temporal, Let's Encrypt lo comprueba, se borra. Funciona con la nube naranja activada, permite comodines y no depende de que tu servidor sea accesible.
 
-El token se guarda en `/etc/orbit/cloudflare.ini` con permisos `0600` y solo necesita el permiso `Zone → DNS → Edit`.
+El token se guarda en `/etc/orbit/cloudflare.ini` con permisos `0600` y solo necesita el permiso `Zone → DNS → Edit` (más `Zone → SSL and Certificates → Edit` si se quieren certificados de origen, §6.5). Desde la 1.4.7 `orbit cf-token` lo **prueba antes de guardarlo** (`GET /user/tokens/verify`): un token mal pegado no fallaba al guardarlo ni al emitir por HTTP, sino en la primera renovación por DNS, dos meses después. Y se escribe a un temporal con `umask 077` que se mueve encima, porque `printf > fichero; chmod` lo dejaba legible un instante —o para siempre, si el fichero ya existía con otros permisos: `>` conserva los del fichero—.
+
+**Validado de punta a punta en noviembre de 2026**, contra la cuenta de Cloudflare de un servidor de verdad y el staging de Let's Encrypt, con la invocación exacta de `orbit ssl` más `--dry-run`: «The dry run was successful» en 38 s, y `certbot renew --dry-run` sobre la configuración guardada, también. La configuración de renovación que deja Orbit apunta bien (`authenticator = dns-cloudflare`, `dns_cloudflare_credentials = /etc/orbit/cloudflare.ini`, 30 s de propagación, ECDSA). Salieron tres cosas, ninguna de ellas un fallo de la validación:
+
+- **Un alias comodín desaparecía de la petición.** `for a in $A_ALIASES` con `nullglob` convierte `*.midominio.com` en nada si no hay ficheros que se le parezcan. certbot emitía sin protestar —le pedían menos nombres, no uno malo— y los subdominios recibían un certificado que no los cubre. Lo mismo en `domain_owner`, que dejaba un comodín sin dueño. Ahora es `read -ra`, y un comodín sin token se rechaza antes de llamar a certbot: por HTTP no se puede validar.
+- **`certbot renew` sin terminal espera al azar hasta ocho minutos** antes de empezar. La primera prueba se quedó 338 s quieta sin decir nada. `--no-random-sleep-on-renew` en el dry-run (§6.4).
+- **python-cloudflare 2.20, la de Ubuntu 24.04, imprime en cada uso un cartel de catorce líneas de exclamaciones** sobre una versión 3 que no está instalada, y lo fuerza saltándose `PYTHONWARNINGS`. Salió dos veces y era lo más alarmante de una ejecución correcta. `_certbot` quita exactamente esas líneas, una a una y sin estado, para que si el cartel cambia no se lleve nada más por delante.
 
 ### El bucle de redirecciones
 
@@ -627,6 +633,41 @@ Con ella nginx responde `Location: /pricing` y el navegador conserva el esquema 
 ### IPs reales
 
 Sin configurar nada, un origen detrás de Cloudflare ve todas las peticiones viniendo de las IPs de Cloudflare. Los logs son inútiles y el rate limiting castiga a todos por igual. El instalador descarga los rangos oficiales y configura `set_real_ip_from` con `real_ip_header CF-Connecting-IP`. `orbit cf-update` los refresca cuando Cloudflare los cambia.
+
+### 6.4 La renovación, probada hoy (1.4.7)
+
+Un certificado de Let's Encrypt tiene dos mitades y sólo se ve una. La que se ve es el fichero de `live/`, que hoy está bien. La que no se ve es `/etc/letsencrypt/renewal/<dominio>.conf`: **lo que certbot usará dentro de sesenta días**, sin nadie mirando. Ahí se rompen las cosas —el token se borró, la carpeta del reto cambió, una redirección se come el reto (el caso de arriba)— y el único aviso llega a falta de diez días.
+
+`orbit ssl <app> --dry-run` ejecuta lo mismo que el temporizador, contra el staging:
+
+- **Con certificado**, `certbot renew --cert-name <dominio> --dry-run`. No una emisión nueva con los argumentos de hoy: lo que falla es la configuración *guardada*, y una prueba que la ignore saldría verde sobre algo que el temporizador no va a hacer.
+- **Sin certificado**, `certbot certonly` con los mismos argumentos que la emisión más `--dry-run`. Los argumentos salen de **una sola función** (`_ssl_le_args`), porque con dos copias la prueba acabaría validando una invocación que ya no existe. Sin correo configurado no se pregunta ni se escribe en `orbit.conf`: la cuenta de staging puede ir con `--register-unsafely-without-email`.
+
+Además dice por qué método renovará y si algún alias de la app **no está en el certificado**: certbot renueva los nombres que tiene guardados, no los que dice la app, y un alias añadido después de emitir no lo renueva nadie.
+
+No toca nginx ni guarda nada, pero no es gratis: el staging tiene límite de frecuencia. Por eso **doctor no lo lanza**. Lo que hace doctor es la versión barata, sin salir de la máquina: leer esa misma configuración y decir si no existe, si el fichero del token que nombra ha desaparecido o no lleva token, o si la carpeta del reto ya no está. No sabe si el token sigue vivo en Cloudflare —eso sólo lo dice el dry-run—, pero ve los fallos que se producen en el servidor, que son los que nadie nota.
+
+Un efecto que hay que saber: la primera prueba **registra una cuenta en el staging** (`/etc/letsencrypt/accounts/acme-staging-v02…`). Es estado de certbot, no de Orbit, y no afecta a la cuenta de producción.
+
+### 6.5 Certificados de origen de Cloudflare (1.4.7)
+
+Para un origen que sólo se sirve a través del proxy, Cloudflare firma un certificado de **15 años** que en modo **Full (strict)** vale lo mismo que uno de Let's Encrypt y no se renueva nunca: no hay temporizador que pueda fallar. La contrapartida es seria, y todo el diseño sale de ella: **sólo lo acepta Cloudflare**. Un visitante que llegue directo —un registro en nube gris, un alias que nadie metió en el DNS— ve un error de certificado a pantalla completa.
+
+**Fallar antes de tocar nada.** `orbit ssl <app> --origin` pregunta a la API, de sólo lectura, el registro DNS de cada nombre de la app. Si alguno no pasa por el proxy o no tiene registro, **no sigue** sin `--force`. Se pregunta al registro (`proxied`) y no a dónde resuelve hoy, porque eso es lo que decide a dónde irá el siguiente visitante. Si la zona no está al alcance del token no se puede saber, y se avisa sin parar: «no lo sé» no es «no».
+
+**La clave no sale del servidor.** Se genera aquí con `umask 077` (ECDSA P-256; `--rsa` para 2048 bits) y a Cloudflare sólo va el CSR. Antes de escribir el vhost se comprueba que certificado y clave sean pareja (comparando la clave pública), que esté vigente y que cubra todos los nombres —un comodín cubre una etiqueta y sólo una—. nginx -t lo vería también, pero después de haber escrito; aquí se sabe antes.
+
+**El permiso.** `POST /certificates` acepta un token de API con `Zone → SSL and Certificates → Edit`, que la plantilla «Edit zone DNS» de `orbit cf-token` no trae. Lo comprobado contra el token de verdad, con llamadas de sólo lectura: `tokens/verify` lo da por activo; `GET /zones` devuelve 44 zonas, cada una con `permissions: ["#dns_records:edit", "#dns_records:read", "#zone:read"]`; `GET /zones/:id/settings/ssl` da **403, código 9109**; y —la pista falsa— `GET /certificates?zone_id=…` da **200 con la lista vacía**, como si el token pudiera leer certificados y no hubiera ninguno. Así que no hay una pregunta de lectura fiable sobre este permiso, y no se intenta adivinar: se pide el certificado, y si contesta 401 o 403 se dice exactamente qué permiso añadir y dónde. Editar un token no cambia su valor, así que no hay que volver a guardarlo. Nunca se cae a otra cosa: ni a la clave global de la cuenta ni a la de servicio de Origin CA.
+
+**Dónde vive.** En `/etc/ssl/orbit/<app>/` —`cert.pem`, `key.pem` y un `origin.info` en texto con el id de Cloudflare, los nombres y la caducidad—, carpeta `0700` y clave `0600`, de root. Por app y no por dominio, como el de Let's Encrypt, porque no se renueva: es de esa app y se va con ella (`remove --purge`; sin `--purge` se aparta a `.<app>.eliminada.*`, porque una app nueva con el mismo nombre lo serviría al instante sin cubrir sus nombres). Las carpetas apartadas empiezan por un punto a propósito: con `<app>.anterior`, como los puntos valen en un nombre de app, pedir otro certificado para `foo` borraba el de una app llamada `foo.anterior`. Lo encontró una revisión adversarial, con las pruebas en verde. Y en `/etc/ssl` y no en `/etc/orbit` porque nginx lo lee directamente: si Orbit desaparece con su carpeta, el servidor no puede quedarse sin la clave (principio 3). El anterior se aparta hasta que nginx acepta el vhost nuevo; si lo rechaza, vuelve a su sitio.
+
+**Lo que pasa con el de Let's Encrypt.** Si la app tenía uno, se retira con `certbot delete` una vez que el vhost nuevo está en marcha. Dejarlo es dejar un temporizador renovando cada dos meses algo que no se sirve, y el día que la validación deje de funcionar el que falla es ese temporizador, por un certificado que no usa nadie. Volver es `orbit ssl <app>` a secas: pregunta, emite, y sólo cuando nginx ha aceptado el vhost nuevo retira el de origen. `orbit domain` pide otro de origen en vez de uno de Let's Encrypt, porque el de ahora sólo cubre los nombres de antes y Cloudflare contesta 526 a los nuevos.
+
+**Las copias lo llevan, con la clave.** Es la excepción a §17.1 y tiene razón de ser: el token de Cloudflare no viaja en la copia, y sin él no se puede pedir otro; un servidor restaurado contestaría 526 a cada visita hasta que alguien encontrara un token con el permiso. La copia ya es `0600` y ya lleva el `.env`, así que la clave no cambia la clase de secreto que hay dentro. Al restaurar se comprueba que certificado y clave sean pareja, porque la copia es un fichero del que no tiene por qué fiarse nadie (§17.4b).
+
+**Qué se ve.** `orbit info`, y en `--json` el campo `cert_type` (`letsencrypt`, `origin` o `null`; `cert_days` ya existía). El vigilante avisa de la caducidad con la orden correcta (`--origin`). Y doctor comprueba el proxy **sin llamar a la API**: compara la IP a la que resuelve el dominio con los rangos de Cloudflare que el instalador ya dejó en `snippets/orbit-cloudflare.conf`. Si un dominio con certificado de origen resuelve fuera de ellos, es un error, no un aviso: hay visitantes viendo una pantalla roja. Con un CNAME o sin `dig` no se acusa nada. También comprueba, con openssl y sin red, que el certificado cubra todos los nombres de la app: tras un `orbit domain` sin pedir otro, Cloudflare contesta 526 a los nuevos.
+
+**El borrado de Let's Encrypt va con dos guardas**: que nginx haya aceptado el vhost nuevo, y que ese vhost lea de verdad la clave de origen. La segunda parece redundante y no lo es: si algo fallara a mitad con errexit apagado —`orbit domain` llamaba a `cmd_ssl` detrás de un `&&`—, el vhost aceptado podría seguir apuntando a Let's Encrypt, y borrarlo dejaría a nginx sin arrancar en la próxima recarga, el servidor entero. El doble de `nginx -t` de `ssl_test` falla, como el de verdad, si un vhost nombra un certificado que no existe: sin eso, invertir el orden salía en verde.
 
 ---
 
@@ -1298,6 +1339,7 @@ Dos detalles que importan:
 | `logs_test.sh` | traducción de «hace dos horas», el filtro por fecha sobre las dos marcas de tiempo de nginx, los argumentos que recibe journalctl y el formato emitido por nginx de verdad | `nginx` |
 | `clone_test.sh` | qué hereda y qué no una copia, las rutas absolutas reapuntadas, el `.env` sin valores, el deshacer si nginx rechaza, y el 503 servido por nginx antes del primer despliegue | `nginx` |
 | `provision_test.sh` | las variables que declara un `orbit.json`: lo que se puede generar se genera sin preguntar, lo que ya tiene valor no se pisa, sin terminal no se cuelga, travesía de rutas y escritura a través de un enlace simbólico | `jq` para el bloque del descriptor |
+| `ssl_test.sh` | los argumentos de certbot (comodines incluidos), el dry-run de renovación y de emisión, lo que doctor ve de la configuración de renovación, y el ciclo entero del certificado de origen contra una API de Cloudflare de mentira que firma el CSR que recibe: proxy, permiso, pareja clave-certificado, nginx que lo rechaza, copia y restauración, vuelta a Let's Encrypt y `remove --purge`; y que el token nunca va en argv | `openssl`, `jq` |
 
 Las dos últimas se saltan solas con un aviso si falta el binario, en vez de fallar.
 
