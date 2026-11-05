@@ -379,7 +379,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.7"
+ORBIT_VERSION="1.4.8"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -10499,6 +10499,25 @@ _ssl_origin_api_error() { # _ssl_origin_api_error <código HTTP> <respuesta.json
   return 0
 }
 
+# El 'status' de una respuesta de tokens/verify. jq es opcional en el resto de
+# Orbit, y guardar el token no puede pasar a necesitarlo: sin él se mira el
+# campo a mano. Sin esto, un token bueno se rechazaba con «HTTP 200».
+_cf_verify_status() { # _cf_verify_status <respuesta.json>
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.result.status // empty' "$1" 2>/dev/null || true
+  else
+    grep -o '"status" *: *"[a-z_]*"' "$1" 2>/dev/null | head -1 | sed 's/.*"\([a-z_]*\)"$/\1/' || true
+  fi
+}
+# El id de la cuenta dueña de la primera zona de una respuesta de /zones.
+_cf_first_account() { # _cf_first_account <respuesta.json>
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.result[0].account.id // empty' "$1" 2>/dev/null || true
+  else
+    grep -o '"account" *: *{ *"id" *: *"[0-9a-f]*"' "$1" 2>/dev/null | head -1 | sed 's/.*"\([0-9a-f]*\)"$/\1/' || true
+  fi
+}
+
 cmd_cf_token() {
   need_root cf-token
   title "Token de API de Cloudflare"
@@ -10509,6 +10528,8 @@ cmd_cf_token() {
     · Permissions: Zone → DNS → Edit
                    Zone → SSL and Certificates → Edit  ${D}(only for 'orbit ssl --origin')${R}
     · Zones:       all of yours (or the ones you want to use here)
+    An account token (Manage Account → API Tokens, 'cfat_…') works too.
+    Give it only these permissions: root reads it on every renewal.
 
 EOF
        ;;
@@ -10518,6 +10539,8 @@ EOF
     · Permisos:  Zone → DNS → Edit
                  Zone → SSL and Certificates → Edit  ${D}(sólo para 'orbit ssl --origin')${R}
     · Zonas:     todas las tuyas (o las que quieras usar aquí)
+    También vale un token de cuenta (Manage Account → API Tokens, 'cfat_…').
+    Dale sólo estos permisos: root lo lee en cada renovación.
 
 EOF
        ;;
@@ -10543,13 +10566,23 @@ EOF
   # primera renovación por DNS, dos meses después.
   out="$(mktemp)"
   code="$(CF_INI="$new" _cf_api GET /user/tokens/verify "$out")"
-  # jq es opcional en el resto de Orbit, y guardar el token no puede pasar a
-  # necesitarlo: sin él se mira el campo a mano. Sin esto, un token bueno se
-  # rechazaba con «HTTP 200».
-  if command -v jq >/dev/null 2>&1; then
-    st="$(jq -r '.result.status // empty' "$out" 2>/dev/null || true)"
-  else
-    st="$(grep -o '"status" *: *"[a-z_]*"' "$out" 2>/dev/null | head -1 | sed 's/.*"\([a-z_]*\)"$/\1/' || true)"
+  st="$(_cf_verify_status "$out")"
+  # Los tokens de cuenta —'cfat_…', los que se crean en Manage Account → API
+  # Tokens y no en el perfil— no existen para /user/tokens/verify: Cloudflare
+  # contesta 401 «Invalid API Token» a un token perfectamente válido, y Orbit
+  # lo rechazaba. Se verifican en /accounts/<id>/tokens/verify, y el id sale de
+  # la primera zona que ve el token: ver zonas le hace falta de todos modos
+  # para validar por DNS y para los certificados de origen.
+  if [[ "$code" == 401 ]]; then
+    local acc
+    code="$(CF_INI="$new" _cf_api GET '/zones?per_page=1' "$out")"
+    acc="$(_cf_first_account "$out")"
+    if [[ "$code" == 200 && -n "$acc" ]]; then
+      code="$(CF_INI="$new" _cf_api GET "/accounts/$acc/tokens/verify" "$out")"
+      st="$(_cf_verify_status "$out")"
+    else
+      code=401; st=""
+    fi
   fi
   rm -f "$out"
   if [[ "$code" == 200 && "$st" == active ]]; then
