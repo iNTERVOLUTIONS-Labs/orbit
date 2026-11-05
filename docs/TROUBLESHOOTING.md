@@ -753,6 +753,32 @@ Ver los certificados que existen:
 sudo certbot certificates
 ```
 
+## El certificado está bien hoy, pero ¿se renovará?
+
+```bash
+sudo orbit ssl mi-web --dry-run
+```
+
+Hace la renovación de verdad contra el entorno de pruebas de Let's Encrypt, sin guardar nada. Si falla, falla igual que fallará el temporizador dentro de unas semanas, y el detalle está en `/var/log/letsencrypt/letsencrypt.log`. Lo que suele salir:
+
+- **`certbot renovará por: webroot`** en una app detrás del proxy, con «Always Use HTTPS» en Cloudflare. Guarda el token (`orbit cf-token`) y vuelve a emitir con `orbit ssl mi-web`.
+- **El fichero del token no existe**: alguien borró `/etc/orbit/cloudflare.ini`. `orbit doctor` también lo ve, sin llamar a nadie.
+- **«El certificado no cubre …»**: añadiste un alias después de emitir. certbot renueva lo que tiene guardado, no lo que dice la app: `orbit ssl mi-web` lo vuelve a emitir con todos los nombres.
+
+Si se queda un rato sin decir nada no está colgado: es la espera de propagación del DNS (30 segundos).
+
+## «El token de Cloudflare no tiene permiso para pedir certificados de origen»
+
+`orbit ssl --origin` usa el mismo token que certbot, y el de la plantilla «Edit zone DNS» sólo puede tocar registros DNS. En https://dash.cloudflare.com/profile/api-tokens, **Edit** en ese token y añade **Zone → SSL and Certificates → Edit** sobre las mismas zonas. El token no cambia al editarlo.
+
+Ojo con una pista falsa: `GET /certificates?zone_id=…` contesta **200 con una lista vacía** aunque el token no tenga el permiso, así que mirar esa lista no dice nada. Lo único que lo dice es pedir el certificado.
+
+## Error 526 o «certificado no válido» con un certificado de origen
+
+El certificado de origen sólo lo acepta Cloudflare. Si el navegador se queja, el nombre no está pasando por el proxy: `orbit doctor` lo dice si el dominio resuelve a una IP que no es de Cloudflare. Pon la nube naranja, o vuelve a Let's Encrypt con `orbit ssl mi-web`.
+
+Si es Cloudflare quien da el 526, el modo es **Full (strict)** y el certificado no cubre ese nombre —un alias añadido después—: `orbit ssl mi-web --origin` pide otro con los nombres de ahora.
+
 ---
 
 ## "Orbit no está instalado" cuando sí lo está
