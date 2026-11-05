@@ -371,17 +371,27 @@ check "shebang sin env y con -p"  "#!/bin/bash -p" "$(head -1 "$ORBIT_ROOT/orbit
 # Se eleva la ruta real: la regla nombra /usr/local/bin/orbit, y 'dv' —el
 # enlace de install.sh— no se llama así. Se ejecuta el script de verdad con un
 # 'sudo' de mentira que enseña con qué lo llamaron.
+# Como root —el contenedor Debian de CI— no se elevaría nada, así que la copia
+# fuerza la condición: el código que se prueba es el mismo, sólo cambia quién
+# lo dispara. Saltarla dejaba test-strict en rojo y la elevación sin probar.
+# Sin SUDO_UID y con timeout: lanzada la tanda con 'sudo', la limpieza del
+# entorno quitaba el sudo de mentira del PATH, la copia forzada llamaba al de
+# verdad, y éste a la copia otra vez — una cadena de sudo que no acababa.
+mkdir -p "$TMP/elev/bin" "$TMP/elev/fake"
 if [[ $EUID -ne 0 ]]; then
-  mkdir -p "$TMP/elev/bin" "$TMP/elev/fake"
-  cp "$ORBIT_ROOT/orbit" "$TMP/elev/bin/orbit"; chmod +x "$TMP/elev/bin/orbit"
+  cp "$ORBIT_ROOT/orbit" "$TMP/elev/bin/orbit"
+else
+  sed 's|^if \[\[ \$EUID -ne 0 \]\]; then$|if true; then|' "$ORBIT_ROOT/orbit" > "$TMP/elev/bin/orbit"
+  check "la copia fuerza la elevación" "1" "$(grep -c '^if true; then$' "$TMP/elev/bin/orbit")"
+fi
+chmod +x "$TMP/elev/bin/orbit"
+{
   ln -s orbit "$TMP/elev/bin/dv"
   printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$TMP/elev/fake/sudo"; chmod +x "$TMP/elev/fake/sudo"
-  out="$(PATH="$TMP/elev/fake:$PATH" "$TMP/elev/bin/dv" list 2>&1 | tr '\n' ' ')"
+  out="$(env -u SUDO_UID -u SUDO_USER PATH="$TMP/elev/fake:$PATH" timeout 20 "$TMP/elev/bin/dv" list 2>&1 | tr '\n' ' ')"
   check "eleva la ruta real"     "-- $TMP/elev/bin/orbit list " "$out"
-  out="$(ORBIT_LANG=en PATH="$TMP/elev/fake:$PATH" "$TMP/elev/bin/dv" list 2>&1 | tr '\n' ' ')"
+  out="$(env -u SUDO_UID -u SUDO_USER ORBIT_LANG=en PATH="$TMP/elev/fake:$PATH" timeout 20 "$TMP/elev/bin/dv" list 2>&1 | tr '\n' ' ')"
   check "y se lleva el idioma"   "-- $TMP/elev/bin/orbit --lang en list " "$out"
-else
-  echo "  me salto la auto-elevación: corriendo como root no se eleva nada"
-fi
+}
 
 report
