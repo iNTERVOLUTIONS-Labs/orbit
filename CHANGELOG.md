@@ -87,6 +87,22 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.8] - 2026-11-05
+
+El certificado de origen de Cloudflare, pedido **de verdad**: lo único que la v1.4.7 había dejado sin medir, porque el token del servidor no tenía el permiso y sólo se habían hecho llamadas de lectura. Y de hacerlo salió un fallo que ninguna prueba podía ver.
+
+### Validado — `orbit ssl <app> --origin` contra la API real
+
+Sobre `reset15.intervolutions.com`, con el proxy puesto y la zona en Full (strict): Cloudflare firmó el CSR en un par de segundos, el vhost pasó `nginx -t`, la web siguió contestando 200 a través de Cloudflare sin un solo corte, y `openssl s_client` contra el origen enseña `CloudFlare Origin SSL ECC Certificate Authority` hasta 2041. La clave quedó en `/etc/ssl/orbit/reset15/key.pem` con 0600 de root, el Let's Encrypt de antes se retiró de certbot —no queda fichero de renovación— y `orbit info`, `info --json` (`cert_type: "origin"`) y `doctor` lo cuentan.
+
+### Corregido — `orbit cf-token` rechazaba los tokens de cuenta
+
+Cloudflare tiene dos clases de token: los del **perfil** y los de la **cuenta** (Manage Account → API Tokens, empiezan por `cfat_`). Los de cuenta no existen para `/user/tokens/verify`: le contesta `401` y `Invalid API Token`, exactamente lo mismo que a uno inventado. Orbit verificaba sólo ahí, así que **un token perfectamente válido no se podía guardar** —el de la prueba de arriba, que listaba las 44 zonas y firmaba certificados, salía «no da ese token por bueno»—. Ahora, ante un 401, se saca el id de cuenta de la primera zona que ve el token y se verifica en `/accounts/<id>/tokens/verify`; con o sin `jq`. Un token inventado sigue sin pasar: la lista de zonas también le contesta 401. Con cinco comprobaciones nuevas en `ssl_test`, y comprobadas quitando la segunda puerta y la lectura del id.
+
+### Cambiado — el texto de `orbit cf-token` pide pocos permisos
+
+Dice que un token de cuenta también vale y que se le den **sólo** los permisos de la lista, porque root lo lee en cada renovación. El de la prueba tenía casi todos los permisos de la cuenta —facturación, crear tokens, registrar dominios— y por eso no se guardó en el servidor: se usó desde un fichero temporal de root y se borró al acabar.
+
 ## [1.4.7] - 2026-11-04
 
 DNS-01 con un token de Cloudflare de verdad, que era lo primero que quedaba por probar en un VPS, y lo siguiente del ROADMAP: los certificados de origen de Cloudflare. `tests/ssl_test.sh` es nueva —`cmd_ssl` no tenía ni una prueba— con 162 comprobaciones, y cada arreglo se puso en rojo quitándolo —treinta y tantas mutaciones del código, todas en rojo—. Una revisión adversarial encargada aparte encontró doce cosas antes del commit (abajo, «Lo que encontró revisarlo»). Ver ARCHITECTURE §6, §6.4 y §6.5.
