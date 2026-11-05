@@ -97,6 +97,8 @@ orbit status               Salud del servidor
 orbit doctor               Diagnóstico completo
 orbit maintenance on|off   Página de "volvemos enseguida" con 503
 orbit watch enable         Vigilancia cada minuto, sin demonios
+orbit metrics prom enable  Métricas para Prometheus, sin exportador ni puerto
+orbit admin add <usuario>  Usar orbit sin ser root (equivale a root)
 orbit notify setup         Avisos por Telegram, Discord, webhook o correo
 orbit lang [código]        Idioma: español o inglés (por defecto, el del sistema)
 ```

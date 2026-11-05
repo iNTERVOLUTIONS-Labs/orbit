@@ -654,6 +654,7 @@ section "Los comandos nuevos llegan por la línea de órdenes"
 sed "s|^ETC_DIR=.*|ETC_DIR=\"$TMP/etc\"|; \
      s|^LOG_FILE=.*|LOG_FILE=\"$TMP/orbit.log\"|; \
      s|^if \[\[ \$EUID -ne 0 \]\]; then|if false; then|; \
+     s|^if \[\[ \$EUID -eq 0 \&\& .*SUDO_UID.*; then$|if false; then|; \
      s|^need_root() {.*|need_root() { return 0; }|" \
     "$ORBIT_ROOT/orbit" > "$TMP/orbitcli"
 chmod +x "$TMP/orbitcli"

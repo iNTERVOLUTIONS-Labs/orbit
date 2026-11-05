@@ -31,10 +31,15 @@ KEEP_RELEASES="5"
 EOF
 
 # Cargamos el script sin su última línea (la llamada a main) y neutralizando la
-# auto-elevación con sudo, para poder invocar las funciones una a una.
+# auto-elevación con sudo, para poder invocar las funciones una a una. Y la
+# limpieza del entorno que hace cuando root actúa en nombre de otro: con la
+# tanda lanzada con 'sudo', SUDO_UID está puesta y se llevaría por delante el
+# PATH de los dobles y lo que cada suite exporta. Esa limpieza tiene su propia
+# prueba en admin_test, que la ejecuta suelta.
 sed '$ d' "$ORBIT_ROOT/orbit" \
   | sed "s|^ETC_DIR=.*|ETC_DIR=\"$TMP/etc\"|" \
   | sed 's|^if \[\[ \$EUID -ne 0 \]\]; then|if false; then|' \
+  | sed 's|^if \[\[ \$EUID -eq 0 \&\& .*SUDO_UID.*; then$|if false; then|' \
   > "$TMP/orbitlib.sh"
 # shellcheck disable=SC1090
 source "$TMP/orbitlib.sh"

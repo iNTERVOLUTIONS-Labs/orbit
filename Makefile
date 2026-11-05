@@ -47,6 +47,8 @@ test: check lint
 	bash tests/cli_test.sh
 	bash tests/top_test.sh
 	bash tests/metrics_test.sh
+	bash tests/prom_test.sh
+	bash tests/admin_test.sh
 	bash tests/traffic_test.sh
 	bash tests/new_test.sh
 	bash tests/interactive_test.sh
