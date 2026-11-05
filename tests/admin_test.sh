@@ -39,6 +39,8 @@ CALLS="$TMP/calls"; : > "$CALLS"
 getent() {
   local f
   case "$1" in passwd) f="$TMP/passwd" ;; group) f="$TMP/group" ;; *) return 2 ;; esac
+  # Sin clave, la base entera: como el de verdad.
+  (( $# > 1 )) || { cat "$f"; return 0; }
   grep -m1 "^$2:" "$f" || return 2
 }
 groupadd() { printf 'groupadd %s\n' "$*" >> "$CALLS"; printf '%s:x:999:\n' "${*: -1}" >> "$TMP/group"; }
@@ -178,6 +180,32 @@ section "La lista"
 run _admin_list >"$TMP/o" 2>&1
 check "enseña a ana"             "1" "$(grep -c 'ana' "$TMP/o")"
 check "y dice lo que es"         "1" "$(grep -c 'equivale a ser root' "$TMP/o")"
+
+section "Quien lo tiene como grupo principal también cuenta"
+# '%orbit-admin' en sudoers casa con el grupo principal, y la lista de 'getent
+# group' no lo trae: 'admin list' decía «Nadie» de alguien que era root.
+cp "$TMP/passwd" "$TMP/passwd.bak"
+printf 'pepe:x:1004:999::/home/pepe:/bin/bash\n' >> "$TMP/passwd"
+check "en la lista"              "ana pepe" "$(_admin_members | tr '\n' ' ' | sed 's/ $//')"
+run _admin_list >"$TMP/o" 2>&1
+check "la lista lo enseña"       "1" "$(grep -c 'pepe' "$TMP/o")"
+: > "$CALLS"
+run _admin_remove pepe >"$TMP/o" 2>&1; r=$?
+check "quitarlo no se finge"     "1" "$r"
+check "y dice cómo"              "1" "$(grep -c 'usermod -g' "$TMP/o")"
+check "sin gpasswd"              "0" "$(grep -c '^gpasswd' "$CALLS")"
+cp "$TMP/passwd.bak" "$TMP/passwd"
+
+section "Un grupo orbit-admin que ya existía"
+# La regla hace root a todos los que ya estén dentro, no sólo a quien se
+# añade: se dice quiénes son.
+mv "$SUDOERS_ADMIN" "$TMP/regla.bak"
+run _admin_add luis >"$TMP/o" 2>&1; r=$?
+check "añade"                    "0" "$r"
+check "y avisa de quién ya estaba" "1" "$(grep -c 'ya existía.*: ana$' "$TMP/o")"
+run _admin_add luis >"$TMP/o" 2>&1
+check "con la regla puesta, no"  "0" "$(grep -c 'ya existía' "$TMP/o")"
+run _admin_remove luis >/dev/null 2>&1
 
 # ═══════════════════════════════════════════════════════════════════════════
 section "Por la línea de órdenes"
@@ -325,10 +353,47 @@ check "sólo un PATH ajeno: fijo"   "PATH=$LIMPIO_PATH" "$(solo PATH="$TMP/malo:
 check "sin PATH: se pone"          "1" "$(solo HOME="$LIMPIO_HOME" | grep -c '^PATH='"$LIMPIO_PATH"'$')"
 check "sin HOME: se pone"          "HOME=$LIMPIO_HOME" "$(solo PATH="$LIMPIO_PATH" | grep '^HOME=')"
 check "limpio del todo: igual"     "PATH=$LIMPIO_PATH" "$(solo PATH="$LIMPIO_PATH" HOME="$LIMPIO_HOME" | grep '^PATH=')"
+# Lo que dispara la limpieza es que SUDO_UID exista, no su valor: con un
+# SETENV en la regla —una regla 'ALL' lo lleva implícito— quien llama escribe
+# 'sudo SUDO_UID=0 BACKUP_HOOK=… orbit' y elegía el valor. Aquí la guarda no se
+# fuerza entera: sólo el «soy root».
+BLOQUE_UID="$TMP/limpieza-uid.sh"
+{ head -1 "$ORBIT_ROOT/orbit"
+  echo 'set -Eeuo pipefail'
+  sed -n '/^# >>> limpieza del entorno/,/^# <<< limpieza del entorno/p' "$ORBIT_ROOT/orbit" \
+    | sed 's|^if \[\[ \$EUID -eq 0 \&\& |if [[ 0 -eq 0 \&\& |'
+  printf 'printf "BACKUP_HOOK=%%s\\n" "${BACKUP_HOOK-(nada)}"\n'
+} > "$BLOQUE_UID"; chmod +x "$BLOQUE_UID"
+check "la guarda, a medias"      "1" "$(grep -c '^if \[\[ 0 -eq 0 && ' "$BLOQUE_UID")"
+check "SUDO_UID=0 no la salta"   "BACKUP_HOOK=(nada)" "$(env -i SUDO_UID=0 SUDO_USER=ana BACKUP_HOOK=x PATH=/usr/bin:/bin timeout 20 "$BLOQUE_UID" 2>&1)"
+check "ni SUDO_UID vacío"        "BACKUP_HOOK=(nada)" "$(env -i SUDO_UID= BACKUP_HOOK=x PATH=/usr/bin:/bin timeout 20 "$BLOQUE_UID" 2>&1)"
+check "root sin sudo, como siempre" "BACKUP_HOOK=x" "$(env -i BACKUP_HOOK=x PATH=/usr/bin:/bin timeout 20 "$BLOQUE_UID" 2>&1)"
+# Una entrada del entorno sin '=' —sudo no las pasa, pero un execve sí— no es
+# una variable, y en la lista de 'env -i' se convertía en la orden que
+# ejecutar: 'env: LANG: No such file or directory'.
+if command -v python3 >/dev/null; then
+  cat > "$TMP/rawexec.py" <<'PY'
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+def arr(xs):
+    a = (ctypes.c_char_p * (len(xs) + 1))(*[x.encode() for x in xs]); a[len(xs)] = None; return a
+env = ["SUDO_UID=1002", "BACKUP_HOOK=x", "PATH=/usr/bin:/bin", "LANG"]
+libc.execve(sys.argv[1].encode(), arr([sys.argv[1]]), arr(env))
+print("execve:", ctypes.get_errno())
+PY
+  check "una entrada sin '=', fuera" "BACKUP_HOOK=(nada)" "$(timeout 20 python3 -I "$TMP/rawexec.py" "$BLOQUE_UID" 2>&1)"
+fi
 # Sin /proc no se puede mirar: se apunta, y Orbit se niega a seguir.
 sed 's|/proc/self/environ|/nonexistent/environ|g' "$BLOQUE" > "$TMP/limpieza-sinproc.sh"; chmod +x "$TMP/limpieza-sinproc.sh"
 env -i BACKUP_HOOK=x SUDO_UID=1002 PATH=/usr/bin:/bin HOME=/home/ana "$TMP/limpieza-sinproc.sh" > "$TMP/env2.out" 2>&1
 check "sin /proc, se apunta"     "1" "$(grep -cx 'DIRTY=yes' "$TMP/env2.out")"
+# Y hasta el aviso hay órdenes —el grep del idioma, tput—: con el PATH de quien
+# llama, su 'grep' corría como root antes de que Orbit dijera que no sigue.
+check "y aun así, PATH fijo"     "1" "$(grep -cx "PATH=$LIMPIO_PATH" "$TMP/env2.out")"
+check "y HOME"                   "1" "$(grep -cx "HOME=$LIMPIO_HOME" "$TMP/env2.out")"
+check "y sin lo de quien llama"  "1" "$(grep -cx 'BACKUP_HOOK=(nada)' "$TMP/env2.out")"
+check "salvo quién es"           "1" "$(env -i SUDO_UID=1002 SUDO_USER=ana PATH=/usr/bin:/bin "$TMP/limpieza-sinproc.sh" 2>&1 | grep -cx 'SUDO_USER=ana')"
+check "y sin rutas en el idioma" "1" "$(env -i SUDO_UID=1002 LANGUAGE=../x PATH=/usr/bin:/bin "$TMP/limpieza-sinproc.sh" 2>&1 | grep -cx 'LANGUAGE=(nada)')"
 # Y el script de verdad, con la guarda forzada y sin /proc, se para antes de
 # hacer nada. Sin la auto-elevación (aquí sí se ejecutaría un sudo de verdad)
 # y con la configuración de la tanda.

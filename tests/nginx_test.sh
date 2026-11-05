@@ -576,6 +576,18 @@ printf 'SECRETO=FUGA\n'              > "$PNA/$PNP/_nuxt/viejo.env"
 printf 'pagina vieja FUGA\n'         > "$PNA/$PNP/vieja.html"
 printf 'del proceso\n'               > "$TMP/back/_nuxt/solo-app.js"
 printf 'latest del proceso\n'        > "$TMP/back/_nuxt/builds/latest.json"
+# Un enlace que el build deja en su salida hacia lo que no es de la app: nginx
+# lo seguía y servía como www-data lo que hubiera al otro lado —los logs de
+# las otras apps, que son de www-data—. El dueño del destino tiene que ser
+# otro que el del enlace, que es lo que mira 'if_not_owner': como root, un
+# fichero de nobody; sin root, uno del sistema, que es de root.
+FUGA_T="$TMP/fuera/secreto.txt"; mkdir -p "$TMP/fuera"; printf 'FUGA por enlace\n' > "$FUGA_T"
+if [[ $EUID -eq 0 ]]; then chown 65534 "$TMP/fuera" "$FUGA_T"; else FUGA_T="/etc/hostname"; fi
+ln -s "$FUGA_T" "$PNB/$PNP/_nuxt/enlace.js"
+ln -s "$FUGA_T" "$PNA/$PNP/_nuxt/enlace-viejo.js"
+ln -s "$(dirname "$FUGA_T")" "$PNB/$PNP/_nuxt/carpeta"
+# Y el que la app hace hacia lo suyo, que sigue valiendo.
+ln -s b2.js "$PNB/$PNP/_nuxt/propio.js"
 ln -sfn "$PNB" "$TMP/apps/procnuxt/current"
 ln -sfn "$PNA" "$TMP/apps/procnuxt/previous"
 mkapp procnuxt node "$BACKPORT" "procnuxt.test"
@@ -1351,6 +1363,10 @@ check "proceso: las rutas, a la app" "respuesta del backend" "$(BODY "${PN[@]}" 
 check "proceso: una página vieja, no" "0"       "$(BODY "${PN[@]}" "$SKU/vieja.html" | grep -c FUGA)"
 check "proceso: oculto de la anterior" "403"    "$(H "${PN[@]}" "$SKU/_nuxt/.oculto.js")"
 check "proceso: .env de la anterior" "403"      "$(H "${PN[@]}" "$SKU/_nuxt/viejo.env")"
+check "enlace fuera: no se sigue"    "404"      "$(H "${PN[@]}" "$SKU/_nuxt/enlace.js")"
+check "ni en la anterior"            "404"      "$(H "${PN[@]}" "$SKU/_nuxt/enlace-viejo.js")"
+check "ni una carpeta enlazada"      "404"      "$(H "${PN[@]}" "$SKU/_nuxt/carpeta/${FUGA_T##*/}")"
+check "el enlace propio, sí"         "nuxt chunk B" "$(BODY "${PN[@]}" "$SKU/_nuxt/propio.js")"
 # Con el proceso caído los recursos siguen saliendo, de las dos; lo que no
 # está es un 502 —ha ido a la app—, no un 404 que nadie ha decidido.
 PQ=(-H 'Host: procqwik.test')

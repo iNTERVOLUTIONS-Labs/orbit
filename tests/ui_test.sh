@@ -43,6 +43,11 @@ check "y arriba"        "100" "$(con_entorno TERM=xterm COLUMNS=400 -- 'printf "
 check "respeta COLUMNS"  "72" "$(con_entorno TERM=xterm COLUMNS=72  -- 'printf "%s" "$UI_WIDTH"')"
 # Un COLUMNS con basura no puede tumbar a orbit ni dar una raya de ancho «».
 check "COLUMNS con basura" "66" "$(con_entorno TERM=xterm COLUMNS=ocho -- 'printf "%s" "$UI_WIDTH"')"
+# Con un cero delante, en base 10: para la aritmética de bash '080' no es un
+# número —error por la salida de errores— y '070' es un 56 que sale escrito
+# «070».
+check "con un cero delante"  "80" "$(con_entorno TERM=xterm COLUMNS=080 -- 'printf "%s" "$UI_WIDTH"')"
+check "y no en octal"        "70" "$(con_entorno TERM=xterm COLUMNS=070 -- 'printf "%s" "$UI_WIDTH"')"
 
 section "La raya mide lo que dice"
 UI_WIDTH=66
