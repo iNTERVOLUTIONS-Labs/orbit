@@ -221,12 +221,19 @@ probar_campo() { # probar_campo <descripción> <campo> <valor ya entrecomillado>
   run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
   check "$1" "1" "$r"
   check "$1: nada escrito" "0" "$(app_exists evil && echo 1 || echo 0)"
+  # Limpia pase lo que pase: si un campo se cuela, el siguiente no tiene que
+  # fallar por encontrarse la app ya restaurada.
+  rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil"
 }
 probar_campo "una directiva más en la unidad"  A_LIMIT_MEM "'512M
 ExecStartPre=+/bin/sh -c id'"
 probar_campo "un arranque de dos líneas"       A_START "'node a.js
 ExecStartPre=+/bin/true'"
-probar_campo "la app corriendo como root"      A_USER "'root'"
+# Un usuario que no es ni el de la app ni el de despliegue. Con la tanda
+# corriendo como root —el contenedor Debian de CI— el de despliegue ES root, y
+# ahí root vale: la prueba usa otro de sistema que nunca lo es.
+AJENO=root; [[ "$DEPLOY_USER" == root ]] && AJENO=daemon
+probar_campo "la app corriendo como otro del sistema" A_USER "'$AJENO'"
 probar_campo "o como otra app"                 A_USER "'orbit-otra'"
 probar_campo "aritmética que ejecuta"          A_HEALTH_TIMEOUT "'a[\$(id)]'"
 probar_campo "un dominio que rompe el vhost"   A_DOMAIN "'x.test; include /etc/shadow'"
