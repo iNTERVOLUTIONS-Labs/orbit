@@ -118,6 +118,23 @@ run _pnpm_ws_apply "$REL" >/dev/null; r=$?
 check "sin paquetes, nada" "1"      "$r"
 check "ni fichero"        "0"       "$([[ -f "$REL/pnpm-workspace.yaml" ]] && echo 1 || echo 0)"
 
+# El fichero viene del repositorio, y git guarda enlaces: uno a un fichero de
+# root lo leía root con awk, le añadía el bloque y se lo daba a la app con un
+# chown. Ni se sigue, ni lo escribe root.
+ws
+printf 'root:x:0:0\n' > "$TMP/passwd-de-mentira"
+ln -s "$TMP/passwd-de-mentira" "$REL/pnpm-workspace.yaml"
+run _pnpm_ws_apply "$REL" esbuild >/dev/null 2>&1; r=$?
+check "un enlace no se sigue"  "1" "$r"
+check "ni se toca lo apuntado" "root:x:0:0" "$(cat "$TMP/passwd-de-mentira")"
+ws 'packages:\n  - a\n'
+A_USER="orbit-rec"
+: > "$AS_USER_LOG"
+run _pnpm_ws_apply "$REL" esbuild >/dev/null; r=$?
+check "escribe"                "0" "$r"
+check "como la app"            "1" "$(grep -c "^orbit-rec tee -- $REL/pnpm-workspace.yaml\$" "$AS_USER_LOG")"
+A_USER=""
+
 section "Cuánta memoria darle a Node"
 mem() { printf 'MemTotal: %s kB\nMemAvailable: %s kB\n' "$1" "$2" > "$TMP/mem"; printf '%s' "$TMP/mem"; }
 check "8 GB libres → 4096 (tope)" "4096" "$(_recover_heap_mb "$(mem 16000000 8000000)")"

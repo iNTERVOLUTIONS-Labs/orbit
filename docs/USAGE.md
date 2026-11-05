@@ -350,10 +350,16 @@ La pasada del autodespliegue y `deploy --all --if-changed` comparan el árbol **
 
 ### Esperar a que la CI esté en verde
 
+> **Cambia en 1.4.9: con un repositorio de GitHub, `orbit autodeploy enable` ya espera a la CI por defecto.** Antes había que pedirlo con `checks on`. Para no esperarla, `orbit autodeploy enable mi-web --no-checks`. Las apps que **ya** estaban en automático no cambian solas —eso sería cambiar en silencio cuándo se despliega algo—: `orbit autodeploy status` dice en cada una si espera a la CI o no, y `orbit doctor` cuenta las de GitHub que no la esperan. Un `checks off` anterior se respeta aunque vuelvas a hacer `enable`.
+
 ```bash
+orbit autodeploy enable mi-web               # GitHub: con la puerta puesta
+orbit autodeploy enable mi-web --no-checks   # sin esperar a la CI
 orbit autodeploy checks on mi-web
 orbit autodeploy checks off mi-web
 ```
+
+Ojo: la puerta pregunta con el `gh` del usuario de despliegue, y **si no puede preguntar no despliega**. Si `orbit github` no está conectado, una app recién puesta en automático no se desplegará sola hasta que lo esté; `enable` lo avisa en ese momento.
 
 Con esto, la pasada sólo despliega un commit cuyas comprobaciones de GitHub —las de Actions y las de cualquier otro CI que publique su estado en el commit— han terminado todas bien. Se pregunta con el `gh` del usuario de despliegue, el de `orbit github`.
 
@@ -859,7 +865,7 @@ Vale para ficheros y para carpetas, y las rutas son relativas a la raíz del rep
 
 **El health check acepta cualquier respuesta que no sea un 5xx.** Antes un 404 o un 401 en `/` hacían rollback siempre, y una API sin ruta raíz no se podía desplegar.
 
-**`cron`** acepta `every` (`"5m"`, `"1h"`, `"1d"`; un minuto como mínimo) o `schedule` con la sintaxis de `OnCalendar` de systemd (`"*:0/15"`, `"Mon *-*-* 07:00:00"`), que se valida con `systemd-analyze calendar`. El `command` es una línea de bash con el `.env` de la app cargado. Dos pasadas nunca se solapan (un oneshot no arranca mientras sigue activo). Las tareas se sincronizan **después** de activar la release —una tarea nueva no ejecuta código que aún no sirve— y la que se quita del `orbit.json` se retira en el despliegue siguiente; `orbit remove` se las lleva todas.
+**`cron`** acepta `every` (`"5m"`, `"1h"`, `"1d"`; un minuto como mínimo) o `schedule` con la sintaxis de `OnCalendar` de systemd (`"*:0/15"`, `"Mon *-*-* 07:00:00"`), que se valida con `systemd-analyze calendar`. El `command` es una línea de bash con el `.env` de la app cargado: `shared/.env` y, si el `orbit.json` declara otro en `"env": {"file": …}`, también ése, detrás, que es el que gana (desde 1.4.9; antes las tareas sólo veían `shared/.env`). Lo mismo para la unidad de la app, el comando `release`, `post_deploy` y `orbit exec`. `orbit cron run <app> <tarea>` sólo acepta una tarea que exista. Dos pasadas nunca se solapan (un oneshot no arranca mientras sigue activo). Las tareas se sincronizan **después** de activar la release —una tarea nueva no ejecuta código que aún no sirve— y la que se quita del `orbit.json` se retira en el despliegue siguiente; `orbit remove` se las lleva todas.
 
 ```bash
 orbit cron mi-app              # las tareas y cuándo corren
@@ -904,7 +910,7 @@ En el despliegue, para cada variable **que aún no tenga valor**:
 
 **El bloque se relee en cada despliegue**, de la release recién sacada. Añadir una variable al `orbit.json` basta; no hay que recrear la app.
 
-`orbit env get/set/list/edit` operan sobre ese mismo fichero, no sobre otro.
+`orbit env get/set/list/edit` operan sobre ese mismo fichero, no sobre otro. Y es el que ve la app al correr: la unidad, las tareas de `cron`, `release`, `post_deploy` y `orbit exec` cargan `shared/.env` y después el declarado, que manda. El build sigue cargando sólo el `.env` de la raíz de la release (`shared/.env`).
 
 Y si no hay nadie al teclado —`--yes`, `--json`, autodeploy, CI—, las que tienen `default` se ponen y las demás se apuntan con el comando exacto para ponerlas después. Sólo paran el despliegue las marcadas `"required": true`: una app sin la contraseña de su base de datos no es un despliegue a medias, es una web caída, y es mejor que falle **antes** de tocar nada.
 
@@ -920,9 +926,12 @@ Y si no hay nadie al teclado —`--yes`, `--json`, autodeploy, CI—, las que ti
 ```bash
 orbit deploy mi-web --env IV_SMTP_PASS='abcd efgh' --env OTRA=1   # repetible
 orbit deploy mi-web --env-file ./produccion.env                   # CLAVE=valor por línea
+printf 'IV_SMTP_PASS=abcd efgh\n' | orbit deploy mi-web --env-stdin  # lo mismo, por la entrada
 ```
 
-Se escriben en el fichero declarado **antes** del build y cuentan como puestas a mano: los despliegues siguientes no las tocan. Es la forma de despachar una variable obligatoria desde CI o desde Orbit Desktop. (`--env` deja el valor en el historial del shell y en `ps` mientras dura el despliegue; para un secreto, mejor `--env-file` o la pregunta.)
+Se escriben en el fichero declarado **antes** del build y cuentan como puestas a mano: los despliegues siguientes no las tocan. Es la forma de despachar una variable obligatoria desde CI o desde Orbit Desktop. (`--env` deja el valor en el historial del shell y en `ps` mientras dura el despliegue —y, si entras como miembro de `orbit-admin`, en el registro de sudo, que apunta la orden entera—; para un secreto, mejor `--env-file`, `--env-stdin` o la pregunta.)
+
+**`--env-stdin`** lee las mismas líneas `CLAVE=valor` que `--env-file`, pero de la entrada estándar, así que los valores no tocan nunca la línea de órdenes: es lo que usa Orbit Desktop para dar las obligatorias por SSH. Se valida igual que `--env` y compone con `--json` y `--progress`. Como la entrada queda gastada, con él **no se pregunta nada**: lo que falte se apunta como sin nadie al teclado, y hay que decir el nombre de la app (ni `--pick` ni el selector).
 
 #### El `.env.example` del repositorio
 

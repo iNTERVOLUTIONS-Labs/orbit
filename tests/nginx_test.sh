@@ -1071,6 +1071,30 @@ check "sin prefijos repetidos: nginx -t" "ok" "$r"
 check "un solo /storage/" "1" "$(grep -c 'location \^~ /storage/' "$NG/aparte/dupweb.conf")"
 check "un solo /uploads/" "1" "$(grep -c 'location \^~ /uploads/' "$NG/aparte/dupweb.conf")"
 
+# Y el mismo choque por otro lado: una app PHP servida desde la raíz que
+# declara "shared": ["vendor"] —para que composer no reinstale en cada
+# despliegue— dejaba vendor/ como enlace a shared/. _php_writable_denies lo
+# protegía como carpeta de escritura y _php_root_denies lo negaba entero: dos
+# 'location ^~ /vendor/', 'nginx -t' en rojo y la app sin poder desplegarse.
+VREL="$TMP/apps/shvendor/releases/r1"
+mkdir -p "$VREL" "$TMP/apps/shvendor/shared/vendor/composer" "$TMP/apps/shvendor/shared/node_modules"
+printf '<?php echo 1; ?>\n' > "$VREL/index.php"
+ln -sfn "$TMP/apps/shvendor/shared/vendor" "$VREL/vendor"
+ln -sfn "$TMP/apps/shvendor/shared/node_modules" "$VREL/node_modules"
+ln -sfn "$VREL" "$TMP/apps/shvendor/current"
+mkapp shvendor php "" "shvendor.test"
+A_TYPE="php"; A_DOCROOT="."; A_SHARED="vendor node_modules"; save_app
+rm -f "$NG/aparte/"*.conf
+nginx_vhost shvendor | sed -e "s#/etc/nginx/snippets/#$NG/snippets/#g" -e "s#/var/log/nginx/#$NG/logs/#g" \
+  -e "s#/run/php/orbit.sock#$NG/php.sock#g" -e "s#unix:[^;]*\.sock#unix:$NG/php.sock#g" \
+  -e "s/^\( *\)listen 80;/\1listen 127.0.0.1:$HTTP_PORT;/" -e "/listen \[::\]/d" > "$NG/aparte/shvendor.conf"
+nginx -t -c "$NG/aparte.conf" -p "$NG" >"$NG/logs/aparte2.out" 2>&1 && r=ok || r=error
+[[ "$r" == ok ]] || sed 's/^/      /' "$NG/logs/aparte2.out"
+check "shared vendor: nginx -t"  "ok" "$r"
+check "un solo /vendor/"         "1"  "$(grep -c 'location \^~ /vendor/' "$NG/aparte/shvendor.conf")"
+check "y es el que lo niega todo" "1" "$(grep -c 'location \^~ /vendor/ *{ return 404; }' "$NG/aparte/shvendor.conf")"
+check "un solo /node_modules/"   "1"  "$(grep -c 'location \^~ /node_modules/' "$NG/aparte/shvendor.conf")"
+
 section "Una web estática servida desde la raíz del repositorio"
 # hibrida: A_OUTDIR=".", así que el docroot ES el repositorio.
 if [[ -n "$PHPFPM" ]]; then

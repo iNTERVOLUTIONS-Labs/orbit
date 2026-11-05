@@ -28,6 +28,29 @@ U="$(svc_unit web)"
 # Valor de una directiva Environment= de la unidad, por nombre.
 env_of() { sed -n "s/^Environment=$1=//p" "$U"; }
 
+section "La unidad carga el fichero de entorno que declara la app"
+# shared/.env siempre, y el de "env": {"file": …} detrás, que en systemd gana.
+# Antes la unidad decía shared/.env y nada más, mientras 'orbit env' y la
+# provisión escribían en el declarado.
+check "sin declarar, uno"   "EnvironmentFile=-$TMP/apps/web/shared/.env" "$(grep '^EnvironmentFile=' "$U")"
+load_app web; A_ENV_FILE="api/.env"; save_app
+render_systemd web
+check "declarado, los dos y en orden" \
+  "EnvironmentFile=-$TMP/apps/web/shared/.env|EnvironmentFile=-$TMP/apps/web/shared/api/.env" \
+  "$(grep '^EnvironmentFile=' "$U" | tr '\n' '|' | sed 's/|$//')"
+# Una ruta que no vale no sale de shared/: se queda en shared/.env.
+load_app web; A_ENV_FILE="../../etc/shadow"; save_app
+render_systemd web
+check "una ruta mala no cuela" "EnvironmentFile=-$TMP/apps/web/shared/.env" "$(grep '^EnvironmentFile=' "$U")"
+load_app web; A_ENV_FILE=""; save_app
+render_systemd web
+
+section "PHP opcional no impide arrancar apps Node"
+# Sin el '-', una app de Node en un servidor sin php-fpm moría con 226/NAMESPACE
+# antes de ejecutar nada: systemd no puede montar una ruta que no existe.
+# (De la rama fix/next-listen-localhost, sin publicar.)
+check "el socket ausente no rompe el namespace" "1" "$(grep -c '^ReadWritePaths=.* -/run/php$' "$U")"
+
 section "La unidad se escribe"
 check "existe"          "1" "$([[ -f "$U" ]] && echo 1 || echo 0)"
 check "arranca la app"  "1" "$(grep -c "^ExecStart=.*node server.js" "$U")"
@@ -77,14 +100,21 @@ section "Todo el HOME lleva dueño, no sólo la hoja"
 # más tiene ese privilegio. Salió con un 'go build' de verdad en un VPS: Go no
 # se podía desplegar en ninguna app aislada. Lo que se afirma es que a la
 # llamada van todos los niveles, que es lo único que se puede ver sin root.
+#
+# Y desde 1.4.9 la llamada la hace el usuario de la app, no un 'install -d -o'
+# de root: shared/home es suyo, y con un '.cache' cambiado por un enlace a
+# /etc, root le daba /etc.
+: > "$AS_USER_LOG"
 INSTALL_LOG="$TMP/install.log"; : > "$INSTALL_LOG"
 install() { printf 'install %s\n' "$*" >> "$INSTALL_LOG"; command install "$@"; }
 render_systemd web >/dev/null 2>&1
 HOMEDIR="$TMP/apps/web/shared/home"
-check "el HOME"            "1" "$(grep -c " $HOMEDIR\( \|\$\)" "$INSTALL_LOG")"
-check "y su .cache"        "1" "$(grep -c " $HOMEDIR/.cache\( \|\$\)" "$INSTALL_LOG")"
-check "y .cache/node"      "1" "$(grep -c " $HOMEDIR/.cache/node\( \|\$\)" "$INSTALL_LOG")"
-check "y el de corepack"   "1" "$(grep -c " $HOMEDIR/.cache/node/corepack\( \|\$\)" "$INSTALL_LOG")"
+MKD="$(grep "^$(id -un) mkdir -p -m 0755 -- " "$AS_USER_LOG")"
+check "el HOME"            "1" "$(grep -c " $HOMEDIR\( \|\$\)" <<<"$MKD")"
+check "y su .cache"        "1" "$(grep -c " $HOMEDIR/.cache\( \|\$\)" <<<"$MKD")"
+check "y .cache/node"      "1" "$(grep -c " $HOMEDIR/.cache/node\( \|\$\)" <<<"$MKD")"
+check "y el de corepack"   "1" "$(grep -c " $HOMEDIR/.cache/node/corepack\( \|\$\)" <<<"$MKD")"
+check "y root no lo crea"  "0" "$(grep -c "$HOMEDIR" "$INSTALL_LOG")"
 unset -f install
 
 section "El cajón sigue cerrado"

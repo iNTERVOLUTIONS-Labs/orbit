@@ -505,6 +505,24 @@ detect_stack "$FX/next";     check "next"        "next"    "$A_TYPE"
 detect_stack "$FX/next";     check "next pkg"    "pnpm"    "$A_PKG"
 detect_stack "$FX/nextexp";  check "next export" "static"  "$A_TYPE"
 detect_stack "$FX/nextexp";  check "next outdir" "out"     "$A_OUTDIR"
+
+# `next start` no lee HOST ni HOSTNAME: sólo -H. Con el script a secas la app
+# escuchaba en *:PORT y lo único que tapaba el puerto era el cortafuegos.
+# (Commit e9efe99 de la rama fix/next-listen-localhost, que no llegó a main.)
+detect_stack "$FX/next"; check "next start escucha sólo en local" "pnpm exec next start -H 127.0.0.1" "$A_START"
+mkdir -p "$FX/nextnpm"; touch "$FX/nextnpm/package-lock.json"
+echo '{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start --keepAliveTimeout 70000"}}' > "$FX/nextnpm/package.json"
+detect_stack "$FX/nextnpm"; check "npm lleva -- y conserva sus opciones" "npm exec -- next start --keepAliveTimeout 70000 -H 127.0.0.1" "$A_START"
+mkdir -p "$FX/nextnostart"; touch "$FX/nextnostart/pnpm-lock.yaml"
+echo '{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}' > "$FX/nextnostart/package.json"
+detect_stack "$FX/nextnostart"; check "sin script start, también -H" "pnpm exec next start -H 127.0.0.1" "$A_START"
+# Lo que el proyecto ya decide, o lo que no es un next start a secas, no se toca.
+mkdir -p "$FX/nexthost"; touch "$FX/nexthost/pnpm-lock.yaml"
+echo '{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start -H 0.0.0.0"}}' > "$FX/nexthost/package.json"
+detect_stack "$FX/nexthost"; check "su -H manda" "pnpm run start" "$A_START"
+mkdir -p "$FX/nextcustom"; touch "$FX/nextcustom/pnpm-lock.yaml"
+echo '{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"node server.js && next start"}}' > "$FX/nextcustom/package.json"
+detect_stack "$FX/nextcustom"; check "script propio, intacto" "pnpm run start" "$A_START"
 detect_stack "$FX/astro";    check "astro"       "static"  "$A_TYPE"
 detect_stack "$FX/astro";    check "astro spa"   "no"      "$A_SPA"
 detect_stack "$FX/astrossr"; check "astro ssr"   "node"    "$A_TYPE"
@@ -1448,7 +1466,7 @@ echo '{"scripts":{"build":"tsc"},"devDependencies":{"typescript":"5"}}' > "$TMP/
 
 detect_stack "$TMP/fx/mononext"; check "mono next"        "next"                        "$A_TYPE"
 detect_stack "$TMP/fx/mononext"; check "mono appdir"      "apps/web"                    "$A_APPDIR"
-detect_stack "$TMP/fx/mononext"; check "mono start"       "pnpm --dir apps/web run start" "$A_START"
+detect_stack "$TMP/fx/mononext"; check "mono start"       "cd apps/web && pnpm exec next start -H 127.0.0.1" "$A_START"
 
 # El outdir de un estático en monorepo tiene que ser relativo a la raíz del repo: es donde
 # nginx pone el `root`.

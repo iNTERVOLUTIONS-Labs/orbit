@@ -221,4 +221,27 @@ check "ya no es 503"          "502" "$(get /)"
 
 nginx -c "$NG/nginx.conf" -s stop >/dev/null 2>&1 || true
 
+
+section "El clon de una app aislada es suyo desde el principio"
+# releases/ y shared/ del clon se creaban con los globales todavía del
+# original, o sea del usuario de PRODUCCIÓN; y el .env lo copiaba root. Ahora
+# las carpetas nacen del usuario del clon, y el .env lo lee el del original y lo
+# escribe el del clon (ver _as_user en orbit).
+load_app origen; A_USER="orbit-origen"; save_app
+mkdir -p "$TMP/apps/origen/shared"; printf 'SECRETO=prod\n' > "$TMP/apps/origen/shared/.env"
+APP_ISOLATION="yes"
+CHOWNS="$TMP/chowns"; : > "$CHOWNS"
+chown() { printf 'chown %s\n' "$*" >> "$CHOWNS"; }
+: > "$AS_USER_LOG"
+run cmd_clone origen aislcopia --domain aisl.origen.test >"$TMP/c9" 2>&1; r=$?
+CU="$(_app_username aislcopia)"
+check "clona"                          "0" "$r"
+check "releases/ del clon, suyo"       "1" "$(grep -c "^chown -h $CU:$CU -- $TMP/apps/aislcopia/releases\$" "$CHOWNS")"
+check "shared/ del clon, suyo"         "1" "$(grep -q "^chown -h $CU:$CU -- $TMP/apps/aislcopia/shared\$" "$CHOWNS" && echo 1 || echo 0)"
+check "nada del clon para producción"  "0" "$(grep "aislcopia" "$CHOWNS" | grep -c 'orbit-origen')"
+check "el .env lo lee el original"     "1" "$(grep -c "^orbit-origen cat -- $TMP/apps/origen/shared/.env\$" "$AS_USER_LOG")"
+check "y lo escribe el clon"           "1" "$(grep -c "^$CU tee -- $TMP/apps/aislcopia/shared/.env\$" "$AS_USER_LOG")"
+unset -f chown
+APP_ISOLATION="no"
+
 report
