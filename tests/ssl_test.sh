@@ -100,7 +100,11 @@ FAKE_TOKEN="cf-token-de-pruebas_123"
 FAKE_ACCOUNT_TOKEN="cfat_token-de-cuenta_456"
 FAKE_VERIFY="active"          # active | disabled | invalid | offline
 FAKE_DENY=""                  # no vacío: el token no tiene el permiso de certificados
-declare -A FAKE_ZONES=([tienda.test]="Z1")
+FAKE_ZONES_RESP=""            # no vacío: lo que contesta GET /zones?per_page=1
+# Los ids, con la forma de los de verdad (32 cifras hexadecimales): Orbit no
+# mete otra cosa en una URL.
+FAKE_ZID="023e105f4ecef8ad9ca31a8372d0c353"; FAKE_ACC="01a7362d577a6c3019a474fd6f485823"
+declare -A FAKE_ZONES=([tienda.test]="$FAKE_ZID")
 declare -A FAKE_PROXY=([tienda.test]="true" [www.tienda.test]="true")
 CURL_ARGV="$TMP/curl.argv"; : > "$CURL_ARGV"
 CURL_CFG="$TMP/curl.cfg";   : > "$CURL_CFG"
@@ -136,8 +140,9 @@ curl() {
   fi
   case "$method $path" in
     "GET /zones?per_page=1")
-      resp='{"success":true,"result":[{"id":"Z1","name":"tienda.test","account":{"id":"acc0123abcd","name":"x"}}]}' ;;
-    "GET /accounts/acc0123abcd/tokens/verify")
+      resp="$FAKE_ZONES_RESP"
+      [[ -n "$resp" ]] || resp="{\"success\":true,\"result\":[{\"id\":\"$FAKE_ZID\",\"name\":\"tienda.test\",\"account\":{\"id\":\"$FAKE_ACC\",\"name\":\"x\"}}]}" ;;
+    "GET /accounts/$FAKE_ACC/tokens/verify")
       resp="{\"success\":true,\"result\":{\"id\":\"y\",\"status\":\"$FAKE_VERIFY\"}}" ;;
     "GET /user/tokens/verify")
       # Sin jq a propósito: la prueba de «sin jq» pasa por aquí.
@@ -362,9 +367,25 @@ eval "$(declare -f _real_render_nginx | sed '1s/^_real_render_nginx/render_nginx
 eval "$HAS_ORIGIN_DEF"
 rm -rf "$(origin_dir tienda)"; run render_nginx tienda >/dev/null 2>&1
 
+section "Certificado de origen: Let's Encrypt no se borra si otro vhost lo usa"
+# Un vhost escrito a mano —otro servicio con el mismo certificado— es legítimo
+# (principio 3). Borrar el Let's Encrypt lo dejaba apuntando a nada, y la
+# siguiente recarga de nginx fallaba para el servidor entero.
+printf 'server {\n    ssl_certificate %s;\n    ssl_certificate_key %s;\n}\n' \
+  "$(cert_file tienda.test)" "$(cert_key tienda.test)" > "$NGINX_AVAILABLE/a-mano.conf"
+ln -sfn "$NGINX_AVAILABLE/a-mano.conf" "$NGINX_ENABLED/a-mano.conf"
+: > "$CERTBOT_LOG"
+OUT="$(run cmd_ssl tienda --origin </dev/null 2>&1)"; r=$?
+check "el de origen, sí"        "0" "$r"
+check "certbot no borra nada"   "0" "$(grep -c '^delete' "$CERTBOT_LOG")"
+check "nginx sigue aceptándolo" "0" "$(nginx -t; echo $?)"
+check "y dice quién lo usa"     "1" "$(grep -c "$NGINX_ENABLED/a-mano.conf" <<<"$OUT")"
+rm -f "$NGINX_ENABLED/a-mano.conf" "$NGINX_AVAILABLE/a-mano.conf"
+rm -rf "$(origin_dir tienda)"; run render_nginx tienda >/dev/null 2>&1
+
 section "Certificado de origen: pedido a la API"
 # Lo que dejó un intento cortado de golpe, con su clave dentro.
-mkdir -p "$ORIGIN_CERT_DIR/.tienda.nuevo.viejo"; : > "$ORIGIN_CERT_DIR/.tienda.nuevo.viejo/key.pem"
+mkdir -p "$ORIGIN_CERT_DIR/.tienda.nuevo.vIej0s"; : > "$ORIGIN_CERT_DIR/.tienda.nuevo.vIej0s/key.pem"
 : > "$CURL_ARGV"; : > "$CURL_CFG"; : > "$CERTBOT_LOG"
 OUT="$(run cmd_ssl tienda --origin </dev/null 2>&1)"; r=$?
 check "sale bien"               "0" "$r"
@@ -378,7 +399,7 @@ check "y no la clave"           "0" "$(grep -c 'PRIVATE KEY' "$REQ")"
 check "el token, por -K"        "yes" "$(grep -q "^header = \"Authorization: Bearer $FAKE_TOKEN\"$" "$CURL_CFG" && echo yes)"
 check "y nunca en argv"         "0" "$(grep -c "$FAKE_TOKEN" "$CURL_ARGV")"
 check "cert en su sitio"        "yes" "$(has_origin tienda && echo yes)"
-check "y los restos, fuera"     "no" "$([[ -d "$ORIGIN_CERT_DIR/.tienda.nuevo.viejo" ]] && echo si || echo no)"
+check "y los restos, fuera"     "no" "$([[ -d "$ORIGIN_CERT_DIR/.tienda.nuevo.vIej0s" ]] && echo si || echo no)"
 check "carpeta 0700"            "700" "$(mode_of "$(origin_dir tienda)")"
 check "clave 0600"              "600" "$(mode_of "$(origin_key tienda)")"
 check "casan"                   "0" "$(_cert_key_match "$(origin_cert tienda)" "$(origin_key tienda)"; echo $?)"
@@ -508,6 +529,15 @@ mkdir -p "$(origin_dir tienda.anterior)"; printf 'de la vecina\n' > "$(origin_di
 run cmd_ssl tienda --origin-cert "$TMP/fx/up.crt" --origin-key "$TMP/fx/up.key" </dev/null >/dev/null 2>&1
 check "la vecina, intacta"      "de la vecina" "$(cat "$(origin_dir tienda.anterior)/cert.pem" 2>/dev/null)"
 rm -rf "$(origin_dir tienda.anterior)"; rm -f "$(app_conf tienda.anterior)"
+# Ni una llamada «tienda.nuevo»: la limpieza de los temporales cortados de
+# 'tienda' ('.tienda.nuevo.XXXXXX') se llevaba con un '*' lo que 'orbit remove'
+# le había apartado a ella, una clave que Cloudflare no vuelve a dar.
+mkdir -p "$ORIGIN_CERT_DIR/.tienda.nuevo.eliminada.AbC123" "$ORIGIN_CERT_DIR/.tienda.nuevo.Zz9Yy8"
+printf 'de la vecina\n' > "$ORIGIN_CERT_DIR/.tienda.nuevo.eliminada.AbC123/key.pem"
+run cmd_ssl tienda --origin-cert "$TMP/fx/up.crt" --origin-key "$TMP/fx/up.key" </dev/null >/dev/null 2>&1
+check "lo apartado de la vecina, intacto" "de la vecina" "$(cat "$ORIGIN_CERT_DIR/.tienda.nuevo.eliminada.AbC123/key.pem" 2>/dev/null)"
+check "y el temporal cortado, fuera" "no" "$([[ -d "$ORIGIN_CERT_DIR/.tienda.nuevo.Zz9Yy8" ]] && echo si || echo no)"
+rm -rf "$ORIGIN_CERT_DIR/.tienda.nuevo.eliminada.AbC123"
 
 section "Volver a Let's Encrypt, y que nginx lo rechace"
 NGINX_FAIL="yes"; : > "$CERTBOT_LOG"
@@ -596,7 +626,7 @@ rm -f "$ETC_DIR/cloudflare.ini"; : > "$CURL_ARGV"; : > "$CURL_CFG"
 OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | run cmd_cf_token 2>&1)"; r=$?
 check "de cuenta: se guarda"    "0" "$r"
 check "y lo da por activo"      "1" "$(grep -c 'reconoce el token y está activo' <<<"$OUT")"
-check "verificado en la cuenta" "1" "$(grep -c 'accounts/acc0123abcd/tokens/verify' "$CURL_CFG")"
+check "verificado en la cuenta" "1" "$(grep -c "accounts/$FAKE_ACC/tokens/verify" "$CURL_CFG")"
 check "nunca en argv"           "0" "$(grep -c "$FAKE_ACCOUNT_TOKEN" "$CURL_ARGV")"
 FAKE_VERIFY="disabled"
 OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | run cmd_cf_token 2>&1)"; r=$?
@@ -634,5 +664,60 @@ OUT="$(PATH="$TMP/nojq:/usr/sbin:/sbin" run cmd_ssl sinjq --origin </dev/null 2>
 check "origen sin jq: no"       "1" "$r"
 check "y dice qué instalar"     "1" "$(grep -c 'apt-get install -y jq' <<<"$OUT")"
 check "sin clave a medias"      "0" "$(find "$ORIGIN_CERT_DIR" -name key.pem 2>/dev/null | wc -l)"
+
+section "El id de la cuenta sale de una respuesta, y va a una URL"
+# Con jq, lo que trajera la respuesta acababa en la ruta y en la configuración
+# de curl que lleva el token; un salto de línea dentro era otra 'url' que se
+# llevaba la cabecera de autorización a donde dijera.
+NOJQ="$TMP/nojq:/usr/sbin:/sbin"
+for via in "$PATH" "$NOJQ"; do
+  FAKE_ZONES_RESP='{"success":true,"result":[{"id":"z","account":{"id":"x\nurl = \"https://fuera.example/\"\nreferer = ","name":"n"}}]}'
+  : > "$CURL_CFG"; rm -f "$ETC_DIR/cloudflare.ini"
+  OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | PATH="$via" run cmd_cf_token 2>&1)"; r=$?
+  check "un id raro: no se guarda" "1" "$r"
+  check "ni sale de la API"       "0" "$(grep -c 'fuera.example' "$CURL_CFG")"
+  check "ni pide la cuenta"       "0" "$(grep -c '/accounts/' "$CURL_CFG")"
+  FAKE_ZONES_RESP='{"success":true,"result":[{"id":"z","account":{"id":"../../user/tokens/verify?","name":"n"}}]}'
+  : > "$CURL_CFG"
+  OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | PATH="$via" run cmd_cf_token 2>&1)"; r=$?
+  check "ni con '..'"             "0" "$(grep -c '/accounts/' "$CURL_CFG")"
+  # Y en cualquier orden, y en varias líneas: un token de cuenta bueno no se
+  # rechaza por cómo venga escrito el JSON.
+  FAKE_ZONES_RESP="$(printf '{\n  "success": true,\n  "result": [\n    {\n      "id": "%s",\n      "account": {\n        "name": "n",\n        "id": "%s"\n      }\n    }\n  ]\n}\n' "$FAKE_ZID" "$FAKE_ACC")"
+  rm -f "$ETC_DIR/cloudflare.ini"
+  OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | PATH="$via" run cmd_cf_token 2>&1)"; r=$?
+  check "en otro orden, sí"       "0" "$r"
+  # Uno que no ve ninguna zona no sirve para nada aquí, y se dice así —no
+  # «HTTP 401», que manda a buscar el fallo en el token—.
+  FAKE_ZONES_RESP='{"success":true,"result":[]}'
+  rm -f "$ETC_DIR/cloudflare.ini"
+  OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | PATH="$via" run cmd_cf_token 2>&1)"; r=$?
+  check "sin zonas: no"           "1" "$r"
+  check "y lo dice"               "1" "$(grep -c 'no le deja ver ninguna zona' <<<"$OUT")"
+  check "sin temporales"          "0" "$(find "$ETC_DIR" -name '.cloudflare.ini.*' | wc -l)"
+done
+FAKE_ZONES_RESP=""
+# Y la zona, por lo mismo: va a /zones/<id>/dns_records.
+FAKE_ZONES[tienda.test]="../../user/tokens/verify?"; cf_token_file
+check "zona con un id raro"     "" "$(_cf_zone_id tienda.test)"
+FAKE_ZONES[tienda.test]="$FAKE_ZID"
+check "y la buena, sí"          "$FAKE_ZID" "$(_cf_zone_id tienda.test)"
+# Cualquier otro valor con un salto de línea tampoco entra en un -K.
+check "-K: sin saltos de línea" "" "$(_curl_cfg url $'https://a/\nurl = "https://b/"')"
+check "y lo dice con el código" "1" "$(_curl_cfg url $'a\rb' >/dev/null; echo $?)"
+check "-K: lo normal, sí"       'url = "https://a/\"b"' "$(_curl_cfg url 'https://a/"b')"
+
+section "orbit cf-token cortado a mitad no deja el token por ahí"
+# Las llamadas pueden tardar hasta 30 s cada una; un Ctrl-C o un kill a mitad
+# dejaban para siempre una copia del token sin verificar.
+_cf_token_pid() { printf '%s' "$BASHPID" > "$TMP/cf.pid"; cmd_cf_token; }
+eval "$(declare -f curl | sed '1s/^curl/_real_curl/')"
+_stub_curl() { cat >/dev/null; kill -TERM "$(cat "$TMP/cf.pid")"; sleep 1; printf '000'; }
+eval "$(declare -f _stub_curl | sed '1s/^_stub_curl/curl/')"
+rm -f "$ETC_DIR/cloudflare.ini"
+printf '%s\n' "$FAKE_TOKEN" | run _cf_token_pid >/dev/null 2>&1
+check "sin copia del token"     "0" "$(find "$ETC_DIR" -name '.cloudflare.ini.*' | wc -l)"
+check "ni guardado"             "no" "$([[ -f "$ETC_DIR/cloudflare.ini" ]] && echo si || echo no)"
+eval "$(declare -f _real_curl | sed '1s/^_real_curl/curl/')"
 
 report
