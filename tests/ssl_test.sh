@@ -97,6 +97,7 @@ certbot() {
 
 # --- la API de Cloudflare de mentira -----------------------------------------
 FAKE_TOKEN="cf-token-de-pruebas_123"
+FAKE_ACCOUNT_TOKEN="cfat_token-de-cuenta_456"
 FAKE_VERIFY="active"          # active | disabled | invalid | offline
 FAKE_DENY=""                  # no vacío: el token no tiene el permiso de certificados
 declare -A FAKE_ZONES=([tienda.test]="Z1")
@@ -127,11 +128,17 @@ curl() {
   # Como la de verdad: el token se lee de la configuración, no de argv.
   local tok; tok="$(sed -n 's/^header = "Authorization: Bearer \(.*\)"$/\1/p' <<<"$cfg")"
   [[ "$FAKE_VERIFY" == "offline" ]] && return 7
-  if [[ "$tok" != "$FAKE_TOKEN" ]]; then
+  # Un token de cuenta es válido en todo menos en /user/tokens/verify, que le
+  # contesta exactamente lo mismo que a uno inventado: así es la API de verdad.
+  if [[ "$tok" != "$FAKE_TOKEN" && ! ( "$tok" == "$FAKE_ACCOUNT_TOKEN" && "$path" != /user/tokens/verify ) ]]; then
     printf '{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}' > "$out"
     printf '401'; return 0
   fi
   case "$method $path" in
+    "GET /zones?per_page=1")
+      resp='{"success":true,"result":[{"id":"Z1","name":"tienda.test","account":{"id":"acc0123abcd","name":"x"}}]}' ;;
+    "GET /accounts/acc0123abcd/tokens/verify")
+      resp="{\"success\":true,\"result\":{\"id\":\"y\",\"status\":\"$FAKE_VERIFY\"}}" ;;
     "GET /user/tokens/verify")
       # Sin jq a propósito: la prueba de «sin jq» pasa por aquí.
       resp="{\"success\":true,\"result\":{\"id\":\"x\",\"status\":\"$FAKE_VERIFY\"}}" ;;
@@ -582,6 +589,25 @@ OUT="$(printf '%s\n' "$FAKE_TOKEN" | run cmd_cf_token 2>&1)"; r=$?
 check "sin red: se guarda"      "0" "$r"
 check "pero lo avisa"           "1" "$(grep -c 'No he podido preguntarle a Cloudflare' <<<"$OUT")"
 FAKE_VERIFY="active"
+# Un token de cuenta ('cfat_…'): /user/tokens/verify le dice «Invalid API
+# Token», como a uno inventado, y Orbit lo rechazaba siendo bueno. Medido
+# contra la API real con uno de verdad.
+rm -f "$ETC_DIR/cloudflare.ini"; : > "$CURL_ARGV"; : > "$CURL_CFG"
+OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | run cmd_cf_token 2>&1)"; r=$?
+check "de cuenta: se guarda"    "0" "$r"
+check "y lo da por activo"      "1" "$(grep -c 'reconoce el token y está activo' <<<"$OUT")"
+check "verificado en la cuenta" "1" "$(grep -c 'accounts/acc0123abcd/tokens/verify' "$CURL_CFG")"
+check "nunca en argv"           "0" "$(grep -c "$FAKE_ACCOUNT_TOKEN" "$CURL_ARGV")"
+FAKE_VERIFY="disabled"
+OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | run cmd_cf_token 2>&1)"; r=$?
+check "de cuenta, desactivado: no" "1" "$r"
+check "y dice cómo está"        "1" "$(grep -c 'disabled' <<<"$OUT")"
+FAKE_VERIFY="active"
+# Uno inventado sigue sin pasar aunque se pruebe la segunda puerta: la lista
+# de zonas también le contesta 401.
+OUT="$(printf 'cfat_inventado\n' | run cmd_cf_token 2>&1)"; r=$?
+check "inventado con cfat_: no" "1" "$r"
+rm -f "$ETC_DIR/cloudflare.ini"
 OUT="$(printf 'con espacio dentro\n' | run cmd_cf_token 2>&1)"; r=$?
 check "con espacios, no"        "1" "$r"
 # jq es opcional en el resto de Orbit: sin él, un token bueno se rechazaba con
@@ -597,6 +623,9 @@ check "y lo da por activo"      "1" "$(grep -c 'reconoce el token y está activo
 FAKE_VERIFY="disabled"
 OUT="$(printf '%s\n' "$FAKE_TOKEN" | PATH="$TMP/nojq:/usr/sbin:/sbin" run cmd_cf_token 2>&1)"; r=$?
 check "sin jq, desactivado: no" "1" "$r"
+FAKE_VERIFY="active"
+OUT="$(printf '%s\n' "$FAKE_ACCOUNT_TOKEN" | PATH="$TMP/nojq:/usr/sbin:/sbin" run cmd_cf_token 2>&1)"; r=$?
+check "sin jq, de cuenta: sí"   "0" "$r"
 FAKE_VERIFY="active"
 # Y pedir un certificado de origen sin jq se niega antes de generar la clave,
 # con la orden que lo arregla, en vez de morir a mitad con un código a pelo.
