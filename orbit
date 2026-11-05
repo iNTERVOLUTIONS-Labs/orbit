@@ -48,14 +48,27 @@ shopt -s nullglob
 # php-fpm — una web en 403 por la configuración de la shell de otro.
 #
 # Sin /proc no se puede mirar, y no se sigue: se apunta aquí y se aborta en
-# cuanto existe 'die', un poco más abajo.
+# cuanto existe 'die', un poco más abajo. Hasta ahí hay unas cuantas órdenes
+# —el grep del idioma, tput—, así que PATH y HOME se fijan igual y se tira lo
+# que bash sí ve: medido con una copia del bloque, sin esto el 'grep' de quien
+# llama corría dieciséis veces antes del aviso.
+#
+# Lo que lo dispara es que SUDO_UID exista, no lo que valga. Con un SETENV en
+# la regla —o una regla 'ALL', que lo lleva implícito— quien llama puede
+# escribir 'sudo SUDO_UID=0 BACKUP_HOOK=… orbit' y elegir el valor, pero no
+# quitar la variable, que la pone sudo siempre. Y una regla así deja pasar
+# además LD_PRELOAD y compañía, que actúan antes de la primera línea: eso no
+# lo puede defender nada escrito aquí (ver ARCHITECTURE §9.1).
 _ORBIT_ENV_DIRTY=""
-if [[ $EUID -eq 0 && "${SUDO_UID:-0}" != 0 ]]; then
+if [[ $EUID -eq 0 && -n "${SUDO_UID+x}" ]]; then
   _orbit_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
   _orbit_home=~root
   _orbit_keep=() _orbit_more="" _orbit_seen=0
   if [[ -r /proc/self/environ ]]; then
     while IFS= read -r -d '' _orbit_e; do
+      # Una entrada sin '=' no es una variable, y en la lista de 'env -i' se
+      # convertía en la orden que ejecutar: 'env: LANG: No such file'.
+      [[ "$_orbit_e" == *=* ]] || { _orbit_more=1; continue; }
       _orbit_n="${_orbit_e%%=*}"
       [[ "$_orbit_n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { _orbit_more=1; continue; }
       case "$_orbit_n" in
@@ -73,6 +86,14 @@ if [[ $EUID -eq 0 && "${SUDO_UID:-0}" != 0 ]]; then
       || exec /usr/bin/env -i "${_orbit_keep[@]}" PATH="$_orbit_path" HOME="$_orbit_home" /bin/bash -p -- "$0" "$@"
   else
     _ORBIT_ENV_DIRTY="yes"
+    while IFS= read -r _orbit_n; do
+      case "$_orbit_n" in
+        USER|LOGNAME|SUDO_*|ORBIT_LANG|NO_COLOR|UI_GLYPHS) ;;
+        TERM|LANG|LANGUAGE|LC_*) [[ "${!_orbit_n}" =~ ^[A-Za-z0-9_.@:-]*$ ]] || unset -v "$_orbit_n" ;;
+        *) unset -v "$_orbit_n" 2>/dev/null || true ;;
+      esac
+    done < <(compgen -e)
+    export PATH="$_orbit_path" HOME="$_orbit_home"
   fi
   unset -v _orbit_path _orbit_home _orbit_keep _orbit_more _orbit_seen _orbit_e _orbit_n
   umask 022
@@ -379,7 +400,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.9"
+ORBIT_VERSION="1.5.0"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -515,7 +536,9 @@ fi
 # encima de 100 una raya de lado a lado en un monitor ancho es ruido.
 _ui_width() {
   local w="${COLUMNS:-0}"
-  [[ "$w" =~ ^[0-9]+$ && "$w" -gt 0 ]] || w=0
+  # En base 10 a la fuerza: '010' es un 8 para la aritmética de bash, y '08'
+  # un error por la salida de errores.
+  [[ "$w" =~ ^[0-9]{1,6}$ ]] && w=$(( 10#$w )) || w=0
   # Sin terminal se deja el 66 de siempre y no se le pregunta a tput, que
   # contesta el 80 del terminfo aunque no haya nadie mirando. Así la salida
   # redirigida —un log de cron, un 'orbit deploy | tee', un informe de fallo
@@ -3674,6 +3697,7 @@ _has_php() { # _has_php <dir>
 # systemd, en el único directorio donde no se había aplicado.
 NGINX_AVAILABLE="${NGINX_AVAILABLE:-/etc/nginx/sites-available}"
 NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
+NGINX_CONFD="${NGINX_CONFD:-${NGINX_ENABLED%/*}/conf.d}"
 nginx_file() { echo "$NGINX_AVAILABLE/orbit-$1.conf"; }
 nginx_link() { echo "$NGINX_ENABLED/orbit-$1.conf"; }
 
@@ -3814,11 +3838,12 @@ EOF
 #
 # <si falta> es adónde va lo que tampoco esté en la anterior: el 404 de nginx
 # por defecto, o '@orbit_app' en las apps con proceso (_proc_assets_block).
-_prev_location() { # _prev_location <nombre> <carpeta en la release> <prefijo a quitar> <expires> <Cache-Control> [si falta]
-  local tag="$1" dir="$2" strip="$3" exp="$4" cc="$5" miss="${6:-=404}" root
+_prev_location() { # _prev_location <nombre> <carpeta en la release> <prefijo a quitar> <expires> <Cache-Control> [si falta] [directiva]
+  local tag="$1" dir="$2" strip="$3" exp="$4" cc="$5" miss="${6:-=404}" extra="${7:-}" root
   root="$(app_previous "$A_NAME")"
   [[ -n "$dir" && "$dir" != "." ]] && root="$root/${dir%/}"
   printf '\n    location @orbit_prev_%s {\n        root %s;\n' "$tag" "$root"
+  [[ -z "$extra" ]] || printf '        %s\n' "$extra"
   if [[ -n "$strip" ]]; then
     printf '        rewrite "^%s(.*)$" /$1 break;\n' \
       "$(printf '%s' "$strip" | sed 's/[][\\^$.|?*+(){}]/\\&/g')"
@@ -4051,21 +4076,38 @@ EOF
 # expresiones regulares, y una location '^~' les ganaría. Así un
 # '/_nuxt/.env' o un '/_astro/x.sql' se niegan igual que en cualquier otro
 # sitio del vhost, también si sólo existen en la anterior.
+#
+# Y sin seguir enlaces que lleven a lo que no es de la app. El build corre como
+# el usuario de la app y puede dejar un enlace en su salida —un fichero, o la
+# carpeta '_nuxt' entera—; nginx lo seguía y servía, como www-data, lo que
+# hubiera al otro lado: medido, un '_nuxt/logs' que apuntaba fuera daba 200
+# con '/_nuxt/logs/otra.access.log.1'. En un servidor, fuera es
+# /var/log/nginx: www-data es dueño de los logs de todas las apps, y el
+# snippet sólo niega '.log' a secas, no el '.log.1' rotado. 'if_not_owner' deja los
+# enlaces de la app hacia lo suyo, y 'from=$document_root' no mira 'current',
+# que sí es un enlace y está antes de la raíz.
 _proc_assets_block() {
   [[ -n "${A_ASSETS:-}" ]] || return 0
   local cur root e pre dir tag any="no"
+  local nosym='disable_symlinks if_not_owner from=$document_root;'
   cur="$(app_current "$A_NAME")"
   local -a parts
+  local -A pa_seen=() pa_tags=()
   read -ra parts <<<"$A_ASSETS"
   for e in "${parts[@]}"; do
     pre="${e#!}"; pre="${pre%%:*}"
     # Lo escrito a mano en la configuración pasa por aquí, y una ruta con un
     # ';' o un espacio es una directiva de nginx nueva. Se descarta y se dice.
-    if [[ ! "$pre" =~ ^/[A-Za-z0-9._/-]+/$ || "$pre" == *..* ]]; then
+    # Tampoco lo que ya tiene location en el vhost —el reto de ACME, las
+    # páginas internas '/__orbit_*'— ni un prefijo repetido: dos 'location'
+    # iguales son un vhost que nginx rechaza, y lo que se rechaza no llega.
+    if [[ ! "$pre" =~ ^/[A-Za-z0-9._/-]+/$ || "$pre" == *..* || "$pre" == /.* || "$pre" == /__orbit* \
+          || -n "${pa_seen[$pre]+x}" ]]; then
       warn "A_ASSETS: «%s» no es un prefijo de URL válido; se ignora." "$e" >&2
       continue
     fi
     if [[ "$e" == '!'* ]]; then
+      pa_seen[$pre]=1
 cat <<EOF
 
     location $pre {
@@ -4081,12 +4123,19 @@ EOF
       warn "A_ASSETS: «%s» no es una carpeta dentro de la release; se ignora." "$e" >&2
       continue
     fi
+    pa_seen[$pre]=1
     root="$cur"; [[ "$dir" != "." ]] && root="$cur/$dir"
     tag="${pre#/}"; tag="${tag%/}"; tag="app_${tag//[^A-Za-z0-9]/_}"
+    # '/a-b/' y '/a_b/' darían el mismo nombre, y nginx no rechaza dos named
+    # location iguales: se queda con la primera y la otra caería a la anterior
+    # de una carpeta que no es la suya, sin un aviso.
+    while [[ -n "${pa_tags[$tag]+x}" ]]; do tag+="_"; done
+    pa_tags[$tag]=1
 cat <<EOF
 
     location $pre {
         root $root;
+        $nosym
         expires 1y;
         access_log off;
         add_header Cache-Control "public, immutable";
@@ -4094,7 +4143,7 @@ $(_sec_headers)
         try_files \$uri @orbit_prev_$tag;
     }
 EOF
-    _prev_location "$tag" "$dir" "" 1y "public, immutable" @orbit_app
+    _prev_location "$tag" "$dir" "" 1y "public, immutable" @orbit_app "$nosym"
     any="yes"
   done
   [[ "$any" == "yes" ]] || return 0
@@ -4178,8 +4227,15 @@ _proc_assets_apply() { # _proc_assets_apply <release>
   [[ -n "$lost" && -z "$out" ]] && info "No encuentro en la release la carpeta de %s: esos recursos los sigue sirviendo la app." "$lost"
   [[ -n "$out" ]] && ok "nginx servirá los recursos de la app desde disco, y los de la release anterior también"
   # render_nginx relee la configuración del disco: si no se guarda aquí, el
-  # vhost se generaría con lo de antes.
-  [[ "$A_ASSETS" == "$was" ]] || save_app
+  # vhost se generaría con lo de antes. Y se guarda este campo y sólo éste:
+  # en memoria está ya lo que pide la release candidata —su orbit.json: el
+  # health check, los límites, el .env declarado— y un despliegue que falla
+  # después no llega al save_app del final. Con todo guardado aquí, la release
+  # buena se quedaba con la configuración de la rota —su límite de memoria, su
+  # .env—, y la siguiente unidad que se regenerara la usaba.
+  if [[ "$A_ASSETS" != "$was" ]]; then
+    ( load_app "$A_NAME"; A_ASSETS="$out"; save_app )
+  fi
   return 0
 }
 
@@ -8902,13 +8958,38 @@ _prom_render() { # _prom_render [--fresh]
 _prom_write() { # _prom_write [--fresh]
   local dir="$METRICS_PROM_DIR"
   [[ -n "$dir" && -d "$dir" ]] || return 1
-  [[ -z "$(_paths_unsafe "$EUID" "$dir")" ]] || return 1
+  [[ -z "$(_prom_dir_unsafe "$dir")" ]] || return 1
+  # Se escribe en la carpeta resuelta, que es la que se ha comprobado: por el
+  # enlace, quien pudiera cambiarlo elegiría la carpeta después de mirarla.
+  dir="$(readlink -f -- "$dir")"
   PROM_TMP="$(mktemp "$dir/.orbit.prom.XXXXXX")"
   trap 'rm -f -- "$PROM_TMP"' EXIT
   _prom_render "$@" > "$PROM_TMP"
   chmod 0644 "$PROM_TMP"
   mv -f -- "$PROM_TMP" "$dir/$METRICS_PROM_NAME"
   trap - EXIT
+}
+
+# La primera ruta que podría cambiar alguien que no es root —ni quien ejecuta,
+# en las pruebas—, o nada. No basta con mirar la carpeta: _paths_unsafe no
+# sigue enlaces, y una carpeta que era un enlace a otra que escribe todo el
+# mundo pasaba la comprobación —medido: con el enlace, root escribía en una
+# carpeta 0777; con la misma carpeta a secas, se negaba—. Así que se resuelve,
+# y se mira la de verdad y cada una por encima: el dueño de la de arriba puede
+# cambiarle el nombre a la de abajo y poner otra en su sitio.
+_prom_dir_unsafe() { # _prom_dir_unsafe <carpeta>
+  local real cur bad; local -a p=()
+  real="$(readlink -f -- "$1" 2>/dev/null || true)"
+  [[ -n "$real" ]] || { printf '%s\n' "$1"; return 0; }
+  cur="$real"
+  while [[ -n "$cur" ]]; do p+=("$cur"); cur="${cur%/*}"; done
+  p+=("/")
+  bad="$(_paths_unsafe "$EUID" "${p[@]}")"
+  # Lo que es de root también vale cuando quien ejecuta es otro: es la prueba,
+  # y /tmp o / no son suyos.
+  (( EUID == 0 )) || [[ -z "$bad" ]] || bad="$(grep -Fxf <(_paths_unsafe 0 "${p[@]}") <<<"$bad" || true)"
+  [[ -z "$bad" ]] || printf '%s\n' "${bad%%$'\n'*}"
+  return 0
 }
 
 # Con errexit de verdad dentro (ver CLAUDE.md: la única forma que funciona) y
@@ -8961,9 +9042,10 @@ _prom_enable() { # _prom_enable [carpeta]
   fi
   # Ver _prom_write: en una carpeta que puede escribir otro, root escribiría
   # donde ese otro quisiera.
-  if [[ -n "$(_paths_unsafe "$EUID" "$dir")" ]]; then
-    err "%s la puede escribir alguien que no es root, y root no escribe ahí: quien la controla podría hacerle sobrescribir cualquier fichero del sistema." "$dir"
-    info "Dásela a root y deja que node_exporter sólo la lea:  sudo chown root:root %s && sudo chmod 0755 %s" "$dir" "$dir"
+  local bad; bad="$(_prom_dir_unsafe "$dir")"
+  if [[ -n "$bad" ]]; then
+    err "%s la puede escribir alguien que no es root, y root no escribe ahí: quien la controla podría hacerle sobrescribir cualquier fichero del sistema." "$bad"
+    info "Dásela a root y deja que node_exporter sólo la lea:  sudo chown root:root %s && sudo chmod 0755 %s" "$bad" "$bad"
     exit 1
   fi
   # Se escribe una vez antes de apuntar nada: si la carpeta no admite el
@@ -10607,6 +10689,9 @@ _cf_zone_id() { # _cf_zone_id <nombre> -> id, o nada
     code="$(_cf_api GET "/zones?name=$c" "$out")"
     id=""
     [[ "$code" == 200 ]] && id="$(jq -r '.result[0].id // empty' "$out" 2>/dev/null || true)"
+    # Va a la ruta de la siguiente llamada: sólo un id de verdad (ver
+    # _cf_first_account).
+    [[ "$id" =~ ^[0-9a-f]{32}$ ]] || id=""
     [[ -n "$id" ]] && { rm -f "$out"; printf '%s' "$id"; return 0; }
     c="${c#*.}"
   done
@@ -10728,8 +10813,12 @@ _ssl_origin() { # _ssl_origin <app> <ecc|rsa> <force> <cert subido> <clave subid
 
   install -d -m 0755 "$ORIGIN_CERT_DIR" || die "No puedo crear %s." "$ORIGIN_CERT_DIR"
   # Lo que dejara un intento anterior cortado de golpe (Ctrl-C, un kill): es
-  # 0700 de root y no se lee, pero es una clave sin dueño.
-  rm -rf "$ORIGIN_CERT_DIR/.$name.nuevo."*
+  # 0700 de root y no se lee, pero es una clave sin dueño. Con las seis letras
+  # de mktemp y no con un '*': los puntos valen en un nombre de app, y
+  # '.tienda.nuevo.*' casaba con lo apartado de una app llamada
+  # 'tienda.nuevo' —su '.tienda.nuevo.eliminada.XXXXXX', la clave que 'orbit
+  # remove' prometió guardar y que Cloudflare no vuelve a dar—.
+  rm -rf "$ORIGIN_CERT_DIR/.$name.nuevo."[[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]]
   ORIGIN_TMP="$(mktemp -d "$ORIGIN_CERT_DIR/.$name.nuevo.XXXXXX")" || die "No puedo crear una carpeta en %s." "$ORIGIN_CERT_DIR"
   chmod 0700 "$ORIGIN_TMP"
   local c="$ORIGIN_TMP/cert.pem" k="$ORIGIN_TMP/key.pem" src id="" rtype=""
@@ -10828,7 +10917,17 @@ _ssl_origin() { # _ssl_origin <app> <ecc|rsa> <force> <cert subido> <clave subid
   # Y sólo si el vhost que acaba de aceptar nginx lee de verdad la clave de
   # origen: borrar el Let's Encrypt con el vhost apuntándole todavía dejaría a
   # nginx sin arrancar en la próxima recarga, el servidor entero.
-  if [[ -f "$LE_RENEWAL_DIR/$A_DOMAIN.conf" ]] && has_origin "$name" \
+  # Ni si lo usa otro fichero que carga nginx: un vhost escrito a mano para
+  # otro servicio con el mismo certificado es legítimo (principio 3), y
+  # borrarlo dejaba la siguiente recarga de nginx rota para todo el servidor.
+  local ajenos=""
+  if [[ -f "$LE_RENEWAL_DIR/$A_DOMAIN.conf" ]]; then
+    ajenos="$(grep -RlsF -- "$(dirname "$(cert_file "$A_DOMAIN")")/" "$NGINX_ENABLED" "$NGINX_CONFD" 2>/dev/null || true)"
+  fi
+  if [[ -n "$ajenos" ]]; then
+    warn "No retiro el certificado de Let's Encrypt de %s: lo usa todavía %s." "$A_DOMAIN" "${ajenos//$'\n'/, }"
+    info "Cuando ya no lo use nadie:  certbot delete --cert-name %s" "$A_DOMAIN"
+  elif [[ -f "$LE_RENEWAL_DIR/$A_DOMAIN.conf" ]] && has_origin "$name" \
      && [[ "$(grep -cF "ssl_certificate_key $(origin_key "$name");" "$(nginx_file "$name")" 2>/dev/null)" != 0 ]]; then
     if _certbot delete --cert-name "$A_DOMAIN" --non-interactive >/dev/null; then
       ok "Certificado de Let's Encrypt de %s retirado: certbot ya no lo renovará" "$A_DOMAIN"
@@ -10872,13 +10971,25 @@ _cf_verify_status() { # _cf_verify_status <respuesta.json>
     grep -o '"status" *: *"[a-z_]*"' "$1" 2>/dev/null | head -1 | sed 's/.*"\([a-z_]*\)"$/\1/' || true
   fi
 }
-# El id de la cuenta dueña de la primera zona de una respuesta de /zones.
+# El id de la cuenta dueña de la primera zona de una respuesta de /zones, o
+# nada. Va a una URL —y la URL, a la configuración de curl que lleva el
+# token—, así que sólo vale lo que es un id de Cloudflare: 32 cifras
+# hexadecimales. Con jq, cualquier cosa que trajera la respuesta acababa en la
+# ruta, y un salto de línea dentro era una línea más de configuración de curl.
+# Sin jq, el objeto 'account' entero y el 'id' de dentro, en cualquier orden y
+# con la respuesta en varias líneas: el patrón de antes pedía que 'id' fuera
+# la primera clave y que todo viniera en una línea, y si no, un token bueno se
+# rechazaba como «HTTP 401».
 _cf_first_account() { # _cf_first_account <respuesta.json>
+  local id
   if command -v jq >/dev/null 2>&1; then
-    jq -r '.result[0].account.id // empty' "$1" 2>/dev/null || true
+    id="$(jq -r '.result[0].account.id // empty' "$1" 2>/dev/null || true)"
   else
-    grep -o '"account" *: *{ *"id" *: *"[0-9a-f]*"' "$1" 2>/dev/null | head -1 | sed 's/.*"\([0-9a-f]*\)"$/\1/' || true
+    id="$(tr -d '\r\n' < "$1" 2>/dev/null | grep -o '"account" *: *{[^}]*}' | head -1 \
+          | grep -o '"id" *: *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
   fi
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] && printf '%s' "$id"
+  return 0
 }
 
 cmd_cf_token() {
@@ -10921,6 +11032,10 @@ EOF
   # conserva los del fichero—.
   local f="$ETC_DIR/cloudflare.ini" new out code st
   new="$(umask 077; mktemp "$ETC_DIR/.cloudflare.ini.XXXXXX")"
+  # Las tres llamadas pueden tardar hasta 30 s cada una, y un Ctrl-C o un kill
+  # a mitad dejaban para siempre una copia del token sin verificar: la trampa
+  # la quita, también con SIGTERM.
+  trap 'rm -f -- "$new"' EXIT
   printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$new"
   chmod 0600 "$new"
 
@@ -10943,6 +11058,12 @@ EOF
     if [[ "$code" == 200 && -n "$acc" ]]; then
       code="$(CF_INI="$new" _cf_api GET "/accounts/$acc/tokens/verify" "$out")"
       st="$(_cf_verify_status "$out")"
+    elif [[ "$code" == 200 ]]; then
+      # Lo acepta, pero no ve ninguna zona —o no se entiende cuál—: no sirve
+      # para validar por DNS ni para los certificados de origen, y llamarlo
+      # «HTTP 401» mandaba a buscar el fallo en el token.
+      rm -f "$out" "$new"
+      die "Cloudflare acepta el token, pero no le deja ver ninguna zona: dale «Zone → DNS → Edit» en las zonas de este servidor. No lo he guardado."
     else
       code=401; st=""
     fi
@@ -10957,6 +11078,7 @@ EOF
     die "Cloudflare no da ese token por bueno (HTTP %s%s). No lo he guardado." "$code" "${st:+, $st}"
   fi
   mv -f "$new" "$f"
+  trap - EXIT
   ok "Token guardado en %s/cloudflare.ini (sólo root puede leerlo)" "$ETC_DIR"
 }
 
@@ -13406,8 +13528,14 @@ _notify_rank() { case "$1" in info) echo 0 ;; warn) echo 1 ;; crit) echo 2 ;; *)
 # leyendo /proc/<pid>/cmdline— mientras dura la llamada, y curl sólo tapa el
 # argumento de --user, no las URL. Las apps corren con su propio usuario
 # (§5.3): una con un fallo podía quedarse con el bot de avisos.
+# Un valor con un salto de línea no se escribe: en un -K cada línea es una
+# opción, y lo que viniera detrás —una URL de la respuesta de una API, una
+# cabecera— se convertía en otra 'url' que se llevaba la cabecera con el token.
+# Sin la línea, curl no tiene a dónde ir y falla, que es el lado bueno.
 _curl_cfg() { # _curl_cfg <opción> <valor>  -> la línea 'opción = "…"' de un -K
-  local cv="$2"; cv="${cv//\\/\\\\}"; cv="${cv//\"/\\\"}"
+  local cv="$2"
+  [[ "$cv" == *[$'\n\r']* ]] && return 1
+  cv="${cv//\\/\\\\}"; cv="${cv//\"/\\\"}"
   printf '%s = "%s"\n' "$1" "$cv"
 }
 
@@ -16432,13 +16560,14 @@ _doctor_admin() {
 # alguien las refresque y que lo esté haciendo.
 _doctor_prom() {
   [[ -n "$METRICS_PROM_DIR" ]] || return 0
-  local f="$METRICS_PROM_DIR/$METRICS_PROM_NAME" ts now
+  local f="$METRICS_PROM_DIR/$METRICS_PROM_NAME" ts now bad=""
+  [[ -d "$METRICS_PROM_DIR" ]] && bad="$(_prom_dir_unsafe "$METRICS_PROM_DIR")"
   if [[ ! -d "$METRICS_PROM_DIR" ]]; then
     _doc error prom "$(t "No existe %s, donde van las métricas de Prometheus" "$METRICS_PROM_DIR")" \
       "$(t "elige otra:  orbit metrics prom enable <carpeta>")"
-  elif [[ -n "$(_paths_unsafe "$EUID" "$METRICS_PROM_DIR")" ]]; then
-    _doc error prom "$(t "%s la puede escribir alguien que no es root: las métricas de Prometheus no se escriben ahí" "$METRICS_PROM_DIR")" \
-      "$(t "dásela a root:  sudo chown root:root %s && sudo chmod 0755 %s" "$METRICS_PROM_DIR" "$METRICS_PROM_DIR")"
+  elif [[ -n "$bad" ]]; then
+    _doc error prom "$(t "%s la puede escribir alguien que no es root: las métricas de Prometheus no se escriben ahí" "$bad")" \
+      "$(t "dásela a root:  sudo chown root:root %s && sudo chmod 0755 %s" "$bad" "$bad")"
   elif ! systemctl is-active --quiet orbit-watch.timer 2>/dev/null; then
     _doc warn prom "$(t "Las métricas de Prometheus no se escriben: las escribe el vigilante, y está parado")" \
       "$(t "actívalo con:  orbit watch enable")"
@@ -16905,13 +17034,31 @@ _admin_rule() {
 EOF
 }
 
+# Los del grupo, y también quien lo tiene como grupo principal: '%orbit-admin'
+# en sudoers casa con los dos, y la lista de miembros de 'getent group' sólo
+# trae a los primeros. Sin ellos, 'admin list' decía «Nadie» y doctor «nadie en
+# el grupo» con un usuario que era root por esa regla.
 _admin_members() { # una por línea
   local line; local -a m=()
   line="$(getent group "$ADMIN_GROUP" 2>/dev/null || true)"
   [[ -n "$line" ]] || return 0
   IFS=, read -ra m <<<"${line##*:}"
-  (( ${#m[@]} )) && printf '%s\n' "${m[@]}"
+  { (( ${#m[@]} )) && printf '%s\n' "${m[@]}"; _admin_primary_of "$line"; } | awk 'NF && !s[$0]++'
   return 0
+}
+
+_admin_primary_of() { # _admin_primary_of <línea de getent group>
+  local gid; IFS=: read -r _ _ gid _ <<<"$1"
+  [[ "$gid" =~ ^[0-9]+$ ]] || return 0
+  getent passwd 2>/dev/null | awk -F: -v g="$gid" '$4 == g { print $1 }' || true
+}
+
+_admin_is_primary() { # _admin_is_primary <usuario>
+  local m line
+  line="$(getent group "$ADMIN_GROUP" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+  while IFS= read -r m <&3; do [[ "$m" == "$1" ]] && return 0; done 3< <(_admin_primary_of "$line")
+  return 1
 }
 
 _admin_is_member() { # _admin_is_member <usuario>
@@ -16986,6 +17133,13 @@ _admin_add() { # _admin_add <usuario>
   _admin_rule_prepare
   if ! getent group "$ADMIN_GROUP" >/dev/null 2>&1; then
     groupadd --system "$ADMIN_GROUP" || { rm -f -- "$ADMIN_TMP"; die "No he podido crear el grupo %s." "$ADMIN_GROUP"; }
+  elif [[ ! -f "$SUDOERS_ADMIN" ]]; then
+    # Un grupo con ese nombre que ya existía: la regla que se va a poner hace
+    # root a todos los que ya estén dentro, no sólo a quien se añade ahora.
+    local -a otros=(); local x
+    while IFS= read -r x <&3; do [[ "$x" == "$u" ]] || otros+=("$x"); done 3< <(_admin_members)
+    (( ${#otros[@]} )) \
+      && warn "El grupo %s ya existía, y quien ya está en él pasa a equivaler a root: %s" "$ADMIN_GROUP" "$(IFS=,; printf '%s' "${otros[*]}")"
   fi
   _admin_rule_commit
   if _admin_is_member "$u"; then
@@ -17008,6 +17162,9 @@ _admin_remove() { # _admin_remove <usuario>
     info "«%s» no era de %s." "$u" "$ADMIN_GROUP"
     return 0
   fi
+  # gpasswd no quita un grupo principal: lo que hay que cambiar es la cuenta.
+  _admin_is_primary "$u" \
+    && die "%s es el grupo principal de «%s», y eso no lo quita gpasswd: cámbiaselo con  sudo usermod -g <otro grupo> %s" "$ADMIN_GROUP" "$u" "$u"
   gpasswd -d "$u" "$ADMIN_GROUP" >/dev/null || die "No he podido quitar a «%s» del grupo %s." "$u" "$ADMIN_GROUP"
   ok "«%s» ya no es de %s" "$u" "$ADMIN_GROUP"
   # sudo mira los grupos de la sesión, que se fijan al entrar: una que ya
@@ -18753,6 +18910,7 @@ _i18n_en() {
     ["visudo no acepta la regla, así que no la instalo:"]="visudo rejects the rule, so I am not installing it:"
     ["No he podido crear el grupo %s."]="I could not create the group %s."
     ["«%s» ya era de %s"]="«%s» was already in %s"
+    ["El grupo %s ya existía, y quien ya está en él pasa a equivaler a root: %s"]="The group %s already existed, and whoever is already in it becomes equivalent to root: %s"
     ["No he podido añadir a «%s» al grupo %s."]="I could not add «%s» to the group %s."
     ["«%s» puede usar orbit sin ser root"]="«%s» can use orbit without being root"
     ["Esto equivale a darle root. Orbit hace como root lo que se le pide, y quien decide qué se le pide decide qué hace root."]="This is the same as giving them root. Orbit does as root what it is asked, and whoever decides what it is asked decides what root does."
@@ -18761,6 +18919,7 @@ _i18n_en() {
     ["«%s» no era de %s."]="«%s» was not in %s."
     ["No he podido quitar a «%s» del grupo %s."]="I could not remove «%s» from the group %s."
     ["«%s» ya no es de %s"]="«%s» is no longer in %s"
+    ["%s es el grupo principal de «%s», y eso no lo quita gpasswd: cámbiaselo con  sudo usermod -g <otro grupo> %s"]="%s is the primary group of «%s», and gpasswd cannot remove that: change it with  sudo usermod -g <another group> %s"
     ["Una sesión que ya tenga abierta puede conservar el grupo hasta que salga. Si es urgente:  sudo loginctl terminate-user %s"]="A session they already have open may keep the group until they leave. If it is urgent:  sudo loginctl terminate-user %s"
     ["Administradores de Orbit"]="Orbit administrators"
     ["Nadie. Se añade con:  orbit admin add <usuario>"]="Nobody. Add someone with:  orbit admin add <user>"
@@ -19000,6 +19159,8 @@ _i18n_en() {
     ["HTTPS con certificado de origen de Cloudflare en %s"]="HTTPS with a Cloudflare origin certificate on %s"
     ["Caduca el %s. Clave en %s, sólo para root."]="It expires on %s. Key in %s, root only."
     ["Certificado de Let's Encrypt de %s retirado: certbot ya no lo renovará"]="Let's Encrypt certificate for %s retired: certbot will no longer renew it"
+    ["No retiro el certificado de Let's Encrypt de %s: lo usa todavía %s."]="I am not retiring the Let's Encrypt certificate for %s: %s still uses it."
+    ["Cuando ya no lo use nadie:  certbot delete --cert-name %s"]="When nothing uses it any more:  certbot delete --cert-name %s"
     ["No he podido retirar el certificado de Let's Encrypt de %s; bórralo con:  certbot delete --cert-name %s"]="I could not retire the Let's Encrypt certificate for %s; delete it with:  certbot delete --cert-name %s"
     ["El token de Cloudflare no tiene permiso para pedir certificados de origen."]="The Cloudflare token has no permission to request origin certificates."
     ["Cloudflare dice: %s"]="Cloudflare says: %s"
@@ -19012,6 +19173,7 @@ _i18n_en() {
     ["Cloudflare reconoce el token y está activo"]="Cloudflare recognises the token and it is active"
     ["No he podido preguntarle a Cloudflare si el token vale. Lo guardo igualmente."]="I could not ask Cloudflare whether the token is valid. Storing it anyway."
     ["Cloudflare no da ese token por bueno (HTTP %s%s). No lo he guardado."]="Cloudflare does not accept that token (HTTP %s%s). I have not stored it."
+    ["Cloudflare acepta el token, pero no le deja ver ninguna zona: dale «Zone → DNS → Edit» en las zonas de este servidor. No lo he guardado."]="Cloudflare accepts the token, but it cannot see any zone: give it «Zone → DNS → Edit» on this server's zones. I have not stored it."
     ["dice llevar el certificado de origen y no está"]="it claims to carry the origin certificate and it is not there"
     ["Certificado de origen de Cloudflare restaurado"]="Cloudflare origin certificate restored"
     ["El certificado de origen de la copia no casa con su clave: no lo restauro."]="The origin certificate in the backup does not match its key: not restoring it."

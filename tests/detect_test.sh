@@ -1333,6 +1333,8 @@ _pa_tree() { # _pa_tree <dir> <package.json> <ficheros…>
   mkdir -p "$d"; printf '%s\n' "$pj" > "$d/package.json"
   for f in "$@"; do mkdir -p "$d/$(dirname "$f")"; : > "$d/$f"; done
 }
+# La app existe antes de desplegarse, como en un despliegue de verdad.
+mkapp pa node 3008 pa.test
 _pa() { # _pa <release> [tipo a la fuerza]  -> A_ASSETS como lo dejaría el despliegue
   detect_stack "$1" >/dev/null 2>&1
   [[ -n "${2:-}" ]] && A_TYPE="$2"
@@ -1376,6 +1378,21 @@ check "angular ssr, no"      ''                                       "$(_pa "$P
 # Se guarda: render_nginx relee la configuración del disco.
 _pa "$PA/nuxt" >/dev/null; A_ASSETS="otra cosa"; load_app pa
 check "y queda guardado"     '/_nuxt/:.output/public !/_nuxt/builds/' "$A_ASSETS"
+
+# Y sólo ese campo. En memoria está ya lo que pide la release candidata —su
+# orbit.json: health check, límites, el .env declarado— y un despliegue que
+# falla después no llega al save_app del final: guardarlo todo aquí dejaba a
+# la release buena con la configuración de la rota.
+mkapp pa node 3008 pa.test; A_LIMIT_MEM="512M"; A_HEALTH_PATH="/"; save_app
+load_app pa
+detect_stack "$PA/nuxt" >/dev/null 2>&1; A_NAME="pa"; A_ASSETS=""
+A_LIMIT_MEM="64M"; A_HEALTH_PATH="/de-la-candidata"
+_proc_assets_apply "$PA/nuxt" >/dev/null 2>&1
+check "en memoria, el nuevo"   '/_nuxt/:.output/public !/_nuxt/builds/' "$A_ASSETS"
+check "la candidata sigue en memoria" "64M" "$A_LIMIT_MEM"
+load_app pa
+check "en el disco, el nuevo"  '/_nuxt/:.output/public !/_nuxt/builds/' "$A_ASSETS"
+check "y nada más de la candidata" "512M /" "$A_LIMIT_MEM $A_HEALTH_PATH"
 
 # Lo que no se apunta. Un 'buildAssetsDir' propio deja la carpeta en otro
 # sitio: sin ella, nada —ni la excepción suelta— y los recursos siguen yendo a
@@ -1429,6 +1446,21 @@ check "a mano: sólo lo válido" "1" "$(grep -c '^    location /' <<<"$PAB")"
 check "y es el bueno"          "1" "$(grep -c '^    location /ok/ {$' <<<"$PAB")"
 check "lo dice, por stderr"    "2" "$(grep -c 'A_ASSETS: «' "$TMP/pa.err")"
 check "y nada fuera"           "0" "$(grep -c '\.\./\.\./etc\|a;b' <<<"$PAB")"
+# Ni lo que ya tiene location en el vhost —el reto de ACME, las páginas
+# internas— ni un prefijo repetido: dos 'location' iguales hacen que nginx
+# rechace el vhost entero.
+A_ASSETS='/.well-known/acme-challenge/:dist /__orbit_502/:dist !/x/ /x/:dist /ok/:dist /ok/:otra'
+PAB="$(_proc_assets_block 2>"$TMP/pa.err")"
+check "ni acme, ni internas, ni repetidos" "2" "$(grep -c '^    location /' <<<"$PAB")"
+check "una sola /x/"           "1" "$(grep -c '^    location /x/ {$' <<<"$PAB")"
+check "y lo dice"              "4" "$(grep -c 'A_ASSETS: «' "$TMP/pa.err")"
+# Dos prefijos que se escriben distinto y dan el mismo nombre: nginx no rechaza
+# dos named location iguales, se queda con la primera, y la segunda caía a la
+# anterior de una carpeta que no es la suya.
+A_ASSETS='/a-b/:uno /a_b/:dos'
+PAB="$(_proc_assets_block 2>/dev/null)"
+check "nombres distintos"      "2" "$(grep -o 'location @orbit_prev_app_[a-z_]*' <<<"$PAB" | sort -u | wc -l)"
+check "cada uno a la suya"     "1" "$(grep -A1 'location @orbit_prev_app_a_b_ {' <<<"$PAB" | grep -c '/previous/dos;$')"
 
 section "Serialización de configuración"
 # Literales ${...} y comillas simples: la trampa que motivó _q().
