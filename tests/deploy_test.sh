@@ -437,9 +437,14 @@ CODEFILE="$TMP/httpcode"; echo 200 > "$CODEFILE"
 _srv_start "$CODEFILE" "$TMP/httpport"; HPID=$!
 NGINX_HTTP_PORT="$(cat "$TMP/httpport")"
 
+# Desde 1.4.9 lo que se escribe en shared/.env lo escribe el usuario de la app:
+# el '>>' de root seguía lo que hubiera en esa ruta (ver _as_user en orbit).
+: > "$AS_USER_LOG"
 run cmd_deploy tienda >"$TMP/lar1" 2>&1; r=$?
 [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/lar1" | tail -20
 check "primer despliegue"      "0" "$r"
+check "el .env lo crea la app" "1" "$(grep -c "^$(id -un) sh -c umask 077.* $LBASE/shared/.env\$" "$AS_USER_LOG")"
+check "y la APP_KEY= también"  "1" "$(grep -c "APP_KEY=.* sh $LBASE/shared/.env\$" "$AS_USER_LOG")"
 check "storage es un enlace"   "$LBASE/shared/storage" "$(readlink "$LBASE/current/storage")"
 # Ésta es la que se pone en rojo sin la siembra: sin framework/views la web
 # responde 500 en todas las peticiones con «Please provide a valid cache path».
@@ -1463,6 +1468,43 @@ JSON
   check "y pisa con lo que trae"           "otro" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
   check "incluida una con export"          "1" "$(_env_read "$RBASE/shared/.env" NUEVA)"
 
+  # --env-stdin: lo mismo que --env, pero los valores no pasan por la línea de
+  # órdenes, donde los ve 'ps' y los apunta el registro de sudo. Es lo que usa
+  # Orbit Desktop para dar las obligatorias.
+  sleep 1
+  printf 'DB_PASS=desde-stdin\n# nada\nOTRA=dos\n' | ASSUME_YES="yes" run cmd_deploy conreq --env-stdin >"$TMP/rq6" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/rq6"
+  check "--env-stdin despliega"            "0" "$r"
+  check "y escribe lo que llega"           "desde-stdin" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
+  check "todas las líneas"                 "dos" "$(_env_read "$RBASE/shared/.env" OTRA)"
+  sleep 1
+  JSON="yes"; _ui_route
+  printf 'DB_PASS=json-stdin\n' | run cmd_deploy conreq --env-stdin --progress >"$TMP/rq7.json" 2>"$TMP/rq7.err"
+  JSON="no"; _ui_route
+  check "con --json y --progress"          "true" "$(jq -r '.ok' "$TMP/rq7.json" 2>/dev/null)"
+  check "stdout sólo el objeto"            "1" "$(grep -c . "$TMP/rq7.json")"
+  check "y el valor llega"                 "json-stdin" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
+  printf 'MAL-NOMBRE=x\n' | run cmd_deploy conreq --env-stdin >/dev/null 2>&1; r=$?
+  check "un mal nombre por stdin, no"      "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  printf "DB_PASS=con'comilla\n" | run cmd_deploy conreq --env-stdin >/dev/null 2>&1; r=$?
+  check "ni un valor que no se guarda"     "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  check "y no pisa el bueno"               "json-stdin" "$(_env_read "$RBASE/shared/.env" DB_PASS)"
+  printf 'DB_PASS=x\n' | run cmd_deploy --env-stdin >"$TMP/rq8" 2>&1; r=$?
+  check "sin app no se puede elegir"       "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  check "y lo dice"                        "1" "$(grep -c 'necesita el nombre de la app' "$TMP/rq8")"
+  printf 'DB_PASS=x\n' | run cmd_deploy conreq --env-stdin --pick >/dev/null 2>&1; r=$?
+  check "ni --pick"                        "1" "$([[ "$r" != 0 ]] && echo 1 || echo 0)"
+  # La entrada queda gastada: aunque haya un terminal, no se pregunta.
+  _stdin_tty() { return 0; }
+  ASSUME_YES="no"; JSON="no"; DEP_ENV_STDIN="no"
+  _env_can_ask && r=si || r=no
+  check "con terminal, se pregunta"        "si" "$r"
+  DEP_ENV_STDIN="yes"
+  _env_can_ask && r=si || r=no
+  check "con --env-stdin, no"              "no" "$r"
+  DEP_ENV_STDIN="no"; unset -f _stdin_tty
+  eval "$(sed -n '/^_stdin_tty() {/p' "$ORBIT_ROOT/orbit")"
+
   section "orbit env check"
   run cmd_env check conreq >"$TMP/ck1" 2>&1; r=$?
   check "con todo puesto, sale bien"       "0" "$r"
@@ -1580,6 +1622,46 @@ JSON
   check "la que se quita del repo se retira" "0" "$(find "$TMP/systemd" -name '*cron-informe*' | wc -l)"
   check "y lo dice"                         "1" "$(grep -c 'informe.*ya no está' "$TMP/kc2")"
   check "la otra se queda"                  "1" "$([[ -f "$PS.timer" ]] && echo 1 || echo 0)"
+  # Sin php-fpm en el servidor, '/run/php' no existe y systemd no monta la
+  # ruta: la tarea moría con 226/NAMESPACE. Con el '-' es opcional.
+  check "/run/php opcional también aquí"    "1" "$(grep -c '^ReadWritePaths=.* -/run/php$' "$PS.service" 2>/dev/null)"
+
+  # 'orbit cron run' sólo miraba que existiera un fichero con ese nombre: un
+  # .service suelto, sin temporizador y con un nombre que no se puede declarar,
+  # se arrancaba igual. Ahora la regla de _cron_sync y una tarea de verdad.
+  : > "$TMP/systemd/orbit-conrel.cron-Suelta.service"
+  : > "$TMP/systemd/orbit-conrel.cron-sintimer.service"
+  : > "$SYSCTL_LOG"
+  for malo in '../../x' '-H' 'Suelta' 'sintimer' 'no-existe'; do
+    run cmd_cron run conrel "$malo" >/dev/null 2>&1; r=$?
+    check "cron run «$malo» se niega"        "1" "$r"
+  done
+  check "y no llega a systemctl"            "0" "$(grep -c '^start' "$SYSCTL_LOG")"
+  run cmd_cron run conrel portal >/dev/null 2>&1; r=$?
+  check "una tarea que existe, sí"          "0" "$r"
+  check "y la arranca"                      "1" "$(grep -c '^start orbit-conrel.cron-portal.service$' "$SYSCTL_LOG")"
+  rm -f "$TMP/systemd/orbit-conrel.cron-Suelta.service" "$TMP/systemd/orbit-conrel.cron-sintimer.service"
+
+  # El fichero de entorno que declara la app es el que carga la tarea. La
+  # web de verdad que lo destapó guarda sus variables en shared/api/.env, y
+  # su tarea de portal necesitaba un token de ahí que nunca le llegaba.
+  cat > "$KORIGIN/orbit.json" <<'JSON'
+{ "type": "static", "outdir": ".",
+  "env": { "file": "api/.env" },
+  "release": "printf '%s|%s' \"$MI_VAR\" \"$API_VAR\" > release-env",
+  "cron": [ { "name": "portal", "every": "5m", "command": "true" } ] }
+JSON
+  git -C "$KORIGIN" commit -qam "env declarado"
+  mkdir -p "$KBASE/shared/api"; printf 'API_VAR=de-api\n' > "$KBASE/shared/api/.env"
+  sleep 1
+  run cmd_deploy conrel >"$TMP/kc3" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/kc3"
+  check "despliega con env.file"            "0" "$r"
+  check "la tarea carga shared/.env"        "1" "$(grep -c "^EnvironmentFile=-$KBASE/shared/.env$" "$PS.service" 2>/dev/null)"
+  check "y el declarado"                    "1" "$(grep -c "^EnvironmentFile=-$KBASE/shared/api/.env$" "$PS.service" 2>/dev/null)"
+  check "detrás, que es el que gana"        "EnvironmentFile=-$KBASE/shared/.env|EnvironmentFile=-$KBASE/shared/api/.env" \
+    "$(grep '^EnvironmentFile=' "$PS.service" 2>/dev/null | tr '\n' '|' | sed 's/|$//')"
+  check "release ve los dos"                "desde-env|de-api" "$(cat "$KBASE/current/release-env" 2>/dev/null)"
   _cron_remove_all conrel
   check "al borrar la app no queda ninguna"  "0" "$(find "$TMP/systemd" -name 'orbit-conrel.cron-*' | wc -l)"
 

@@ -646,6 +646,63 @@ pasada_json "$TMP/k4" --auto
 check "no es GitHub: ci_unknown"   "ci_unknown" "$(estado "$TMP/k4" fuera)"
 check "y no despliega"             "1"  "$([[ "$(sirve fuera)" != "fuera v9" ]] && echo 1 || echo 0)"
 
+section "autodeploy enable espera a la CI por defecto en GitHub"
+# Desde 1.4.9. Desplegar solo un commit en rojo es lo que nadie quiere que pase
+# de madrugada, así que encender el automático en un repositorio de GitHub
+# enciende también la puerta. Pero sólo si nadie lo había decidido: un
+# 'checks off' se respeta, y las apps que ya estaban no cambian solas.
+systemctl() { return 0; }
+registrar gh1 "https://github.com/acme/uno"; load_app gh1; A_AUTODEPLOY="no"; save_app
+run cmd_autodeploy enable gh1 >"$TMP/e1" 2>&1; r=$?
+load_app gh1
+check "se activa"                    "0"   "$r"
+check "con la puerta puesta"         "yes" "$A_CHECKS"
+check "y lo dice"                    "1"   "$(grep -c 'sólo con la CI de acme/uno en verde' "$TMP/e1")"
+check "con la salida para no"        "1"   "$(grep -c 'enable gh1 --no-checks' "$TMP/e1")"
+check "y avisa si gh no tiene sesión" "1"  "$(grep -c 'gh no tiene sesión' "$TMP/e1")"
+registrar gh2 "https://github.com/acme/dos"; load_app gh2; A_AUTODEPLOY="no"; save_app
+run cmd_autodeploy enable --no-checks gh2 >"$TMP/e2" 2>&1; r=$?
+load_app gh2
+check "--no-checks la deja fuera"    "no"  "$A_CHECKS"
+check "y avisa de lo que implica"    "1"   "$(grep -c 'un commit en rojo se desplegará igual' "$TMP/e2")"
+# Un 'checks off' anterior es una decisión: volver a encender no la deshace.
+run cmd_autodeploy disable gh2 >/dev/null 2>&1
+run cmd_autodeploy enable gh2 >/dev/null 2>&1
+load_app gh2
+check "un off anterior se respeta"   "no"  "$A_CHECKS"
+# Fuera de GitHub no hay a quién preguntar: nada cambia.
+registrar local1 "$TMP/repo-otra"; load_app local1; A_AUTODEPLOY="no"; save_app
+run cmd_autodeploy enable local1 >"$TMP/e3" 2>&1; r=$?
+load_app local1
+check "fuera de GitHub, se activa"   "0"   "$r"
+check "sin puerta"                   ""    "$A_CHECKS"
+check "y sin hablar de CI"           "0"   "$(grep -c 'CI' "$TMP/e3")"
+run cmd_autodeploy enable local1 --checks >/dev/null 2>&1; r=$?
+check "--checks fuera de GitHub, no" "1"   "$r"
+# Las que ya estaban en automático sin decidir nada no se migran: registrar
+# deja A_CHECKS vacío y A_AUTODEPLOY en yes, que es una app de antes de 1.4.9.
+registrar vieja1 "https://github.com/acme/vieja"
+check "una de antes, intacta"        ""    "$(load_app vieja1; printf '%s' "$A_CHECKS")"
+# Y el estado lo dice, sin abrir el .conf.
+_watch_state_load
+SALIDA="$(load_app gh1; _autodeploy_line gh1)"
+check "status: espera a la CI"       "1"   "$(grep -c 'espera a la CI' <<<"$SALIDA")"
+SALIDA="$(load_app vieja1; _autodeploy_line vieja1)"
+check "status: sin esperar"          "1"   "$(grep -c 'sin esperar a la CI' <<<"$SALIDA")"
+SALIDA="$(load_app local1; _autodeploy_line local1)"
+check "status: fuera de GitHub, nada" "0"  "$(grep -c 'CI' <<<"$SALIDA")"
+# Y doctor lo cuenta, sin arreglarlo: puede ser deliberado.
+DOC_LEVEL=(); DOC_ID=(); DOC_MSG=(); DOC_FIX=(); DOC_ACT=()
+nginx() { return 0; }
+_doctor_collect >/dev/null 2>&1
+DOCIDS=" ${DOC_ID[*]} "
+check "doctor: la de antes"          "1"   "$([[ "$DOCIDS" == *" ci-off:vieja1 "* ]] && echo 1 || echo 0)"
+check "doctor: la de --no-checks"    "1"   "$([[ "$DOCIDS" == *" ci-off:gh2 "* ]] && echo 1 || echo 0)"
+check "doctor: no la que espera"     "0"   "$([[ "$DOCIDS" == *" ci-off:gh1 "* ]] && echo 1 || echo 0)"
+check "doctor: ni la de fuera"       "0"   "$([[ "$DOCIDS" == *" ci-off:local1 "* ]] && echo 1 || echo 0)"
+unset -f nginx
+for _a in gh1 gh2 local1 vieja1; do rm -f "$TMP/etc/apps/$_a.conf"; done
+
 # ═══════════════════════════════════════════ por el router de verdad ══════
 section "Los comandos nuevos llegan por la línea de órdenes"
 # Lo de arriba llama a las funciones; esto pasa por main(), que es donde un
