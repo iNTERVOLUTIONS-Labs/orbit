@@ -54,6 +54,16 @@ check "HOST local" "127.0.0.1" "$(x web sh -c 'echo $HOST')"
 # la unidad gana al del .env. exec tiene que comportarse igual o miente.
 check "NODE_ENV gana al .env" "production" "$(x web sh -c 'echo $NODE_ENV')"
 
+# Y el fichero que declara la app ("env": {"file": "api/.env"}), detrás: el
+# mismo orden que la unidad, donde el declarado gana.
+mkdir -p "$TMP/apps/web/shared/api"
+printf 'DEL_API=de-api\nDEL_ENV=pisada\n' > "$TMP/apps/web/shared/api/.env"
+load_app web; A_ENV_FILE="api/.env"; save_app
+check "carga el declarado"    "de-api" "$(x web sh -c 'echo $DEL_API')"
+check "que gana al .env"      "pisada" "$(x web sh -c 'echo $DEL_ENV')"
+load_app web; A_ENV_FILE=""; save_app
+check "sin declarar, como antes" "hola" "$(x web sh -c 'echo $DEL_ENV')"
+
 check "node_modules/.bin en PATH" "binario-local" "$(x web miherramienta)"
 check ".venv/bin en PATH" "1" \
   "$(x web sh -c 'case $PATH in *"/.venv/bin"*) echo 1;; *) echo 0;; esac')"

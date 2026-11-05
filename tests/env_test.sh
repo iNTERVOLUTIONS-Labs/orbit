@@ -199,4 +199,57 @@ check "la última definición gana" "ultima" "$(_env_read "$REGEXF" K)"
 printf '  export K=exportada\n' > "$REGEXF"
 check "acepta 'export' y sangría" "exportada" "$(_env_read "$REGEXF" K)"
 
+
+section "Lo que es de la app lo escribe la app"
+# shared/ es del usuario de la app, así que entre el '[[ -L ]]' que comprueba el
+# .env y la escritura la app puede cambiarlo por un enlace. Si escribe root,
+# escribe donde ella elija —/etc/sudoers.d/…—; si escribe la app, no llega a
+# nada que no pudiera tocar ya. Sin root no se puede ver el permiso, así que se
+# comprueba QUIÉN hace cada cosa (el doble de _as_user de lib.sh lo apunta).
+mkapp aislada node 3031 aislada.test
+load_app aislada; A_USER="orbit-aislada"; save_app
+AENV="$TMP/apps/aislada/shared/.env"; mkdir -p "$TMP/apps/aislada/shared"
+chown() { :; }   # sin root no se puede dar a otro; lo que importa es quién escribe
+: > "$AS_USER_LOG"
+run cmd_env set aislada CLAVE valor >/dev/null 2>&1; r=$?
+check "set funciona"                "0"     "$r"
+check "lo crea la app"              "1"     "$(grep -c "^orbit-aislada sh -c .* $AENV\$" "$AS_USER_LOG")"
+check "lo escribe la app"           "1"     "$(grep -c "^orbit-aislada tee -- $AENV\$" "$AS_USER_LOG")"
+check "y se lee"                    "valor" "$(run cmd_env get aislada CLAVE)"
+: > "$AS_USER_LOG"
+run cmd_env unset aislada CLAVE >/dev/null 2>&1
+check "unset también"               "1"     "$(grep -c "^orbit-aislada tee -- $AENV\$" "$AS_USER_LOG")"
+# La carrera, puesta a mano: la comprobación ya ha pasado cuando aparece el
+# enlace. Lo que se afirma es que quien lo sigue es la app.
+printf 'de root\n' > "$TMP/de-root"
+_path_has_link() { return 1; }
+rm -f "$AENV"; ln -s "$TMP/de-root" "$AENV"
+: > "$AS_USER_LOG"
+_env_write "$AENV" CLAVE x
+check "a través del enlace, como la app" "1" "$(grep -c "^orbit-aislada tee -- $AENV\$" "$AS_USER_LOG")"
+check "y como la app también lo lee"     "1" "$(grep -c "^orbit-aislada cat -- $AENV\$" "$AS_USER_LOG")"
+unset -f _path_has_link
+rm -f "$AENV"; : > "$AENV"
+# 'orbit env edit' abría el editor de root sobre el fichero de la app y luego
+# le hacía un chown que seguía lo que hubiera en la ruta. Ahora el editor
+# trabaja sobre una copia privada y la escribe la app.
+printf '#!/bin/sh\nprintf "%%s\\n" "$1" > %s\nprintf "EDITADA=1\\n" >> "$1"\n' "$TMP/editor-vio" > "$TMP/editor"
+chmod +x "$TMP/editor"
+: > "$AS_USER_LOG"
+EDITOR="$TMP/editor" run cmd_env edit aislada </dev/null >/dev/null 2>&1; r=$?
+check "edit termina"                "0"  "$r"
+check "el editor no abre el de la app" "0" "$(grep -cxF "$AENV" "$TMP/editor-vio")"
+check "y lo guarda la app"          "1"  "$(grep -c "^orbit-aislada tee -- $AENV\$" "$AS_USER_LOG")"
+check "con lo editado"              "1"  "$(grep -c '^EDITADA=1$' "$AENV")"
+unset -f chown
+
+section "_as_user: sudo sólo para otro usuario"
+SUDO_VIO="$TMP/sudo-vio"; : > "$SUDO_VIO"
+sudo() { printf '%s\n' "$*" >> "$SUDO_VIO"; }
+_as_user_real "$(id -un)" true
+check "a sí mismo, sin sudo"        "0" "$(grep -c . "$SUDO_VIO")"
+_as_user_real orbit-otra tee -- /x
+check "a otro, con sudo -u"         "-u orbit-otra -- tee -- /x" "$(cat "$SUDO_VIO")"
+unset -f sudo
+
 report

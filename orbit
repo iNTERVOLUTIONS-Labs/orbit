@@ -379,7 +379,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.4.8"
+ORBIT_VERSION="1.4.9"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -983,6 +983,85 @@ as_deploy() { sudo -u "$DEPLOY_USER" -H bash -lc "$*"; }
 app_user()  { echo "${A_USER:-$DEPLOY_USER}"; }
 as_app()    { sudo -u "$(app_user)" -H bash -lc "$*"; }
 
+# Lo que root escribe en lo que es de la app, lo escribe la app.
+#
+# shared/ y releases/ son del usuario de la app a propósito —la app escribe
+# ahí—, así que cualquier ruta de dentro la puede cambiar ella por un enlace
+# cuando quiera. Comprobar con '[[ -L ]]' y escribir después como root deja un
+# hueco entre las dos cosas: el enlace que aparece justo en medio hace que root
+# escriba en, o le cambie el dueño o el modo a, un fichero que elige la app —
+# un 'chown' de root siguiendo shared/maintenance.reason → /etc/passwd le daba
+# el fichero al usuario de la app la siguiente vez que alguien ponía el
+# mantenimiento—. Ninguna comprobación cierra esa carrera. La cierra que quien
+# sigue el enlace sea la propia app: con él no llega a nada que no pudiera
+# tocar ya.
+#
+# Sin sudo cuando ya se es ese usuario: las pruebas, y root cuando la app no
+# tiene usuario propio ni lo es nadie más.
+_ORBIT_WHO=""
+_as_user() { # _as_user <usuario> <orden…>
+  local u="$1"; shift
+  [[ -n "$_ORBIT_WHO" ]] || _ORBIT_WHO="$(id -un)"
+  if [[ "$u" == "$_ORBIT_WHO" ]]; then "$@"; else sudo -u "$u" -- "$@"; fi
+}
+
+# El usuario de la app a la que pertenece una ruta de $APPS_DIR, por la ruta y
+# no por los globales (la lección de app_user_of). Vacío fuera de $APPS_DIR:
+# eso no lo controla ninguna app.
+_path_user() { # _path_user <ruta>
+  local rest="${1#"$APPS_DIR"/}"
+  [[ "$rest" != "$1" && -n "$rest" ]] || return 0
+  app_user_of "${rest%%/*}"
+}
+
+# La entrada estándar a <fichero>, escrita por <usuario>. Trunca y escribe en
+# el mismo inodo, como el 'cat > f' de antes: el enlace de la release al
+# shared/.env sigue valiendo y el fichero conserva dueño y modo.
+_user_write() { # _user_write <usuario> <fichero>
+  _as_user "$1" tee -- "$2" >/dev/null
+}
+
+# Crea <fichero> vacío si no existe, como <usuario> y sin que nadie más pueda
+# leerlo mientras tanto, y le pone el modo.
+_user_touch() { # _user_touch <usuario> <fichero> <modo>
+  # shellcheck disable=SC2016  # el $1 es del sh de dentro
+  _as_user "$1" sh -c 'umask 077; [ -e "$1" ] || : > "$1"' sh "$2"
+  _as_user "$1" chmod "$3" -- "$2"
+}
+
+# Editar a mano un fichero de la app sin que el editor de root lo abra en su
+# sitio: se edita una copia privada de root y la escribe de vuelta la app. Un
+# editor que guarda renombrando —vim lo hace— dejaba además el fichero de root
+# en shared/, y el 'chown' de después seguía lo que hubiera en esa ruta.
+_edit_as() { # _edit_as <usuario> <fichero> <modo>
+  local u="$1" f="$2" mode="$3" tmp rc=0
+  tmp="$(mktemp)"
+  if [[ -e "$f" || -L "$f" ]]; then
+    _as_user "$u" cat -- "$f" > "$tmp" \
+      || { rm -f "$tmp"; die "%s no lo puede leer su usuario (%s). No lo edito." "$f" "$u"; }
+  fi
+  set +e
+  "${EDITOR:-nano}" "$tmp"; rc=$?
+  set -e
+  if (( rc != 0 )); then rm -f "$tmp"; die "El editor ha salido con %s: no guardo nada." "$rc"; fi
+  _user_write "$u" "$f" < "$tmp" || { rm -f "$tmp"; die "No he podido guardar %s como %s." "$f" "$u"; }
+  rm -f "$tmp"
+  _as_user "$u" chmod "$mode" -- "$f"
+}
+
+# Una carpeta de la app cuyo PADRE no es de la app —releases/ y shared/ dentro
+# de la base, que es del fetcher—. 'install -d -o' no vale: GNU install sigue
+# un enlace y le cambia dueño y modo al destino (§5.3). mkdir no crea nada si
+# ya hay algo con ese nombre, y 'chown -h' no sigue el último componente.
+_own_dir() { # _own_dir <usuario> <carpeta>
+  [[ ! -L "$2" ]] || die "%s es un enlace simbólico y no una carpeta. No lo sigo: lo ha puesto alguien que no es Orbit." "$2"
+  # El modo es para la hoja a propósito: los padres —la base de la app— son
+  # de root o del fetcher y los crea quien los crea siempre.
+  # shellcheck disable=SC2174
+  [[ -d "$2" ]] || mkdir -p -m 0755 -- "$2"
+  chown -h "$1:$1" -- "$2"
+}
+
 # El nombre de usuario del aislamiento: determinista —dos llamadas dan lo
 # mismo, que es lo que permite recrearlo en un restore— y siempre válido para
 # useradd: ≤32 caracteres y sin '.' ni '_', que el NAME_REGEX por defecto de
@@ -1513,6 +1592,13 @@ load_app() {
   # versión anterior no trae los campos que se inventaron después, y sin esto se
   # quedarían con lo que dejó la app cargada justo antes.
   for k in "${ORBIT_APP_FIELDS[@]}"; do printf -v "$k" '%s' ""; done
+  # Con '.', y es correcto porque lo único que escribe este fichero es
+  # save_app, con cada valor entre comillas simples. Lo que no lo era es que
+  # 'orbit restore' lo instalaba tal cual desde la copia: ahora la copia se
+  # lee como datos (_conf_parse) y se vuelve a escribir con save_app, así que
+  # aquí no llega nada que no haya escrito Orbit. Leerlo como datos también
+  # aquí costaba 4 ms por app —sin forks, sólo comparaciones de bash— y
+  # 'orbit list' carga todas.
   # shellcheck disable=SC1090
   . "$(app_conf "$n")"
 }
@@ -1564,6 +1650,68 @@ _conf_unquote() { # _conf_unquote <valor tal cual>
     v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}"
   fi
   printf '%s' "$v"
+}
+
+# Lee un fichero CLAVE='valor' como DATOS: asigna las claves de la lista y no
+# ejecuta nada. Es el formato que escriben save_app y _notify_save —comillas
+# simples con su '\'' para la comilla de dentro, también con saltos de línea
+# dentro del valor—, más las dos formas que salen de editar a mano: comillas
+# dobles sin nada que expandir y un valor suelto. Un '# comentario' detrás del
+# valor se ignora, como en bash.
+#
+# Existe por 'orbit restore', que instalaba el app.conf y el notify.conf de la
+# copia tal cual en /etc/orbit, donde root los carga con '.' en cada ejecución
+# —temporizadores incluidos—. Una línea 'curl …|sh' metida en un tar.gz del
+# cubo de copias era código de root al restaurar y en cada 'orbit' posterior.
+# Medido antes de arreglarlo: la restauración ejecutaba la línea. Ahora la
+# copia se lee con esto, se valida y se vuelve a escribir con save_app.
+#
+#   strict   la primera línea que no es una asignación de esas formas, o una
+#            clave que no es de la lista ni lleva su prefijo, para todo y
+#            devuelve 1, con el número de línea en CONF_PARSE_ERR. Una clave
+#            con el prefijo que no está en la lista se ignora: es un campo de
+#            otra versión de Orbit, y sólo es un dato.
+#   lenient  se salta esa línea y sigue.
+CONF_PARSE_ERR=""
+_conf_parse() { # _conf_parse <fichero> <strict|lenient> <clave…>
+  local file="$1" mode="$2" line buf key val i=0 at k pre total
+  shift 2
+  local -A want=()
+  for k in "$@"; do want[$k]=1; done
+  pre="${1%%_*}_"
+  local re_skip='^[[:blank:]]*(#.*)?$'
+  local re_open="^[A-Za-z_][A-Za-z0-9_]*='([^']|'\\\\'')*\$"
+  local re_sq="^([A-Za-z_][A-Za-z0-9_]*)='(([^']|'\\\\'')*)'[[:blank:]]*(#.*)?\$"
+  local re_dq='^([A-Za-z_][A-Za-z0-9_]*)="([^"$`\\]*)"[[:blank:]]*(#.*)?$'
+  local re_bare="^([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]'\"\$\`\\\;&|<>()]*)([[:blank:]]+#.*)?[[:blank:]]*\$"
+  local -a lines=()
+  CONF_PARSE_ERR=""
+  [[ -r "$file" ]] || return 0
+  mapfile -t lines < "$file"
+  total=${#lines[@]}
+  while (( i < total )); do
+    line="${lines[i]}"; i=$((i + 1)); at="$i"
+    [[ "$line" =~ $re_skip ]] && continue
+    # Un valor entre comillas simples sin cerrar sigue en la línea de abajo:
+    # save_app escribe así los que llevan saltos de línea (A_ENV_SPEC).
+    buf="$line"
+    while [[ "$buf" =~ $re_open ]] && (( i < total )); do
+      buf+=$'\n'"${lines[i]}"; i=$((i + 1))
+    done
+    key=""
+    if [[ "$buf" =~ $re_sq ]]; then
+      key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"; val="${val//\'\\\'\'/\'}"
+    elif [[ "$buf" =~ $re_dq || "$buf" =~ $re_bare ]]; then
+      key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+    fi
+    if [[ -z "$key" ]] || [[ -z "${want[$key]:-}" && "$mode" == "strict" && "$key" != "$pre"* ]]; then
+      CONF_PARSE_ERR="$at"
+      [[ "$mode" == "strict" ]] && return 1
+      continue
+    fi
+    [[ -z "${want[$key]:-}" ]] || printf -v "$key" '%s' "$val"
+  done
+  return 0
 }
 
 # El fichero se abre una vez y las 31 líneas se arman en memoria. Antes eran 31
@@ -3275,7 +3423,31 @@ detect_stack() { # detect_stack <dir> [subcarpeta]  -> setea A_TYPE A_PKG A_BUIL
 
     if grep -qx 'next' <<<"$deps"; then
       A_TYPE="next"; A_BUILD="$install_cmd && $A_PKG run build"
-      if grep -qx 'start' <<<"$pkgscripts"; then A_START="$run_in_app start"; else A_START="$A_PKG exec next start"; fi
+      # `next start` no lee HOST ni HOSTNAME —sólo la opción -H—, así que con
+      # el Environment=HOST=127.0.0.1 de la unidad escuchaba en *:PORT, y lo
+      # único que tapaba el puerto era el cortafuegos. Medido en un VPS con
+      # Next 15.5: HOST y HOSTNAME dan *:3998, -H da 127.0.0.1. Si el script
+      # 'start' es un `next start` a secas, se llama a next directamente con
+      # -H; si hace otra cosa (o ya trae -H), es del proyecto y no se toca.
+      # npm necesita el '--': sin él se queda el -H, que para npm es --usage.
+      # Y bun va con 'run', que busca en node_modules/.bin: 'bun exec' es su
+      # shell, no el lanzador de binarios de los demás.
+      local nextexec="$A_PKG exec"
+      [[ "$A_PKG" == "npm" ]] && nextexec="npm exec --"
+      [[ "$A_PKG" == "bun" ]] && nextexec="bun run"
+      local startcmd=""
+      grep -qx 'start' <<<"$pkgscripts" \
+        && startcmd="$(_json_script "$dir/$A_APPDIR/package.json" start || true)"
+      if [[ -z "$startcmd" ]] && ! grep -qx 'start' <<<"$pkgscripts"; then
+        A_START="$nextexec next start -H 127.0.0.1"
+        [[ -n "$A_APPDIR" && "$A_APPDIR" != "." ]] && A_START="cd $A_APPDIR && $A_START"
+      elif [[ "$startcmd" =~ ^next[[:space:]]+start([[:space:]]+[-A-Za-z0-9=._/]+)*$ \
+              && ! "$startcmd" =~ (^|[[:space:]])(-H|--hostname)([[:space:]=]|$) ]]; then
+        A_START="$nextexec $startcmd -H 127.0.0.1"
+        [[ -n "$A_APPDIR" && "$A_APPDIR" != "." ]] && A_START="cd $A_APPDIR && $A_START"
+      else
+        A_START="$run_in_app start"
+      fi
       # export estático de Next (next.config con output: 'export')
       local nextcfg=("$dir/$A_APPDIR"/next.config.*)
       if (( ${#nextcfg[@]} )) && grep -qE "output[\"']?[[:space:]]*:[[:space:]]*[\"']export" "${nextcfg[@]}" 2>/dev/null; then
@@ -3700,8 +3872,8 @@ err_page() { echo "$APPS_DIR/$1/shared/50x.html"; }
 _errpage_ensure() { # _errpage_ensure <app>
   local f; f="$(err_page "$1")"
   [[ -f "$f" ]] && return 0
-  install -d -o "$(app_user)" -g "$(app_user)" "$APPS_DIR/$1/shared"
-  cat > "$f" <<EOF
+  _own_dir "$(app_user)" "$APPS_DIR/$1/shared"
+  _user_write "$(app_user)" "$f" <<EOF
 <!doctype html>
 <html lang="$ORBIT_LANG_CODE">
 <meta charset="utf-8">
@@ -3722,8 +3894,7 @@ _errpage_ensure() { # _errpage_ensure <app>
   <p>$(t "El fallo es nuestro, no tuyo. Prueba de nuevo en unos segundos.")</p>
 </main>
 EOF
-  chown "$(app_user):$(app_user)" "$f" 2>/dev/null || true
-  chmod 0644 "$f"
+  _as_user "$(app_user)" chmod 0644 -- "$f"
 }
 
 # Sólo los errores que genera nginx: sin 'proxy_intercept_errors' ni
@@ -4274,6 +4445,15 @@ _php_writable_paths() {
         # ahí falla la configuración del servidor **entero**: no se despliega
         # ninguna otra app ni se renueva ningún certificado. Comprobado.
         [[ "${p##*/}" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+        # vendor/ y node_modules/ ya los niega enteros _php_root_denies cuando
+        # se sirve la raíz, y dos 'location ^~' con el mismo prefijo son un
+        # vhost que nginx rechaza: con "shared": ["vendor"] —un vendor/ que
+        # sobrevive entre despliegues— el 'nginx -t' fallaba y no se podía
+        # desplegar. El bloque entero gana al de escritura: aquel devuelve 404
+        # a todo, éste sólo a lo ejecutable.
+        if [[ "${p##*/}" == "vendor" || "${p##*/}" == "node_modules" ]] && _php_root_served; then
+          continue
+        fi
         printf '%s\n' "${p##*/}"
       done
     fi
@@ -4475,14 +4655,21 @@ EOF
 # composer.json, composer.lock y README.md salían con 200. En un monorepo la
 # raíz de la app es su carpeta (A_APPDIR), no la del repositorio, y las URL
 # parten de ahí igual.
-_php_root_denies() {
+# ¿Sirve la app PHP cargada la raíz de la app, y lleva por tanto los bloques de
+# abajo? Aparte, porque hay un segundo que necesita saberlo: ver
+# _php_writable_paths.
+_php_root_served() {
   local docroot
   case "$A_TYPE" in
-    static)      [[ "$A_PHP" == "yes" ]] || return 0; docroot="${A_OUTDIR:-.}" ;;
+    static)      [[ "$A_PHP" == "yes" ]] || return 1; docroot="${A_OUTDIR:-.}" ;;
     php|laravel) docroot="${A_DOCROOT:-.}" ;;
-    *)           return 0 ;;
+    *)           return 1 ;;
   esac
-  [[ "$docroot" == "." || "$docroot" == "${A_APPDIR:-.}" ]] || return 0
+  [[ "$docroot" == "." || "$docroot" == "${A_APPDIR:-.}" ]]
+}
+
+_php_root_denies() {
+  _php_root_served || return 0
 cat <<'EOF'
 
     location ^~ /vendor/       { return 404; }
@@ -4986,15 +5173,18 @@ render_systemd() {
   # de permisos de la app. Se crea aquí y no sólo en el despliegue para que
   # 'orbit port', 'orbit restore' o cualquier otra cosa que regenere la unidad
   # dejen el disco coherente con lo que la unidad dice.
+  # Como la app y no con 'install -d -o' de root: shared/home es suyo, y un
+  # '.cache' cambiado por un enlace a /etc hacía que root le diera /etc (§5.3).
   local -a hdirs; mapfile -t hdirs < <(app_home_tree "$name")
-  install -d -o "$(app_user)" -g "$(app_user)" -m 0755 "${hdirs[@]}" 2>/dev/null || true
+  _own_dir "$(app_user)" "$(app_shared "$name")"
+  _as_user "$(app_user)" mkdir -p -m 0755 -- "${hdirs[@]}" 2>/dev/null || true
   # Sólo en Deno: al resto de tipos no les sobra, les estorba. El salto de línea
   # va dentro de la variable para que una app que no es de Deno genere
   # exactamente la misma unidad que antes, sin una línea en blanco de más.
   local denodir=""
   if [[ "$A_TYPE" == "deno" ]]; then
     denodir="Environment=DENO_DIR=$(app_deno "$name")"$'\n'
-    install -d -o "$(app_user)" -g "$(app_user)" -m 0755 "$(app_deno "$name")" 2>/dev/null || true
+    _as_user "$(app_user)" mkdir -p -m 0755 -- "$(app_deno "$name")" 2>/dev/null || true
   fi
   _systemd_unit_body "$svc" "$(app_current "$name")" "$A_PORT" "$denodir" > "$(svc_unit "$name")"
   systemctl daemon-reload 2>/dev/null \
@@ -5021,6 +5211,36 @@ render_systemd() {
 #     otra: compila bien y no arranca, la misma pista falsa de §5.1.
 # Las herramientas tienen que estar donde las ve UNIT_PATH (§18.6), no donde
 # las ponga un .env.
+# El fichero de entorno que la app declara en su orbit.json ("env": {"file":
+# "api/.env"}), o shared/.env si no declara ninguno. Es la ruta de la que
+# parten todos: 'orbit env', la provisión del despliegue, las unidades, las
+# tareas de cron, 'orbit exec' y el comando 'release'. Sin crear nada ni mirar
+# enlaces —eso es de quien escribe, _env_path—, y con la app cargada.
+#
+# Antes cada uno tenía su ruta escrita a mano y las unidades decían siempre
+# shared/.env: una app que guarda sus variables en shared/api/.env —la
+# provisión las escribe ahí, 'orbit env set' también— tenía unas tareas de
+# cron que no las veían. Medido en una web real: la tarea del portal llamaba a
+# su API sin el IV_PORTAL_CRON_TOKEN que sí estaba en api/.env.
+_env_file() { # _env_file <app>  -> ruta absoluta
+  local rel="${A_ENV_FILE:-.env}"
+  { _safe_relpath "$rel" && [[ "$rel" != "." ]]; } || rel=".env"
+  printf '%s/%s' "$(app_shared "$1")" "$rel"
+}
+
+# Las líneas EnvironmentFile= de las unidades de la app. shared/.env va
+# siempre, y el declarado DETRÁS, que en systemd es el que gana: una app que
+# empezó con shared/.env y luego declaró el suyo no pierde ninguna variable, y
+# las del declarado mandan, que es lo que dice 'orbit env'. Lo que fija Orbit
+# (_unit_pinned_env) sigue ganando a los dos, porque va en la orden.
+_unit_env_files() { # _unit_env_files <app>
+  local base f
+  base="$(app_shared "$1")/.env"; f="$(_env_file "$1")"
+  printf 'EnvironmentFile=-%s\n' "$base"
+  [[ "$f" == "$base" ]] || printf 'EnvironmentFile=-%s\n' "$f"
+  return 0
+}
+
 _unit_pinned_env() { # _unit_pinned_env <app>  -> CLAVE=valor separados por espacios
   local name="$1" out
   out="HOME=$(app_home "$name") PATH=$UNIT_PATH COREPACK_HOME=$(app_corepack "$name")"
@@ -5057,6 +5277,11 @@ _systemd_unit_body() { # _systemd_unit_body <svc> <workdir> <puerto> <denodir>
   # lo expande del entorno que acabamos de fijar.
   local start="${A_START//\$/\$\$}"
   local pinned; pinned="$(_unit_pinned_env "$name")"
+  # '-/run/php' y no '/run/php': el guion hace la ruta opcional. Sin él, una
+  # app de Node en un servidor sin php-fpm —o tras una actualización que se lo
+  # llevó— no llega ni a ejecutarse: systemd no puede montar una ruta que no
+  # existe y la unidad muere con 226/NAMESPACE antes de lanzar nada. Lo mismo
+  # en las tareas de cron, que llevan el mismo cajón.
   cat <<EOF
 [Unit]
 Description=Orbit · $A_NAME ($A_TYPE)
@@ -5068,7 +5293,7 @@ Type=simple
 User=$(app_user)
 Group=$(app_user)
 WorkingDirectory=$workdir
-EnvironmentFile=-$(app_shared "$name")/.env
+$(_unit_env_files "$name")
 Environment=NODE_ENV=production
 Environment=PORT=$port
 Environment=HOST=127.0.0.1
@@ -5094,7 +5319,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=$APPS_DIR/$name /run/php
+ReadWritePaths=$APPS_DIR/$name -/run/php
 LimitNOFILE=65535
 $(_unit_limits)
 [Install]
@@ -5215,8 +5440,14 @@ _php_pool_apply() { # _php_pool_apply <app> [usuario]
 # Recargar php-fpm es SIGUSR2: relee la configuración —pools nuevos incluidos—
 # y los procesos terminan la petición que tengan entre manos antes de
 # renovarse. Un pool que se acaba de escribir no existe hasta esto.
+#
+# Lo que contesta systemctl se enseña: con '2>/dev/null' a secas, «la unidad no
+# existe», «está parada» y «la configuración no vale» salían todas como el
+# mismo aviso genérico, y la única pista de verdad se tiraba.
 _php_fpm_reload() {
-  systemctl reload "php${PHP_VER}-fpm" 2>/dev/null && return 0
+  local detail
+  detail="$(systemctl reload "php${PHP_VER}-fpm" 2>&1)" && return 0
+  [[ -z "$detail" ]] || printf '%s\n' "$detail" >&2
   warn "No he podido recargar php%s-fpm. Revísalo con:  systemctl status php%s-fpm" "$PHP_VER" "$PHP_VER"
   return 1
 }
@@ -5324,7 +5555,7 @@ END {
 # 'sharp: false' es que no quiere que sharp ejecute nada, y eso no se discute.
 _pnpm_ws_denied() { # _pnpm_ws_denied <fichero> <paquete…>
   local f="$1"; shift
-  [[ -r "$f" ]] || return 0
+  [[ -r "$f" && ! -L "$f" ]] || return 0
   local p
   for p in "$@"; do
     grep -qE "^[[:space:]]+[\"']?${p//./\\.}[\"']?[[:space:]]*:[[:space:]]*false[[:space:]]*$" "$f" \
@@ -5336,19 +5567,28 @@ _pnpm_ws_denied() { # _pnpm_ws_denied <fichero> <paquete…>
 _pnpm_ws_apply() { # _pnpm_ws_apply <release> <paquete…>  -> 0 si cambió algo
   local rel="$1"; shift
   (( $# )) || return 1
-  local f="$rel/pnpm-workspace.yaml" tmp rc=0
+  local f="$rel/pnpm-workspace.yaml" tmp rc=0 u
+  # El fichero viene del repositorio y la release es de la app, así que no se
+  # sigue un enlace —git los guarda, y uno a /etc/passwd lo leía root con awk,
+  # le añadía un 'allowBuilds:' y se lo daba a la app con el chown de después—,
+  # y lo que se lee y se escribe lo hace el usuario de la app (ver _as_user).
+  [[ ! -L "$f" ]] || { warn "pnpm-workspace.yaml es un enlace simbólico; no lo toco."; return 1; }
+  u="$(app_user)"
+  tmp="$(mktemp)"
   # Sin fichero se le da a awk una entrada vacía en vez de dejarle fallar: el
   # caso «todavía no existe» es el normal, no un error.
-  local src="/dev/null"; [[ -f "$f" ]] && src="$f"
-  tmp="$(mktemp)"
-  awk -v PKGS="$*" "$_PNPM_WS_AWK" "$src" 2>/dev/null > "$tmp" || rc=$?
+  if [[ -f "$f" ]]; then
+    _as_user "$u" cat -- "$f" 2>/dev/null | awk -v PKGS="$*" "$_PNPM_WS_AWK" 2>/dev/null > "$tmp" || rc=$?
+  else
+    awk -v PKGS="$*" "$_PNPM_WS_AWK" /dev/null 2>/dev/null > "$tmp" || rc=$?
+  fi
   # awk sale con 1 cuando no había nada que cambiar, y ahí no se toca el
   # fichero: reescribirlo igual sería mover la fecha por gusto.
   if (( rc != 0 )); then rm -f "$tmp"; return 1; fi
-  cat "$tmp" > "$f"          # cat y no mv: conserva permisos y dueño del original
+  # En el mismo inodo: conserva permisos y dueño del original.
+  _user_write "$u" "$f" < "$tmp" || rc=$?
   rm -f "$tmp"
-  chown "$(app_user):$(app_user)" "$f" 2>/dev/null || true
-  return 0
+  (( rc == 0 ))
 }
 
 # Cuánta memoria darle a Node. Sale de la disponible y no de la total: en el
@@ -5494,14 +5734,14 @@ _build_run() { # _build_run <release>
   # instalar la misma dependencia dos veces no ocupe el doble.
   local cph; cph="$(app_corepack "$A_NAME")"
   local -a hdirs; mapfile -t hdirs < <(app_home_tree "$A_NAME")
-  install -d -o "$(app_user)" -g "$(app_user)" -m 0755 "${hdirs[@]}" 2>/dev/null || true
+  _as_user "$(app_user)" mkdir -p -m 0755 -- "${hdirs[@]}" 2>/dev/null || true
   extra="export COREPACK_HOME='$cph'; "
   # Lo mismo para Deno, y por el mismo motivo: si el build baja las
   # dependencias a un sitio y la unidad las busca en otro, el build pasa y el
   # servicio se estrella. Ver app_deno().
   if [[ "$A_TYPE" == "deno" ]]; then
     local dd; dd="$(app_deno "$A_NAME")"
-    install -d -o "$(app_user)" -g "$(app_user)" -m 0755 "$dd" 2>/dev/null || true
+    _as_user "$(app_user)" mkdir -p -m 0755 -- "$dd" 2>/dev/null || true
     extra+="export DENO_DIR='$dd'; "
   fi
   # Delante y no detrás del .env: si la app ya trae su propio NODE_OPTIONS,
@@ -6204,7 +6444,76 @@ _deploy_overlap() { # _deploy_overlap <app> <release> <base> <prev> <stamp>
 # Si no se puede ni crear el cerrojo se sigue, avisando: un servidor con
 # /var/lib de sólo lectura tiene problemas mayores, y bloquear todos los
 # despliegues por eso sería peor que el riesgo que se cubre.
+#
+# Quién lo tiene se apunta al lado, en <app>.owner, porque el cerrojo en sí no
+# lo dice. Y hace falta: el descriptor lo heredan los hijos del despliegue —el
+# build, el rsync, el comando 'release'—, así que si alguien mata sólo a
+# 'orbit' con un SIGKILL, el cerrojo sigue puesto mientras ellos terminan, y el
+# despliegue siguiente esperaba hasta DEPLOY_LOCK_WAIT sin decir por qué. Que
+# lo sigan teniendo es lo correcto —siguen escribiendo en la app, y una
+# migración a medias no se pisa con otra—; lo que no lo era es el silencio.
+# Ahora el que espera dice quién lo tiene y desde cuándo, y si su dueño ya no
+# existe, qué procesos lo retienen, para que quien mire decida si matarlos.
 DEP_LOCK_FD=""
+DEP_LOCK_OWNER=""
+_app_lock_owner() { echo "$DEPLOY_LOCK_DIR/$1.owner"; }
+_app_lock_claim() { # _app_lock_claim <app>
+  DEP_LOCK_OWNER="$(_app_lock_owner "$1")"
+  printf 'pid=%s\nsince=%s\ncmd=%s\n' "$BASHPID" "$(date -Iseconds)" "${ORBIT_CMD0:-deploy}" \
+    > "$DEP_LOCK_OWNER" 2>/dev/null || DEP_LOCK_OWNER=""
+  return 0
+}
+# Los procesos que tienen abierto <fichero>, «PID (orden)» uno por línea, sin
+# contar a <yo> ni a sus descendientes: quien pregunta también tiene el
+# descriptor abierto, y sus subshells lo heredan. Con find y no con fuser ni
+# lsof, que no están en todas partes: '-lname' lee cada /proc/PID/fd/N sin un
+# fork por descriptor.
+_lock_holders() { # _lock_holders <fichero> <yo>
+  local fd pid seen=" " p l up comm
+  while IFS= read -r fd; do
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    [[ "$seen" == *" $pid "* ]] && continue
+    seen+="$pid "
+    # Hacia arriba por PPid hasta init: si pasa por <yo>, es de los nuestros.
+    p="$pid"; up=""
+    while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )); do
+      [[ "$p" == "$2" ]] && { up="yo"; break; }
+      l=""; while IFS= read -r l; do [[ "$l" == PPid:* ]] && break; done < "/proc/$p/status" 2>/dev/null || true
+      p="${l#PPid:}"; p="${p//[[:space:]]/}"
+    done
+    [[ -z "$up" ]] || continue
+    comm="?"; read -r comm < "/proc/$pid/comm" 2>/dev/null || comm="?"
+    [[ -d "/proc/$pid" ]] && printf '%s (%s)\n' "$pid" "$comm"
+  done < <(find /proc/[0-9]*/fd -maxdepth 1 -lname "$1" 2>/dev/null || true)
+  return 0
+}
+_app_lock_explain() { # _app_lock_explain <app> <fichero del cerrojo>
+  local o pid="" since="" cmd="" l holders
+  o="$(_app_lock_owner "$1")"
+  if [[ -f "$o" ]]; then
+    while IFS= read -r l; do
+      case "$l" in pid=*) pid="${l#pid=}" ;; since=*) since="${l#since=}" ;; cmd=*) cmd="${l#cmd=}" ;; esac
+    done < "$o"
+  fi
+  [[ "$pid" =~ ^[0-9]+$ ]] || pid=""
+  if [[ -n "$pid" && -d "/proc/$pid" ]]; then
+    info "Lo tiene 'orbit %s' (PID %s) desde %s." "${cmd:-deploy}" "$pid" "${since:-?}"
+    return 0
+  fi
+  # El PID se toma fuera del '$( )': dentro, BASHPID es ya el del subshell.
+  local me="$BASHPID"
+  holders="$(_lock_holders "$2" "$me")"
+  if [[ -n "$pid" ]]; then
+    warn "El 'orbit %s' que lo tomó (PID %s, desde %s) ya no existe, pero sus procesos siguen con el cerrojo:" "${cmd:-deploy}" "$pid" "${since:-?}"
+  elif [[ -n "$holders" ]]; then
+    warn "Lo retienen estos procesos:"
+  fi
+  if [[ -n "$holders" ]]; then
+    printf '%s\n' "$holders" | sed 's/^/      /' >&$UI_FD
+    info "Espero a que terminen. Si sabes que sobran:  kill %s" "$(printf '%s\n' "$holders" | cut -d' ' -f1 | tr '\n' ' ' | sed 's/ $//')"
+  fi
+  return 0
+}
 _app_lock() { # _app_lock <app>  -> 0 con el cerrojo puesto; 1 si no llegó a tiempo
   local f="$DEPLOY_LOCK_DIR/$1.lock"
   if ! install -d -m 0755 "$DEPLOY_LOCK_DIR" 2>/dev/null || ! exec {DEP_LOCK_FD}>"$f"; then
@@ -6212,11 +6521,15 @@ _app_lock() { # _app_lock <app>  -> 0 con el cerrojo puesto; 1 si no llegó a ti
     warn "No he podido crear el cerrojo de despliegue en %s; sigo sin él." "$DEPLOY_LOCK_DIR"
     return 0
   fi
-  flock -n "$DEP_LOCK_FD" && return 0
-  info "Hay otro despliegue o rollback de '%s' en curso; espero a que termine…" "$1"
-  flock -w "$DEPLOY_LOCK_WAIT" "$DEP_LOCK_FD"
+  if flock -n "$DEP_LOCK_FD"; then _app_lock_claim "$1"; return 0; fi
+  info "Hay otro despliegue o rollback de '%s' en curso; espero a que termine (hasta %s s)…" "$1" "$DEPLOY_LOCK_WAIT"
+  _app_lock_explain "$1" "$f"
+  flock -w "$DEPLOY_LOCK_WAIT" "$DEP_LOCK_FD" || return 1
+  _app_lock_claim "$1"
 }
 _app_unlock() {
+  [[ -n "$DEP_LOCK_OWNER" ]] && rm -f "$DEP_LOCK_OWNER"
+  DEP_LOCK_OWNER=""
   [[ -n "$DEP_LOCK_FD" ]] && exec {DEP_LOCK_FD}>&-
   DEP_LOCK_FD=""
   return 0
@@ -6412,7 +6725,7 @@ _run_release_cmd() { # _run_release_cmd <release> <comando>
   local ddir=""; [[ "$A_TYPE" == "deno" ]] && ddir="$(app_deno "$A_NAME")"
   sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-release \
     "$(app_shared "$A_NAME")/.env" "${A_PORT:-}" "$(_app_root "$1")" "$(app_corepack "$A_NAME")" "$ddir" \
-    timeout --kill-after=10 "$RELEASE_TIMEOUT" bash -c "$2"
+    "$(_env_file "$A_NAME")" timeout --kill-after=10 "$RELEASE_TIMEOUT" bash -c "$2"
 }
 
 # ─────────────────────────────────────────────────────────────── cron ─────────
@@ -6498,7 +6811,7 @@ Type=oneshot
 User=$(app_user)
 Group=$(app_user)
 WorkingDirectory=$(_app_root "$(app_current "$name")")
-EnvironmentFile=-$(app_shared "$name")/.env
+$(_unit_env_files "$name")
 Environment=NODE_ENV=production
 Environment=PATH=$UNIT_PATH
 Environment=HOME=$(app_home "$name")
@@ -6509,7 +6822,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$APPS_DIR/$name /run/php
+ReadWritePaths=$APPS_DIR/$name -/run/php
 $(_unit_limits)
 EOF
 )"
@@ -6567,7 +6880,16 @@ cmd_cron() { # orbit cron [list] <app> [--json] · orbit cron run <app> <tarea>
   load_app "$name"
   if [[ "$sub" == "run" ]]; then
     local c="${2:-}"
-    [[ -n "$c" && -f "$(_cron_base "$name" "$c").service" ]] \
+    # El nombre acaba en una ruta y en el nombre de una unidad, así que se
+    # valida con la misma regla con la que se escribió (_cron_sync) y tiene
+    # que ser una de las tareas que hay —las que tienen temporizador—. Antes
+    # bastaba con que existiera un fichero con ese nombre: un .service suelto,
+    # escrito a mano o resto de una tarea retirada a medias, se arrancaba
+    # igual, con un nombre que ni siquiera podría declararse.
+    # La lista va a una variable y no a un 'grep -q' en tubería: con pipefail,
+    # grep sale al encontrarla y el printf de detrás muere con 141 (CLAUDE.md).
+    local tareas; tareas=" $(_cron_units "$name" | tr '\n' ' ')"
+    [[ "$c" =~ ^[a-z0-9][a-z0-9-]{0,30}$ && "$tareas" == *" $c "* ]] \
       || die "'%s' no tiene ninguna tarea «%s». Míralas con 'orbit cron %s'." "$name" "$c" "$name"
     info "Ejecutando «%s»… (la salida queda en: journalctl -u orbit-%s.cron-%s)" "$c" "$name" "$c"
     systemctl start "orbit-$name.cron-$c.service" || die "La tarea «%s» ha fallado. Mira: journalctl -u orbit-%s.cron-%s -n 50" "$c" "$name" "$c"
@@ -6615,6 +6937,28 @@ _deploy_env_add() { # _deploy_env_add <CLAVE=valor> <origen>
   DEP_ENV_SET+=("$key=$val")
 }
 
+# Las líneas CLAVE=valor de la entrada estándar, o de un fichero redirigido
+# ahí: el formato de --env-file y de --env-stdin, que es el mismo.
+_deploy_env_lines() { # _deploy_env_lines <origen, para los mensajes>  < líneas
+  local efl
+  while IFS= read -r efl || [[ -n "$efl" ]]; do
+    efl="${efl%$'\r'}"
+    [[ "$efl" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$efl" =~ ^[[:space:]]*(export[[:space:]]+)?([^=]*)=(.*)$ ]] \
+      || die "orbit deploy: «%s» no es una línea CLAVE=valor de %s." "$efl" "$1"
+    _deploy_env_add "${BASH_REMATCH[2]}=$(_env_unquote "${BASH_REMATCH[3]}")" "$1"
+  done
+  return 0
+}
+
+# Lo que se pasa con --env acaba en la línea de órdenes del servidor: se ve
+# en 'ps' mientras dura el despliegue y, cuando Orbit Desktop entra como un
+# miembro de orbit-admin, en el registro de sudo, que apunta la orden entera.
+# Con --env-stdin los valores llegan por la entrada estándar y no tocan argv.
+# La entrada queda gastada, así que con él no se pregunta nada: lo que falte
+# se apunta como sin nadie al teclado (ver _env_can_ask).
+DEP_ENV_STDIN="no"
+
 # El commit que 'deploy --all' ha dejado pasar por la puerta de la CI. Lo pone
 # el lote dentro del subshell de cada despliegue y nadie más: vacío, cmd_deploy
 # despliega la punta de la rama como siempre.
@@ -6626,7 +6970,7 @@ DEP_REFUSED="no"
 cmd_deploy() {
   need_root deploy
   local name="" ref="" pick="no" force="no" a
-  DEP_ENV_SET=()
+  DEP_ENV_SET=(); DEP_ENV_STDIN="no"
   while [[ $# -gt 0 ]]; do
     a="$1"
     case "$a" in
@@ -6636,15 +6980,13 @@ cmd_deploy() {
       --env-file)
         [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
         [[ -f "$2" && -r "$2" ]] || die "orbit deploy: no puedo leer «%s»." "$2"
-        local efl
-        while IFS= read -r efl || [[ -n "$efl" ]]; do
-          efl="${efl%$'\r'}"
-          [[ "$efl" =~ ^[[:space:]]*(#|$) ]] && continue
-          [[ "$efl" =~ ^[[:space:]]*(export[[:space:]]+)?([^=]*)=(.*)$ ]] \
-            || die "orbit deploy: «%s» no es una línea CLAVE=valor de %s." "$efl" "$2"
-          _deploy_env_add "${BASH_REMATCH[2]}=$(_env_unquote "${BASH_REMATCH[3]}")" "$2"
-        done < "$2"
+        _deploy_env_lines "$2" < "$2"
         shift 2 ;;
+      --env-stdin)
+        [[ "$DEP_ENV_STDIN" != "yes" ]] || die "orbit deploy: --env-stdin sólo una vez: la entrada ya está leída."
+        DEP_ENV_STDIN="yes"
+        _deploy_env_lines "stdin"
+        shift ;;
       --ref|--commit|--pr)
         [[ $# -ge 2 ]] || die "orbit deploy: «%s» necesita un valor." "$a"
         ref="$2"; [[ "$a" == "--pr" ]] && ref="pr:$2"; shift 2 ;;
@@ -6665,6 +7007,7 @@ cmd_deploy() {
        --pick        elegir de una lista qué desplegar (PRs, commits)\n\
        --env K=V     poner una variable en el .env antes del build (repetible)\n\
        --env-file F  poner las de un fichero CLAVE=valor antes del build\n\
+       --env-stdin   lo mismo, leído de la entrada estándar (no sale en ps)\n\
        --ref <x>     desplegar un commit o rama concretos\n\
        --pr <n>      desplegar un pull request sin fusionarlo\n\
        --force       desplegar aunque la app esté congelada ('orbit lock')\n\
@@ -6695,6 +7038,14 @@ cmd_deploy() {
     [[ "$pick" != "yes" ]] || { DEP_ERR="$(t "--pick necesita a alguien delante")"
       die "orbit deploy: --pick no se puede usar con --json."; }
   fi
+  # Y con --env-stdin, por lo mismo: la entrada estándar ya se ha leído entera,
+  # así que no queda de dónde sacar la respuesta a ninguna pregunta.
+  if [[ "$DEP_ENV_STDIN" == "yes" ]]; then
+    [[ -n "$name" ]] || { DEP_ERR="$(t "con --env-stdin hay que decir qué app desplegar")"
+      die "orbit deploy --env-stdin necesita el nombre de la app: la entrada ya está leída."; }
+    [[ "$pick" != "yes" ]] || { DEP_ERR="$(t "--pick necesita a alguien delante")"
+      die "orbit deploy: --pick no se puede usar con --env-stdin."; }
+  fi
 
   [[ -n "$name" ]] || name="$(pick_app 'App a desplegar')" || return 0
   load_app "$name"
@@ -6718,6 +7069,7 @@ cmd_deploy() {
   # En modo EVA se pregunta siempre qué desplegar: es justo la decisión que el
   # modo sencillo toma por ti. Con --json, nunca: no hay a quién preguntar.
   [[ "$JSON" != "yes" ]] && \
+    [[ "$DEP_ENV_STDIN" != "yes" ]] && \
     [[ "$pick" == "yes" || ( "$EVA" == "yes" && -z "$ref" && "$ASSUME_YES" != "yes" ) ]] && ref="$(_pick_ref)"
   DEP_REF="$ref"
   [[ "$A_TYPE" == "redirect" ]] && { DEP_ERR="$(t "es una redirección de dominio, no tiene código")"
@@ -6741,7 +7093,7 @@ cmd_deploy() {
   # La base es del fetcher: dentro vive la caché de git, que deploy escribe
   # en cada fetch. Releases y shared son del builder — el usuario de la app.
   install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$base"
-  install -d -o "$(app_user)" -g "$(app_user)" "$base/releases" "$shared"
+  _own_dir "$(app_user)" "$base/releases"; _own_dir "$(app_user)" "$shared"
   _rel_partial_mark "$name" "$rel"
 
   # 1 · código
@@ -6846,7 +7198,9 @@ cmd_deploy() {
     DEP_ERR="$(t "shared/.env es un enlace simbólico")"
     die "%s es un enlace simbólico y no un fichero. No lo sigo: sustitúyelo por el fichero de verdad y vuelve a desplegar." "$shared/.env"
   fi
-  [[ -f "$shared/.env" ]] || { install -o "$(app_user)" -g "$(app_user)" -m 0640 /dev/null "$shared/.env"; }
+  # Lo crea la app, no root: entre el '-L' de arriba y esto puede poner el
+  # enlace (ver _as_user).
+  [[ -f "$shared/.env" ]] || _user_touch "$(app_user)" "$shared/.env" 0640
   as_app "ln -sfn '$shared/.env' '$rel/.env'"
   # Y otro dentro de la app, cuando la app no está en la raíz del repositorio.
   # No es una duplicación por si acaso: son dos lectores distintos y cada uno
@@ -7196,7 +7550,7 @@ cmd_deploy() {
     # unidad de systemd: que el disco no pueda contradecir a la configuración.
     # No hace nada si la app no está aislada.
     render_php_pool "$name"
-    systemctl reload "php${PHP_VER}-fpm" 2>/dev/null \
+    _php_fpm_reload \
       || warn "No he podido recargar php%s-fpm: puede seguir sirviendo la versión anterior." "$PHP_VER"
   fi
 
@@ -7268,7 +7622,7 @@ cmd_deploy() {
         # ahora a la release rota, así que sin esto el symlink vuelve atrás y
         # la web se queda en 500 hasta que caduque. Comprobado: sin la
         # recarga, la portada seguía dando 500 con la release buena activa.
-        systemctl reload "php${PHP_VER}-fpm" 2>/dev/null || true
+        _php_fpm_reload || true
         DEP_ROLLBACK="yes"
         DEP_ERR="$(t "la web devolvió %s tras desplegar" "$HTTP_CODE")"
         warn "Restaurada la release anterior: %s" "$(basename "$prev")"
@@ -9203,7 +9557,7 @@ cmd_rollback() {
   # y el rollback anuncia un cambio que la web no ha hecho todavía.
   if _serves_php; then
     render_php_pool "$name"
-    systemctl reload "php${PHP_VER}-fpm" 2>/dev/null \
+    _php_fpm_reload \
       || warn "No he podido recargar php%s-fpm: puede seguir sirviendo la versión anterior." "$PHP_VER"
   fi
   _app_unlock
@@ -9494,7 +9848,7 @@ cmd_new() {
   # --- clonar para detectar
   local base cache; base="$APPS_DIR/$name"; cache="$base/cache"
   install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$base"
-  install -d -o "$(app_user)" -g "$(app_user)" "$base/releases" "$base/shared"
+  _own_dir "$(app_user)" "$base/releases"; _own_dir "$(app_user)" "$base/shared"
   spin "Clonando el repositorio" \
     sudo -u "$DEPLOY_USER" -H git clone --depth 50 -b "$branch" "$repo" "$cache" \
     || { rm -rf "$base"; die "No pude clonar. Si es privado ejecuta 'orbit github'."; }
@@ -9821,12 +10175,17 @@ _clone_path() { # _clone_path <valor> <origen> <nuevo>
 _clone_env() { # _clone_env <origen> <nuevo> <valores: yes|no>
   local from="$1" to="$2" values="$3" src dst
   src="$(_env_path "$from")"; dst="$(_env_path "$to")"
+  # Lo lee el usuario del original y lo escribe el del clon: los dos ficheros
+  # son de sus apps, y un 'cp' de root seguía lo que hubiera en cada ruta.
+  local fu tu; fu="$(app_user_of "$from")"; tu="$(app_user_of "$to")"
   if [[ "$values" == "yes" ]]; then
-    cp "$src" "$dst"
+    _as_user "$fu" cat -- "$src" | _user_write "$tu" "$dst"
   else
-    sed -E 's/^([[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*)=.*/\1=/' "$src" > "$dst"
+    _as_user "$fu" cat -- "$src" \
+      | sed -E 's/^([[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*)=.*/\1=/' \
+      | _user_write "$tu" "$dst"
   fi
-  chown "$(app_user):$(app_user)" "$dst"; chmod 0640 "$dst"
+  _as_user "$tu" chmod 0640 -- "$dst"
 }
 
 cmd_clone() {
@@ -9870,7 +10229,6 @@ cmd_clone() {
   title "Clonando «%s» → «%s»" "$from" "$to"
   local base="$APPS_DIR/$to"
   install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" "$base"
-  install -d -o "$(app_user)" -g "$(app_user)" "$base/releases" "$base/shared"
 
   # ── la configuración: se hereda todo menos lo que identifica al original
   A_NAME="$to"
@@ -9885,6 +10243,9 @@ cmd_clone() {
     A_USER="$(_app_username "$to")"
     _ensure_app_user "$A_USER" "$to"
   fi
+  # Después de decidir el usuario y no antes: con los globales todavía del
+  # original, releases/ y shared/ del clon nacían del usuario de PRODUCCIÓN.
+  _own_dir "$(app_user)" "$base/releases"; _own_dir "$(app_user)" "$base/shared"
   A_STATIC_ROOT="$(_clone_path "$A_STATIC_ROOT" "$from" "$to")"
   A_MEDIA_ROOT="$(_clone_path "$A_MEDIA_ROOT" "$from" "$to")"
   # Desplegarse sola es un permiso, y los permisos no se heredan. Procesar la
@@ -9914,8 +10275,10 @@ cmd_clone() {
   _clone_env "$from" "$to" "$values"
   # La página de mantenimiento es parte del aspecto de la app y se copia; el
   # testigo y el motivo son estado del original y no.
-  [[ -f "$(maint_page "$from")" ]] \
-    && install -o "$(app_user)" -g "$(app_user)" -m 0644 "$(maint_page "$from")" "$(maint_page "$to")"
+  if [[ -f "$(maint_page "$from")" ]]; then
+    _as_user "$(app_user_of "$from")" cat -- "$(maint_page "$from")" | _user_write "$(app_user)" "$(maint_page "$to")"
+    _as_user "$(app_user)" chmod 0644 -- "$(maint_page "$to")"
+  fi
   [[ -f "$(redir_file "$from")" ]] && cp "$(redir_file "$from")" "$(redir_file "$to")"
 
   # Todavía no hay release. Sin esto el dominio contestaría 502, o el listado
@@ -10810,8 +11173,8 @@ db_create() {
   # app_user() caía a deploy — el .env de una app aislada se quedaba con un
   # dueño que su builder no puede leer (revisión del PR #10).
   local duser; duser="$(app_user_of "$name")"
-  install -d -o "$duser" -g "$duser" "$APPS_DIR/$name/shared"
-  touch "$envf"; chown "$duser:$duser" "$envf"; chmod 0640 "$envf"
+  _own_dir "$duser" "$APPS_DIR/$name/shared"
+  _user_touch "$duser" "$envf" 0640
   # Con comillas simples: si la contraseña llevara un '$', las dobles harían
   # que bash lo expandiera al cargar el fichero y la URL llegaría truncada.
   _env_write "$envf" DATABASE_URL "$url"
@@ -11542,7 +11905,13 @@ _restore_db() { # _restore_db <app> <dump.gz>
       return 0
     fi
     role="$user"
-    sudo -u postgres psql -qc "CREATE ROLE \"$role\" WITH LOGIN PASSWORD '$pass';" >/dev/null
+    # La contraseña y el usuario salen del .env de la copia, y van dentro de
+    # una orden SQL que ejecuta el superusuario: con una comilla en la
+    # contraseña, «x'; ALTER ROLE … SUPERUSER; --» era SQL de postgres. Se
+    # escapan como manda SQL —la comilla se dobla— en vez de rechazarlas,
+    # porque una contraseña puede llevarlas.
+    local qrole="${role//\"/\"\"}" qpass="${pass//\'/\'\'}"
+    sudo -u postgres psql -qc "CREATE ROLE \"$qrole\" WITH LOGIN PASSWORD '$qpass';" >/dev/null
     ok "Rol «%s» recreado con la contraseña que tenía el .env" "$role"
   fi
 
@@ -11556,7 +11925,7 @@ _restore_db() { # _restore_db <app> <dump.gz>
     sudo -u postgres createdb -O "$role" "$db"
   fi
   if gunzip -c "$dump" | sudo -u postgres psql -q "$db" >/dev/null 2>&1; then
-    sudo -u postgres psql -qc "GRANT ALL PRIVILEGES ON DATABASE \"$db\" TO \"$role\";" >/dev/null
+    sudo -u postgres psql -qc "GRANT ALL PRIVILEGES ON DATABASE \"$db\" TO \"${role//\"/\"\"}\";" >/dev/null
     ok "Base de datos «%s» restaurada" "$db"
   else
     err "El volcado ha dado errores. Revísalo a mano:"
@@ -11574,6 +11943,64 @@ _restore_db() { # _restore_db <app> <dump.gz>
 # a orbit **antes** de llegar al mensaje que explica qué pasa. El usuario veía
 # un código 2 y ni una línea. Aquí «no he podido leerlo» es una respuesta
 # válida, y se devuelve vacía para que la decida quien pregunta.
+# La configuración de una app que llega en una copia, cargada como datos y
+# comprobada antes de que root la escriba en /etc/orbit/apps. Deja los A_* en
+# los globales —save_app los escribe después— o dice por qué no la acepta en
+# APP_IMPORT_ERR y devuelve 1.
+#
+# Parsearla no basta: varios de esos campos acaban donde los interpreta root.
+# A_START y A_LIMIT_* van dentro de una unidad de systemd, y un salto de línea
+# ahí es una directiva más —'ExecStartPre=+…', con el '+' que la ejecuta como
+# root—; el dominio, los alias, las rutas y la redirección van al vhost; los
+# números pasan por aritmética de bash, que ejecuta lo que haya en 'a[$(…)]'; y
+# A_USER decide quién ejecuta todo lo demás, así que en una copia sólo puede
+# ser el que Orbit le daría a esa app o el usuario de despliegue. Las órdenes
+# del build y del arranque sí se aceptan como vengan: las ejecuta el usuario de
+# la app, igual que las del repositorio.
+APP_IMPORT_ERR=""
+_app_conf_import() { # _app_conf_import <app.conf de la copia> <app>
+  local file="$1" name="$2" k v d
+  APP_IMPORT_ERR=""
+  for k in "${ORBIT_APP_FIELDS[@]}"; do printf -v "$k" '%s' ""; done
+  if ! _conf_parse "$file" strict "${ORBIT_APP_FIELDS[@]}"; then
+    _t "la línea %s no es una asignación CLAVE='valor' de Orbit" "$CONF_PARSE_ERR"; APP_IMPORT_ERR="$I18N_MSG"
+    return 1
+  fi
+  [[ -z "$A_NAME" || "$A_NAME" == "$name" ]] \
+    || { _t "dice ser «%s» y el manifiesto dice «%s»" "$A_NAME" "$name"; APP_IMPORT_ERR="$I18N_MSG"; return 1; }
+  A_NAME="$name"
+  for k in "${ORBIT_APP_FIELDS[@]}"; do
+    v="${!k}"
+    case "$k" in
+      # Lo que ejecuta el usuario de la app, no root. El build y la
+      # especificación del .env pueden llevar saltos de línea; el arranque no,
+      # porque va dentro de la unidad.
+      A_BUILD|A_ENV_SPEC|A_MIGRATE) continue ;;
+      A_START|A_PYAPP) [[ "$v" != *[$'\n\r']* ]] && continue ;;
+      A_PORT|A_HEALTH_TIMEOUT|A_REDIRECT_CODE|A_NODE_HEAP)
+        [[ "$v" =~ ^[0-9]{0,6}$ ]] && continue ;;
+      A_USER)
+        [[ -z "$v" || "$v" == "$DEPLOY_USER" || "$v" == "$(_app_username "$name")" ]] && continue ;;
+      A_DOMAIN) [[ -z "$v" ]] || _domain_ok "$v" && continue ;;
+      A_ALIASES)
+        local -a ds=(); read -ra ds <<<"$v"; d=""
+        for d in "${ds[@]}"; do _domain_ok "$d" wild || break; d=""; done
+        [[ -z "${d:-}" ]] && continue ;;
+      A_OUTDIR|A_DOCROOT|A_APPDIR|A_ENV_FILE) [[ -z "$v" ]] || _safe_relpath "$v" && continue ;;
+      A_LIMIT_MEM) [[ "$v" =~ ^([0-9]+[KMGT]?)?$ ]] && continue ;;
+      A_LIMIT_CPU) [[ "$v" =~ ^([0-9]{1,4}%)?$ ]] && continue ;;
+      A_CI_SEEN)   [[ "$v" =~ ^([0-9a-f]+\ [0-9]+)?$ ]] && continue ;;
+      # El resto acaba en el vhost, en rutas o en comparaciones: sin comillas,
+      # sin ';', sin llaves, sin '$' —nginx lo leería como variable— y en una
+      # línea.
+      *) [[ "$v" =~ ^[A-Za-z0-9\ ._/:@%+=,~!*#?\&-]*$ ]] && continue ;;
+    esac
+    _t "el campo %s no tiene un valor que Orbit escriba («%s»)" "$k" "${v:0:60}"; APP_IMPORT_ERR="$I18N_MSG"
+    return 1
+  done
+  return 0
+}
+
 _restore_name() { # _restore_name <fichero>
   { tar xzOf "$1" ./manifest 2>/dev/null | sed -n 's/^app=//p' | head -1; } || true
 }
@@ -11584,10 +12011,30 @@ _restore_name() { # _restore_name <fichero>
 _restore_one() { # _restore_one <fichero> [--sin-siguiente-paso]
   local file="$1" callado="${2:-}"
   local tmp; tmp="$(mktemp -d)"
-  tar -xzf "$file" -C "$tmp" 2>/dev/null \
+  # --no-same-owner: lo extraído es de root hasta el chown de abajo, y no de
+  # los UID que diga la copia, que en esta máquina pueden ser de otro.
+  tar --no-same-owner -xzf "$file" -C "$tmp" 2>/dev/null \
     || { rm -rf "$tmp"; err "«%s» no es un tar.gz legible." "$file"; return 1; }
   if [[ ! -f "$tmp/manifest" || ! -f "$tmp/app.conf" ]]; then
     rm -rf "$tmp"; err "«%s» no parece una copia de Orbit: no trae manifiesto." "$file"; return 1
+  fi
+  # Nada de lo que se lee de la copia puede ser un enlace: tar los extrae tal
+  # cual, y root seguiría un 'redirects.list' que apunta a /etc/shadow para
+  # copiarlo 0644 en /etc/orbit, o un 'shared' que apunta a /etc para dejarlo
+  # como carpeta de la app. Lo copia Orbit, así que en una buena no hay ninguno.
+  local f
+  for f in manifest app.conf redirects.list shared database.sql.gz; do
+    if [[ -L "$tmp/$f" ]]; then
+      rm -rf "$tmp"; err "La copia «%s» trae «%s» como enlace simbólico. No la restauro." "$file" "$f"; return 1
+    fi
+  done
+  # Ni nada que no sea un fichero, una carpeta o un enlace. tar, como root,
+  # crea también dispositivos: un 'shared/disco' de bloque acababa en manos del
+  # usuario de la app con el chown -R de más abajo, y eso es leer y escribir el
+  # disco entero sin pasar por ningún permiso.
+  local raro; raro="$(find "$tmp" ! -type f ! -type d ! -type l -print -quit 2>/dev/null || true)"
+  if [[ -n "$raro" ]]; then
+    rm -rf "$tmp"; err "La copia «%s» trae algo que no es un fichero (%s). No la restauro." "$file" "${raro#"$tmp"/}"; return 1
   fi
   local name; name="$(sed -n 's/^app=//p' "$tmp/manifest" | head -1)"
   if [[ -z "$name" ]] || ! _app_name_ok "$name"; then
@@ -11595,13 +12042,21 @@ _restore_one() { # _restore_one <fichero> [--sin-siguiente-paso]
   fi
   local existia="no"; app_exists "$name" && existia="si"
 
+  # Como datos, comprobada, y escrita de nuevo por save_app: nunca el fichero
+  # de la copia tal cual (ver _conf_parse y _app_conf_import).
+  if ! _app_conf_import "$tmp/app.conf" "$name"; then
+    rm -rf "$tmp"
+    err "La configuración de «%s» en la copia no es de fiar: %s." "$name" "$APP_IMPORT_ERR"
+    info "No he tocado nada. Si la copia es tuya, mira el app.conf que trae:  tar xzOf %s ./app.conf" "$file"
+    return 1
+  fi
   install -d -m 0755 "$APPS_CONF"
-  install -m 0640 "$tmp/app.conf" "$(app_conf "$name")"
+  save_app
   ok "Configuración restaurada"
   # El usuario del aislamiento viaja en la configuración, pero en un servidor
   # recién instalado no existe: se recrea antes de devolverle sus ficheros, y
   # con el MISMO nombre — _app_username es determinista justo para esto.
-  local ruser; ruser="$(sed -n "s/^A_USER='\(.*\)'\$/\1/p" "$(app_conf "$name")" | head -1)"
+  local ruser="$A_USER"
   if [[ -n "$ruser" && "$ruser" != "$DEPLOY_USER" ]]; then
     _ensure_app_user "$ruser" "$name"
     # Y su pool, si es una app PHP: el vhost restaurado apunta al socket
@@ -11675,10 +12130,23 @@ _ORBIT_CONF_RESTORE='LETSENCRYPT_EMAIL|KEEP_RELEASES|PORT_BASE|AUTODEPLOY_EVERY|
 
 # Vuelca las preferencias de una copia de orbit.conf sobre el de este servidor,
 # clave a clave. No se copia el fichero entero a propósito: ver arriba.
+#
+# Menos BACKUP_HOOK, que no es una preferencia sino una orden que root ejecuta
+# con cada copia: traída de un tar.gz que no se sabe quién ha tocado, era la
+# forma de que una copia ejecutara lo que quisiera en la siguiente pasada del
+# cron de copias. Se dice cuál traía, para que quien la reconozca la ponga a
+# mano.
 _restore_conf() { # _restore_conf <orbit.conf de la copia>
   local src="$1" k v n=0
   [[ -r "$src" ]] || return 0
   while IFS='=' read -r k v; do
+    if [[ "$k" == "BACKUP_HOOK" ]]; then
+      v="$(_conf_unquote "$v")"
+      [[ -z "$v" || "$v" == "$BACKUP_HOOK" ]] && continue
+      warn "La copia traía BACKUP_HOOK=«%s». No lo restauro: es una orden que ejecuta root." "$v"
+      info "Si es tuya, ponla tú en %s." "$CONF_FILE"
+      continue
+    fi
     [[ "$k" =~ ^($_ORBIT_CONF_RESTORE)$ ]] || continue
     _conf_set "$k" "$(_conf_unquote "$v")"
     n=$((n + 1))
@@ -11855,13 +12323,26 @@ _restore_all() { # _restore_all <directorio> <yes> <deploy>
 # La configuración global de la copia: las preferencias se vuelcan clave a
 # clave y los avisos se restauran enteros, porque notify.conf no describe al
 # servidor —es a quién avisar y por dónde—.
+#
+# notify.conf no se copia tal cual, aunque se restaure entero: root lo carga con
+# '.' en cada aviso, así que el de la copia se lee como datos —sólo las claves
+# que escribe _notify_save— y se vuelve a escribir con _notify_save. Un enlace,
+# ni eso.
+NOTIFY_KEYS=(NOTIFY_MIN_LEVEL NOTIFY_TELEGRAM_TOKEN NOTIFY_TELEGRAM_CHAT NOTIFY_DISCORD NOTIFY_WEBHOOK
+             NOTIFY_MAIL_TO NOTIFY_MAIL_FROM NOTIFY_SMTP_URL NOTIFY_SMTP_USER NOTIFY_SMTP_PASS)
 _restore_global() { # _restore_global <_orbit-conf-*.tar.gz>
-  local file="$1" tmp; tmp="$(mktemp -d)"
-  if tar -xzf "$file" -C "$tmp" 2>/dev/null; then
-    [[ -f "$tmp/orbit.conf" ]] && _restore_conf "$tmp/orbit.conf"
-    if [[ -f "$tmp/notify.conf" ]]; then
-      install -m 0600 "$tmp/notify.conf" "$ETC_DIR/notify.conf"
-      ok "Avisos restaurados (notify.conf)"
+  local file="$1" tmp k; tmp="$(mktemp -d)"
+  if tar --no-same-owner -xzf "$file" -C "$tmp" 2>/dev/null; then
+    [[ -f "$tmp/orbit.conf" && ! -L "$tmp/orbit.conf" ]] && _restore_conf "$tmp/orbit.conf"
+    if [[ -f "$tmp/notify.conf" && ! -L "$tmp/notify.conf" ]]; then
+      for k in "${NOTIFY_KEYS[@]}"; do printf -v "$k" '%s' ""; done
+      if _conf_parse "$tmp/notify.conf" strict "${NOTIFY_KEYS[@]}"; then
+        _notify_save
+        ok "Avisos restaurados (notify.conf)"
+      else
+        err "El notify.conf de la copia no es el que escribe Orbit (línea %s): no lo restauro." "$CONF_PARSE_ERR"
+        info "Vuelve a configurarlos con:  orbit notify setup"
+      fi
     fi
   else
     err "No he podido abrir %s" "$(basename "$file")"
@@ -12549,6 +13030,7 @@ _exec_script='
   __orbit_home="$HOME" __orbit_path="$PATH"
   set -a
   [ -f "$1" ] && . "$1"
+  [ -n "$6" ] && [ "$6" != "$1" ] && [ -f "$6" ] && . "$6"
   set +a
   export HOME="$__orbit_home" PATH="$__orbit_path"
   unset __orbit_home __orbit_path
@@ -12558,7 +13040,7 @@ _exec_script='
   [ -n "$5" ] && export DENO_DIR="$5"
   export PATH="$3/node_modules/.bin:$3/.venv/bin:$3/bin:$PATH:/usr/local/go/bin"
   cd "$3" || exit 1
-  shift 5
+  shift 6
   exec "$@"
 '
 
@@ -12569,7 +13051,10 @@ _run_in_dir() { # _run_in_dir <dir> <.env> <puerto> <comando...>
   # la variable sin tocar en vez de exportar una ruta a medio construir.
   local cph="" ddir=""; [[ -n "${A_NAME:-}" ]] && cph="$(app_corepack "$A_NAME")"
   [[ -n "${A_NAME:-}" && "${A_TYPE:-}" == "deno" ]] && ddir="$(app_deno "$A_NAME")"
-  sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-exec "$envf" "$port" "$dir" "$cph" "$ddir" "$@"
+  # Y el fichero que declare la app, detrás del que se pasa: el mismo orden que
+  # en la unidad (_unit_env_files), para que 'exec' no mienta.
+  local declared=""; [[ -n "${A_NAME:-}" ]] && declared="$(_env_file "$A_NAME")"
+  sudo -u "$(app_user)" -H bash -lc "$_exec_script" orbit-exec "$envf" "$port" "$dir" "$cph" "$ddir" "$declared" "$@"
 }
 
 # Igual, pero sobre la release activa de una app ya cargada con load_app.
@@ -12757,8 +13242,13 @@ _laravel_post_build() { # _laravel_post_build <app> <release> <shared>
   #     pasaba a valer 'hunter2APP_KEY=', y como no quedaba ninguna línea
   #     APP_KEY= que sustituir, key:generate salía con 0 sin escribir la clave y
   #     Orbit anunciaba en verde una clave que no existía.
-  [[ -s "$shared/.env" && -n "$(tail -c1 "$shared/.env")" ]] && printf '\n' >> "$shared/.env"
-  grep -q '^APP_KEY=' "$shared/.env" 2>/dev/null || printf 'APP_KEY=\n' >> "$shared/.env"
+  #
+  #     Y lo añade la app, no root: el '>>' de root seguía lo que hubiera en
+  #     shared/.env en ese momento (ver _as_user).
+  # shellcheck disable=SC2016  # el $1 es del sh de dentro
+  _as_user "$(app_user)" sh -c '
+    [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ] && printf "\n" >> "$1"
+    grep -q "^APP_KEY=" "$1" 2>/dev/null || printf "APP_KEY=\n" >> "$1"' sh "$shared/.env"
   if [[ -z "$(_env_read "$shared/.env" APP_KEY || true)" ]]; then
     as_app "cd '$app' && php artisan key:generate --force" >/dev/null 2>&1 || true
     # El código de salida de artisan no vale: 'key:generate' sale con 0 y dice
@@ -13031,8 +13521,7 @@ _notify_save() {
   install -d -m 0755 "$ETC_DIR"
   : > "$NOTIFY_CONF"
   printf '# Avisos de Orbit. Puede contener tokens: solo root puede leerlo.\n' >> "$NOTIFY_CONF"
-  for k in NOTIFY_MIN_LEVEL NOTIFY_TELEGRAM_TOKEN NOTIFY_TELEGRAM_CHAT NOTIFY_DISCORD NOTIFY_WEBHOOK \
-           NOTIFY_MAIL_TO NOTIFY_MAIL_FROM NOTIFY_SMTP_URL NOTIFY_SMTP_USER NOTIFY_SMTP_PASS; do
+  for k in "${NOTIFY_KEYS[@]}"; do
     printf '%s=%s\n' "$k" "$(_q "${!k-}")" >> "$NOTIFY_CONF"
   done
   chmod 0600 "$NOTIFY_CONF"
@@ -13841,12 +14330,18 @@ _autodeploy_line() { # _autodeploy_line <app>
     printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" "$1" "$A_BRANCH" "$(t "(la CI del commit %s ha fallado; espero uno que pase)" "${ci#ci-fallo:}")"
     return 0
   fi
+  # Y si espera a la CI o no, siempre: desde 1.4.9 es lo normal en GitHub, y
+  # una app que se despliega sin mirarla tiene que verse sin abrir su .conf.
+  local cit
+  if [[ "$A_CHECKS" == "yes" ]]; then cit="$(t "{d}· espera a la CI{r}")"
+  elif _gh_slug "$A_REPO" >/dev/null 2>&1; then cit="$(t "{yel}· sin esperar a la CI{r}")"
+  else cit=""; fi
   if [[ -n "$A_AUTOFAIL" ]]; then
-    printf "  ${RED}%s${R} %-18s %s ${D}%s${R}\n" "$G_OFF" \
-      "$1" "$A_BRANCH" "$(t "(commit %s falló; espero uno nuevo)" "${A_AUTOFAIL:0:7}")"
+    printf "  ${RED}%s${R} %-18s %s ${D}%s${R} %s\n" "$G_OFF" \
+      "$1" "$A_BRANCH" "$(t "(commit %s falló; espero uno nuevo)" "${A_AUTOFAIL:0:7}")" "$cit"
   else
-    printf "  ${GRN}%s${R} %-18s %s ${D}%s${R}\n" "$G_ON" \
-      "$1" "$A_BRANCH" "$(t "(desplegado %s)" "${A_LASTDEPLOY:-$(t "nunca")}")"
+    printf "  ${GRN}%s${R} %-18s %s ${D}%s${R} %s\n" "$G_ON" \
+      "$1" "$A_BRANCH" "$(t "(desplegado %s)" "${A_LASTDEPLOY:-$(t "nunca")}")" "$cit"
   fi
 }
 
@@ -13866,15 +14361,51 @@ cmd_autodeploy() {
   local name="${1:-}"
   case "$sub" in
     enable)
+      # orbit autodeploy enable <app> [--no-checks|--checks], en cualquier orden.
+      local ci_want="" a
+      name=""
+      for a in "$@"; do
+        case "$a" in
+          --no-checks|--sin-ci) ci_want="no" ;;
+          --checks|--ci)        ci_want="yes" ;;
+          -*) die "orbit autodeploy enable: no entiendo «%s»." "$a" ;;
+          *) [[ -z "$name" ]] || die "uso: orbit autodeploy enable <app> [--no-checks]"; name="$a" ;;
+        esac
+      done
       [[ -n "$name" ]] || name="$(pick_app 'App a desplegar sola')" || return 0
       load_app "$name"
       [[ "$A_TYPE" == "redirect" ]] && die "'%s' es una redirección: no tiene código que desplegar." "$A_NAME"
       [[ -n "$A_REPO" ]] || die "'%s' no tiene repositorio." "$A_NAME"
+      # Desde 1.4.9, con un repositorio de GitHub se espera a su CI por
+      # defecto: desplegar solo un commit en rojo es justo lo que nadie quiere
+      # que pase de madrugada, y el modo cómodo no puede ser el inseguro
+      # (principio 7). Sólo se decide aquí, cuando alguien enciende el
+      # automático, y sólo si nadie lo había decidido antes: un 'checks off'
+      # anterior se respeta, y las apps que ya estaban en automático no
+      # cambian solas.
+      local slug=""; slug="$(_gh_slug "$A_REPO" 2>/dev/null)" || slug=""
+      if [[ "$ci_want" == "yes" && -z "$slug" ]]; then
+        die "Sólo sé preguntar por la CI a GitHub, y el repositorio de «%s» no está ahí: %s" "$name" "$A_REPO"
+      fi
+      if [[ -n "$ci_want" ]]; then
+        A_CHECKS="$ci_want"; [[ "$ci_want" == "no" ]] && A_CI_SEEN=""
+      elif [[ -n "$slug" && -z "$A_CHECKS" ]]; then
+        A_CHECKS="yes"
+      fi
       A_AUTODEPLOY="yes"; A_AUTOFAIL=""; save_app
       _autodeploy_timer_write
       systemctl enable --now orbit-autodeploy.timer >/dev/null 2>&1 || true
       ok "«%s» se desplegará sola cuando avance %s" "$name" "$A_BRANCH"
       info "Se comprueba cada %s min con 'git ls-remote'. Sin puertos abiertos ni webhooks." "${AUTODEPLOY_EVERY}"
+      if [[ "$A_CHECKS" == "yes" ]]; then
+        info "Y sólo con la CI de %s en verde. Sin comprobaciones en el commit, espera %s s y despliega." "${slug:-GitHub}" "$CHECKS_GRACE"
+        info "Para no esperarla:  orbit autodeploy enable %s --no-checks" "$name"
+        # La puerta que no puede preguntar no abre: sin sesión de gh, la app
+        # no se desplegará sola hasta que se arregle. Mejor decirlo ahora.
+        _gh_ok || warn "gh no tiene sesión para '%s': mientras no la tenga, «%s» no se desplegará sola. Conéctalo con 'orbit github'." "$DEPLOY_USER" "$name"
+      elif [[ -n "$slug" ]]; then
+        warn "No espera a la CI de %s: un commit en rojo se desplegará igual. Para esperarla:  orbit autodeploy checks on %s" "$slug" "$name"
+      fi
       notify_configured || warn "Sin avisos configurados no te enterarás si un despliegue falla: 'orbit notify setup'"
       logline "autodeploy enable $name" ;;
     disable)
@@ -14385,8 +14916,8 @@ cmd_queue() {
 _maint_page_ensure() { # _maint_page_ensure <app>
   local f; f="$(maint_page "$1")"
   [[ -f "$f" ]] && return 0
-  install -d -o "$(app_user)" -g "$(app_user)" "$APPS_DIR/$1/shared"
-  cat > "$f" <<'EOF'
+  _own_dir "$(app_user)" "$APPS_DIR/$1/shared"
+  _user_write "$(app_user)" "$f" <<'EOF'
 <!doctype html>
 <html lang="es">
 <meta charset="utf-8">
@@ -14411,7 +14942,7 @@ _maint_page_ensure() { # _maint_page_ensure <app>
   <p class="motivo"><!--# include file="maintenance.reason" --></p>
 </main>
 EOF
-  chown "$(app_user):$(app_user)" "$f"; chmod 0644 "$f"
+  _as_user "$(app_user)" chmod 0644 -- "$f"
 }
 
 # El motivo acaba dentro de una página HTML, así que se escapa. No es tanto por
@@ -14430,19 +14961,16 @@ _html_escape() {
 # una página de error 404 entera dentro del párrafo. Comprobado.
 _maint_reason_write() { # _maint_reason_write <app> [texto]
   local f; f="$(maint_reason "$1")"
-  install -d -o "$(app_user)" -g "$(app_user)" "$APPS_DIR/$1/shared"
-  printf '%s' "$(_html_escape "${2-}")" > "$f"
-  chown "$(app_user):$(app_user)" "$f" 2>/dev/null || true
-  chmod 0644 "$f"
+  _own_dir "$(app_user)" "$APPS_DIR/$1/shared"
+  printf '%s' "$(_html_escape "${2-}")" | _user_write "$(app_user)" "$f"
+  _as_user "$(app_user)" chmod 0644 -- "$f"
 }
 
 _maint_on() { # _maint_on <app> [motivo]
   local f; f="$(maint_flag "$1")"
   _maint_page_ensure "$1"
   _maint_reason_write "$1" "${2-}"
-  : > "$f"
-  chown "$(app_user):$(app_user)" "$f" 2>/dev/null || true
-  chmod 0644 "$f"
+  _user_touch "$(app_user)" "$f" 0644
 }
 
 _maint_is_on() { [[ -e "$(maint_flag "$1")" ]]; }
@@ -14491,8 +15019,7 @@ cmd_maintenance() {
       [[ -n "$name" ]] || name="$(pick_app 'App')" || return 0
       load_app "$name"
       _maint_page_ensure "$name"
-      "${EDITOR:-nano}" "$(maint_page "$name")"
-      chown "$(app_user):$(app_user)" "$(maint_page "$name")"; chmod 0644 "$(maint_page "$name")"
+      _edit_as "$(app_user)" "$(maint_page "$name")" 0644
       ok "Guardada. Se sirve tal cual, sin recargar nginx." ;;
     status)
       [[ -n "$name" ]] && { app_exists "$name" || die "No existe ninguna app llamada «%s»." "$name"; }
@@ -14668,10 +15195,10 @@ _env_path() { # _env_path <app>
   # shared/.env mientras la provisión mira shared/api/.env: la variable
   # seguiría sin definirse y cada despliegue repetiría el mismo aviso, sin
   # que nadie entienda por qué. Requiere `load_app` previo, que es lo que
-  # hacen todos los que llaman aquí.
-  local rel="${A_ENV_FILE:-.env}"
-  _safe_relpath "$rel" || rel=".env"
-  local f="$d/$rel"
+  # hacen todos los que llaman aquí. La ruta sale de _env_file, la misma que
+  # cargan las unidades.
+  local f; f="$(_env_file "$1")"
+  local rel="${f#"$d"/}"
   # El dueño sale de la app NOMBRADA, no de la cargada: el clone llama aquí
   # con el original mientras los globales ya son del clon, y con app_user()
   # el chown le robaba el .env al original y le enseñaba sus secretos al
@@ -14679,10 +15206,14 @@ _env_path() { # _env_path <app>
   local u; u="$(app_user_of "$1")"
   _path_has_link "$d" "$rel" \
     && die "El .env de '%s' (%s) pasa por un enlace simbólico. No lo toco: lo cambió alguien que no es Orbit." "$1" "$rel"
-  install -d -o "$u" -g "$u" "$(dirname "$f")"
-  [[ -f "$f" ]] || { : > "$f"; }
+  # La comprobación de arriba es un diagnóstico, no la protección: entre ella
+  # y lo de abajo la app puede poner el enlace. Lo que protege es que todo lo
+  # de aquí lo haga la app (ver _as_user), no root.
+  _own_dir "$u" "$d"
+  _as_user "$u" mkdir -p -- "$(dirname "$f")"
+  _user_touch "$u" "$f" 0640 2>/dev/null \
+    || die "El .env de '%s' (%s) no lo puede escribir su usuario (%s). Dáselo con:  sudo chown %s: %s" "$1" "$rel" "$u" "$u" "$f"
   [[ -f "$f" && ! -L "$f" ]] || die "El .env de '%s' (%s) no es un fichero normal. No lo toco." "$1" "$rel"
-  chown -h "$u:$u" "$f"; chmod 0640 "$f"
   printf '%s' "$f"
 }
 
@@ -14800,20 +15331,30 @@ _env_unquote() { # _env_unquote <valor crudo>
 }
 
 _env_write() { # _env_write <fichero> <clave> [valor]   (sin valor, la borra)
-  local f="$1" key="$2" val="${3-}" tmp line done_it="no"
-  tmp="$(mktemp)"
+  local f="$1" key="$2" val="${3-}" line out="" done_it="no" cur u
+  # Lo lee y lo escribe el usuario de la app, no root (ver _as_user). Antes
+  # era un 'cat tmp > f' de root, después de que alguien comprobara que 'f' no
+  # era un enlace: en medio, la app podía ponerlo, y root escribía el .env
+  # —con sus líneas de vuelta— en el fichero que ella eligiera.
+  u="$(_path_user "$f")"
+  [[ -n "$u" ]] || u="${_ORBIT_WHO:-$(id -un)}"
+  # La 'x' guarda los saltos de línea del final, que '$( )' se come.
+  cur="$(_as_user "$u" cat -- "$f" && printf x)" \
+    || die "%s no lo puede leer su usuario (%s). No lo toco." "$f" "$u"
+  cur="${cur%x}"
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?"$key"= ]]; then
       # Se sustituye en su sitio para no descolocar los comentarios que el
       # usuario haya puesto alrededor.
-      [[ $# -ge 3 ]] && { printf '%s=%s\n' "$key" "$(_q "$val")" >> "$tmp"; done_it="yes"; }
+      [[ $# -ge 3 ]] && { out+="$key=$(_q "$val")"$'\n'; done_it="yes"; }
       continue
     fi
-    printf '%s\n' "$line" >> "$tmp"
-  done < "$f"
-  [[ $# -ge 3 && "$done_it" == "no" ]] && printf '%s=%s\n' "$key" "$(_q "$val")" >> "$tmp"
-  cat "$tmp" > "$f"     # se conserva el inodo: el symlink de la release sigue valiendo
-  rm -f "$tmp"
+    out+="$line"$'\n'
+  done < <(printf '%s' "$cur")
+  [[ $# -ge 3 && "$done_it" == "no" ]] && out+="$key=$(_q "$val")"$'\n'
+  # Se conserva el inodo: el symlink de la release sigue valiendo.
+  printf '%s' "$out" | _user_write "$u" "$f" \
+    || die "No he podido escribir %s como %s." "$f" "$u"
   # Y con el inodo se conserva el dueño, así que aquí no hay que tocarlo. Había
   # un 'chown "$(app_user)"', y app_user() lee las GLOBALES: quien llega sin
   # load_app —'orbit db create <app>' es el caso real— obtenía 'deploy' y le
@@ -14823,7 +15364,7 @@ _env_write() { # _env_write <fichero> <clave> [valor]   (sin valor, la borra)
   # del PR #10 estaba en la llamada; esta línea lo deshacía tres más abajo.
   # Quien crea el fichero es quien le pone dueño, y todos los que llaman aquí lo
   # crean antes con el suyo.
-  chmod 0640 "$f"
+  _as_user "$u" chmod 0640 -- "$f" 2>/dev/null || true
 }
 
 # Valor para una variable declarada con "generate".
@@ -14859,7 +15400,12 @@ ENV_EXAMPLE_DECL=""
 
 # Sólo se pregunta si hay alguien delante. Con --json, además, por stdout no
 # puede salir una pregunta: rompería el objeto que espera el cliente.
-_env_can_ask() { [[ -t 0 && "$ASSUME_YES" != "yes" && "$JSON" != "yes" ]]; }
+# Ni con --env-stdin: la entrada ya se ha leído hasta el final, y una pregunta
+# leería un EOF —o el teclado, si lo que se gastó era un terminal— en vez de la
+# respuesta.
+# El terminal, aparte para que las pruebas puedan fingir uno.
+_stdin_tty() { [[ -t 0 ]]; }
+_env_can_ask() { _stdin_tty && [[ "$ASSUME_YES" != "yes" && "$JSON" != "yes" && "$DEP_ENV_STDIN" != "yes" ]]; }
 
 # Pide un valor. La etiqueta viene del repositorio, así que va como dato y no
 # como formato: un '%' en una descripción no puede romper el printf.
@@ -14953,8 +15499,9 @@ _provision_env() { # _provision_env <app> <shared> [release]
     return 0
   fi
   local f="$shared/$rel"
-  install -d -o "$(app_user)" -g "$(app_user)" "$(dirname "$f")"
-  [[ -e "$f" ]] || install -o "$(app_user)" -g "$(app_user)" -m 0640 /dev/null "$f"
+  # Como la app: la comprobación de arriba no cierra la carrera (_as_user).
+  _as_user "$(app_user)" mkdir -p -- "$(dirname "$f")"
+  [[ -e "$f" ]] || _user_touch "$(app_user)" "$f" 0640
   if [[ ! -f "$f" ]]; then
     warn "env: '%s' existe y no es un fichero normal; no lo toco." "$rel"
     return 0
@@ -15116,8 +15663,7 @@ cmd_env() {
 
   case "$sub" in
     edit)
-      "${EDITOR:-nano}" "$f"
-      chown "$(app_user):$(app_user)" "$f"; chmod 0640 "$f"
+      _edit_as "$(app_user_of "$name")" "$f" 0640
       ok "Guardado. Recuerda: los cambios se aplican al reiniciar."
       if needs_svc "$A_TYPE" && confirm "¿Reiniciar '%s' ahora?" y "$name"; then
         systemctl restart "$(svc_name "$name")"; ok "Reiniciada"
@@ -15451,7 +15997,7 @@ cmd_isolate() { # orbit isolate <app>
   local envf; envf="$(app_shared "$name")/.env"
   local relevo="no"
   if _serves_php && [[ -f "$envf" ]]; then
-    chown "$u:$DEPLOY_USER" "$envf"; relevo="si"
+    chown -h "$u:$DEPLOY_USER" "$envf"; relevo="si"
   fi
   A_USER="$u"; save_app
   render_systemd "$name"
@@ -15990,6 +16536,19 @@ _doctor_collect() {
   for cn in $(app_names); do
     _lock_read "$cn" || continue
     _doc info "lock:$cn" "$(t "«%s» está %s" "$cn" "$(_lock_desc)")" "$(t "se levanta con:  orbit unlock %s" "$cn")"
+  done
+  # Una app de GitHub que se despliega sola sin mirar su CI. Desde 1.4.9
+  # 'autodeploy enable' la enciende por defecto, pero las que ya estaban en
+  # automático no se migran solas —sería cambiar en silencio cuándo se
+  # despliega algo—, así que se cuenta aquí. Sin acción: es una decisión, y
+  # puede ser deliberada ('checks off').
+  local ad ck rp
+  for cn in $(app_names); do
+    IFS=$'\x1f' read -r ad ck rp < <(load_app "$cn"; printf '%s\x1f%s\x1f%s\n' "$A_AUTODEPLOY" "$A_CHECKS" "$A_REPO")
+    [[ "$ad" == "yes" && "$ck" != "yes" ]] || continue
+    _gh_slug "$rp" >/dev/null 2>&1 || continue
+    _doc info "ci-off:$cn" "$(t "«%s» se despliega sola sin esperar a la CI de GitHub" "$cn")" \
+      "$(t "para esperarla:  orbit autodeploy checks on %s" "$cn")"
   done
 
   # Unidades escritas antes de que la unidad declarara su propio HOME. Con
@@ -16920,6 +17479,7 @@ cat <<EOF
                             Deploy them all, with a summary at the end
     autodeploy enable|disable|status <app>
                             Deploy on its own whenever the branch moves
+                            (GitHub: waits for green CI; --no-checks to skip)
     autodeploy every <min>  How often the remote is checked
     autodeploy checks on|off <app>
                             Deploy on its own only with GitHub CI green
@@ -17026,6 +17586,7 @@ cat <<EOF
                             Desplegar todas, con resumen al final
     autodeploy enable|disable|status <app>
                             Desplegar sola cuando avance la rama
+                            (GitHub: espera a la CI en verde; --no-checks, no)
     autodeploy every <min>  Cada cuánto se mira el remoto
     autodeploy checks on|off <app>
                             Desplegarse sola sólo con la CI de GitHub en verde
@@ -17236,7 +17797,43 @@ _i18n_en() {
     ["¿Les das valor ahora? [S/n] (Intro deja el del ejemplo; vacío, la salta)"]="Set them now? [Y/n] (Enter keeps the example value; empty skips it)"
     ["El valor de %s %s; no lo guardo."]="The value of %s %s; not saving it."
     ["No he podido crear el cerrojo de despliegue en %s; sigo sin él."]="Could not create the deploy lock in %s; carrying on without it."
-    ["Hay otro despliegue o rollback de '%s' en curso; espero a que termine…"]="Another deploy or rollback of '%s' is running; waiting for it to finish…"
+    ["Hay otro despliegue o rollback de '%s' en curso; espero a que termine (hasta %s s)…"]="Another deploy or rollback of '%s' is running; waiting for it to finish (up to %s s)…"
+    ["orbit deploy: --env-stdin sólo una vez: la entrada ya está leída."]="orbit deploy: --env-stdin only once: standard input has already been read."
+    ["con --env-stdin hay que decir qué app desplegar"]="with --env-stdin you have to say which app to deploy"
+    ["orbit deploy --env-stdin necesita el nombre de la app: la entrada ya está leída."]="orbit deploy --env-stdin needs the app name: standard input has already been read."
+    ["orbit deploy: --pick no se puede usar con --env-stdin."]="orbit deploy: --pick cannot be used with --env-stdin."
+    ["Lo tiene 'orbit %s' (PID %s) desde %s."]="It is held by 'orbit %s' (PID %s) since %s."
+    ["El 'orbit %s' que lo tomó (PID %s, desde %s) ya no existe, pero sus procesos siguen con el cerrojo:"]="The 'orbit %s' that took it (PID %s, since %s) is gone, but its processes still hold the lock:"
+    ["Lo retienen estos procesos:"]="These processes hold it:"
+    ["Espero a que terminen. Si sabes que sobran:  kill %s"]="Waiting for them to finish. If you know they are leftovers:  kill %s"
+    ["%s no lo puede leer su usuario (%s). No lo edito."]="%s cannot be read by its user (%s). Not editing it."
+    ["El editor ha salido con %s: no guardo nada."]="The editor exited with %s: nothing saved."
+    ["No he podido guardar %s como %s."]="Could not save %s as %s."
+    ["%s es un enlace simbólico y no una carpeta. No lo sigo: lo ha puesto alguien que no es Orbit."]="%s is a symbolic link, not a directory. Not following it: someone other than Orbit put it there."
+    ["pnpm-workspace.yaml es un enlace simbólico; no lo toco."]="pnpm-workspace.yaml is a symbolic link; not touching it."
+    ["la línea %s no es una asignación CLAVE='valor' de Orbit"]="line %s is not an Orbit KEY='value' assignment"
+    ["dice ser «%s» y el manifiesto dice «%s»"]="it says it is «%s» and the manifest says «%s»"
+    ["el campo %s no tiene un valor que Orbit escriba («%s»)"]="field %s holds a value Orbit would never write («%s»)"
+    ["La copia «%s» trae «%s» como enlace simbólico. No la restauro."]="Backup «%s» has «%s» as a symbolic link. Not restoring it."
+    ["La copia «%s» trae algo que no es un fichero (%s). No la restauro."]="Backup «%s» contains something that is not a file (%s). Not restoring it."
+    ["La configuración de «%s» en la copia no es de fiar: %s."]="The configuration of «%s» in the backup cannot be trusted: %s."
+    ["No he tocado nada. Si la copia es tuya, mira el app.conf que trae:  tar xzOf %s ./app.conf"]="Nothing was touched. If the backup is yours, look at the app.conf inside:  tar xzOf %s ./app.conf"
+    ["La copia traía BACKUP_HOOK=«%s». No lo restauro: es una orden que ejecuta root."]="The backup had BACKUP_HOOK=«%s». Not restoring it: it is a command root runs."
+    ["Si es tuya, ponla tú en %s."]="If it is yours, set it yourself in %s."
+    ["El notify.conf de la copia no es el que escribe Orbit (línea %s): no lo restauro."]="The backup's notify.conf is not what Orbit writes (line %s): not restoring it."
+    ["Vuelve a configurarlos con:  orbit notify setup"]="Set them up again with:  orbit notify setup"
+    ["{d}· espera a la CI{r}"]="{d}· waits for CI{r}"
+    ["{yel}· sin esperar a la CI{r}"]="{yel}· does not wait for CI{r}"
+    ["orbit autodeploy enable: no entiendo «%s»."]="orbit autodeploy enable: I do not understand «%s»."
+    ["uso: orbit autodeploy enable <app> [--no-checks]"]="usage: orbit autodeploy enable <app> [--no-checks]"
+    ["Y sólo con la CI de %s en verde. Sin comprobaciones en el commit, espera %s s y despliega."]="And only with %s CI green. With no checks on the commit, it waits %s s and deploys."
+    ["Para no esperarla:  orbit autodeploy enable %s --no-checks"]="To not wait for it:  orbit autodeploy enable %s --no-checks"
+    ["No espera a la CI de %s: un commit en rojo se desplegará igual. Para esperarla:  orbit autodeploy checks on %s"]="Not waiting for %s CI: a red commit will be deployed anyway. To wait for it:  orbit autodeploy checks on %s"
+    ["El .env de '%s' (%s) no lo puede escribir su usuario (%s). Dáselo con:  sudo chown %s: %s"]="The .env of '%s' (%s) cannot be written by its user (%s). Give it to them with:  sudo chown %s: %s"
+    ["%s no lo puede leer su usuario (%s). No lo toco."]="%s cannot be read by its user (%s). Not touching it."
+    ["No he podido escribir %s como %s."]="Could not write %s as %s."
+    ["«%s» se despliega sola sin esperar a la CI de GitHub"]="«%s» deploys itself without waiting for GitHub CI"
+    ["para esperarla:  orbit autodeploy checks on %s"]="to wait for it:  orbit autodeploy checks on %s"
     ["otro despliegue de la app sigue en curso"]="another deploy of the app is still running"
     ["Otro despliegue de '%s' sigue en curso tras %s s. No he tocado nada."]="Another deploy of '%s' is still running after %s s. Nothing was touched."
     ["orbit.json declara una ruta compartida nueva: %s"]="orbit.json declares a new shared path: %s"
@@ -17362,7 +17959,7 @@ _i18n_en() {
     ["El build de %s ha fallado y se ha reintentado solo tras arreglarlo."]="The build of %s failed and was retried on its own after being fixed."
     ["orbit deploy: «%s» necesita un valor."]="orbit deploy: «%s» needs a value."
     ["orbit deploy: --progress sólo tiene sentido con --json."]="orbit deploy: --progress only makes sense with --json."
-    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --env K=V     poner una variable en el .env antes del build (repetible)\\n       --env-file F  poner las de un fichero CLAVE=valor antes del build\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --force       desplegar aunque la app esté congelada ('orbit lock')\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --env K=V     set a variable in the .env before the build (repeatable)\\n       --env-file F  set the KEY=value lines of a file before the build\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --force       deploy even if the app is frozen ('orbit lock')\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
+    ["  uso: orbit deploy [app] [--pick] [--ref <commit|rama>] [--pr <número>]\\n       orbit deploy --all [--if-changed]\\n       --pick        elegir de una lista qué desplegar (PRs, commits)\\n       --env K=V     poner una variable en el .env antes del build (repetible)\\n       --env-file F  poner las de un fichero CLAVE=valor antes del build\\n       --env-stdin   lo mismo, leído de la entrada estándar (no sale en ps)\\n       --ref <x>     desplegar un commit o rama concretos\\n       --pr <n>      desplegar un pull request sin fusionarlo\\n       --force       desplegar aunque la app esté congelada ('orbit lock')\\n       --json        el resultado como un objeto, por stdout (también con --all)\\n       --progress    con --json, un suceso por línea en stderr\\n"]="  usage: orbit deploy [app] [--pick] [--ref <commit|branch>] [--pr <number>]\\n       orbit deploy --all [--if-changed]\\n       --pick        pick from a list what to deploy (PRs, commits)\\n       --env K=V     set a variable in the .env before the build (repeatable)\\n       --env-file F  set the KEY=value lines of a file before the build\\n       --env-stdin   the same, read from standard input (stays out of ps)\\n       --ref <x>     deploy a specific commit or branch\\n       --pr <n>      deploy a pull request without merging it\\n       --force       deploy even if the app is frozen ('orbit lock')\\n       --json        the result as an object, on stdout (also with --all)\\n       --progress    with --json, one event per line on stderr\\n"
     ["orbit deploy: no entiendo «%s». Mira 'orbit deploy --help'."]="orbit deploy: I don't understand «%s». See 'orbit deploy --help'."
     ["orbit deploy: sobra «%s»."]="orbit deploy: «%s» is one argument too many."
     ["con --json hay que decir qué app desplegar"]="with --json you have to say which app to deploy"
