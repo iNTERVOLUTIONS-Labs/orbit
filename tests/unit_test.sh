@@ -247,4 +247,39 @@ else
   echo "  (sin sudo: me salto la comprobación como el usuario de despliegue)"
 fi
 
+
+section "El cerrojo de despliegue dice quién lo tiene"
+# Un SIGKILL sólo a 'orbit' deja el cerrojo en manos de sus hijos —el build
+# hereda el descriptor— hasta que terminan, y el despliegue siguiente esperaba
+# hasta DEPLOY_LOCK_WAIT sin decir nada. Ahora el que espera cuenta de quién es
+# y, si su dueño ha muerto, qué procesos lo retienen.
+mkdir -p "$DEPLOY_LOCK_DIR"
+LK="$DEPLOY_LOCK_DIR/huerfana.lock"
+# Los «hijos que sobreviven»: un proceso con el cerrojo puesto, como el build.
+( exec 8>"$LK"; flock 8; exec sleep 30 ) &
+HIJO=$!
+for _i in 1 2 3 4 5 6 7 8 9 10; do flock -n "$LK" true 2>/dev/null || break; sleep 0.1; done
+# Y el dueño apuntado, que ya no existe: un PID que acaba de terminar.
+true & MUERTO=$!; wait "$MUERTO"
+printf 'pid=%s\nsince=2026-11-05T10:00:00+00:00\ncmd=deploy\n' "$MUERTO" > "$(_app_lock_owner huerfana)"
+DEPLOY_LOCK_WAIT=1 run _app_lock huerfana >"$TMP/lk" 2>&1; r=$?
+check "no llega a tiempo"          "1" "$r"
+check "dice que el dueño murió"    "1" "$(grep -c "(PID $MUERTO, desde 2026-11-05T10:00:00+00:00) ya no existe" "$TMP/lk")"
+check "y quién lo retiene"         "1" "$(grep -c "^ *$HIJO (sleep)$" "$TMP/lk")"
+check "con la orden para cortarlo" "1" "$(grep -c "kill $HIJO\$" "$TMP/lk")"
+check "sin contarse a sí mismo"    "0" "$(grep -c '(find)\|(bash)' "$TMP/lk")"
+# Con el dueño vivo, se dice quién es y desde cuándo, y nada de matar.
+printf 'pid=%s\nsince=ayer\ncmd=rollback\n' "$HIJO" > "$(_app_lock_owner huerfana)"
+DEPLOY_LOCK_WAIT=1 run _app_lock huerfana >"$TMP/lk2" 2>&1
+check "dueño vivo: quién"          "1" "$(grep -c "Lo tiene 'orbit rollback' (PID $HIJO) desde ayer" "$TMP/lk2")"
+check "sin proponer un kill"       "0" "$(grep -c 'kill' "$TMP/lk2")"
+kill "$HIJO" 2>/dev/null; wait "$HIJO" 2>/dev/null
+# Y quien lo toma se apunta, y lo borra al soltarlo.
+( _app_lock huerfana >/dev/null 2>&1
+  yo=$BASHPID; printf '%s\n' "$(grep -c "^pid=$yo$" "$(_app_lock_owner huerfana)")" > "$TMP/lk3"
+  _app_unlock
+  [[ -f "$(_app_lock_owner huerfana)" ]] && echo queda >> "$TMP/lk3" || echo borrado >> "$TMP/lk3" )
+check "se apunta al tomarlo"       "1" "$(head -1 "$TMP/lk3")"
+check "y se borra al soltarlo"     "borrado" "$(tail -1 "$TMP/lk3")"
+
 report

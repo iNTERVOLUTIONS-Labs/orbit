@@ -87,6 +87,64 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.4.9] - 2026-11-05
+
+Los fallos conocidos que quedaban, cada uno reproducido antes de arreglarlo y con una prueba que se pone en rojo sin el arreglo (comprobado mutando el código), más tres arreglos de una rama que nunca llegó a `main`. Y un cambio de comportamiento que conviene leer: **el autodespliegue de un repositorio de GitHub espera a la CI por defecto**.
+
+### Cambiado — `orbit autodeploy enable` espera a la CI de GitHub por defecto
+
+Hasta ahora la puerta de la CI (1.4.3) había que pedirla con `checks on`, y el automático cómodo era el que desplegaba un commit en rojo de madrugada: el principio 7 dice que eso no puede ser lo cómodo. Desde 1.4.9, **encender el automático en un repositorio de GitHub enciende también la puerta**, y lo dice; `orbit autodeploy enable <app> --no-checks` para no esperarla. La semántica es la de siempre: sin comprobaciones en el commit, espera `CHECKS_GRACE` (300 s) y despliega; sin poder preguntar a GitHub —`gh` sin sesión—, **no despliega**, y `enable` lo avisa en ese momento.
+
+**No hay migración silenciosa**: sólo se decide al hacer `enable`, y sólo si la app no lo tenía decidido. Un `checks off` anterior se respeta, y las apps que ya estaban en automático siguen como estaban. Para verlas, `orbit autodeploy status` dice en cada fila si espera a la CI o no, y `orbit doctor` cuenta (sin arreglarlo) cada app de GitHub que se despliega sola sin esperarla. Con 20 comprobaciones nuevas en `gates_test`.
+
+### Seguridad — `orbit restore` ejecutaba como root lo que trajera la copia
+
+El `app.conf` de la copia se instalaba tal cual en `/etc/orbit/apps`, donde root lo carga con `.` en cada `orbit` —temporizadores incluidos—, y lo mismo el `notify.conf`. Una línea de más en un tar.gz que alguien ha tocado en el cubo de copias era código de root; medido antes de arreglarlo. Ahora la copia se lee **como datos** (`_conf_parse`: sólo claves conocidas, valores con las comillas de `save_app`, nada que se ejecute), se comprueba y se vuelve a escribir con `save_app` y `_notify_save`. Y parsear no bastaba, porque hay campos que acaban donde los interpreta root, así que una copia se rechaza entera si trae:
+
+- un salto de línea en `A_START` o en los límites —en la unidad de systemd es una directiva más, `ExecStartPre=+…`, que corre como root—;
+- un `A_USER` que no sea el que Orbit le daría a esa app ni el usuario de despliegue —`root`, u otra app—;
+- números que no son números —la aritmética de bash ejecuta `a[$(…)]`—, o dominios, rutas o redirecciones que romperían el vhost;
+- un enlace simbólico en lo que se lee (`redirects.list` → `/etc/shadow` acababa 0644 en `/etc/orbit`; `shared` → `/etc` se quedaba como carpeta de la app), o algo que no sea un fichero —como root, tar crea dispositivos, y el `chown -R` de `shared/` se los daba a la app—.
+
+Además: **`BACKUP_HOOK` ya no se restaura** —es una orden que root ejecuta con cada copia, no una preferencia; se dice cuál traía—, la extracción va con `--no-same-owner`, y la contraseña del `.env` de la copia, que va dentro del `CREATE ROLE` que ejecuta el superusuario de PostgreSQL, se escapa como SQL (con una comilla se salía de la cadena). 43 comprobaciones nuevas en `backup_test`. Ver ARCHITECTURE §17.6, que también apunta lo que **no** se ha cerrado: el volcado de la base se sigue cargando como superusuario.
+
+### Seguridad — root escribía en lo que es de la app después de comprobar que no era un enlace
+
+`shared/` es del usuario de la app, y entre el `[[ -L ]]` que comprobaba el `.env` y la escritura de root la app podía poner el enlace: root escribía el `.env` —o le hacía `chown` y `chmod`— en el fichero que ella eligiera. Ninguna comprobación cierra esa carrera, y en varios sitios ni había que ganarla: el `chown` de `shared/maintenance.reason` seguía un enlace que la app hubiera dejado ahí antes, así que `orbit maintenance on` le daba `/etc/passwd` —vaciado— al usuario de la app; con `shared/home/.cache` como enlace, el `install -d -o` del `HOME` de la unidad le daba `/etc`; y `pnpm-workspace.yaml`, que **viene del repositorio** y git guarda como enlace si se lo pides, lo reescribía root y se lo daba a la app. Ahora todo eso lo escribe **la propia app** (`_as_user`: un `sudo -u`, o nada si ya se es ese usuario), que siguiendo un enlace no llega a nada que no pudiera tocar ya: el `.env` en `orbit env set/unset`, la provisión del despliegue, el `APP_KEY=` de Laravel, `orbit db create` y `clone`; el mantenimiento entero, la página de error, el `HOME` y el `DENO_DIR` de la unidad, y `pnpm-workspace.yaml` (que además no se sigue si es un enlace). `orbit env edit` y `orbit maintenance edit` abren el editor sobre una copia privada de root y la guarda la app. `releases/` y `shared/`, cuyo padre no es de la app, se crean con `mkdir` y `chown -h`, que no siguen el último componente. Ver ARCHITECTURE §5.3. Las pruebas no pueden ver permisos sin root, así que el doble de `_as_user` en `tests/lib.sh` apunta **quién** habría hecho cada cosa —y de paso ninguna prueba hace `sudo` de verdad a un usuario que en un servidor sí podría existir—.
+
+### Añadido — `orbit deploy <app> --env-stdin`
+
+Orbit Desktop da las variables obligatorias que faltan con `--env CLAVE=valor`, y eso deja el secreto en la línea de órdenes del servidor: en `ps` mientras dura el despliegue y, cuando el escritorio entra como un miembro de `orbit-admin`, en el registro de sudo, que apunta la orden entera. `--env-stdin` lee las mismas líneas `CLAVE=valor` que `--env-file`, de la entrada estándar, con la misma validación que `--env` —nombre, sin saltos de línea ni comillas simples en el valor—, y compone con `--json` y `--progress`. Como la entrada queda gastada, con él no se pregunta nada: ni las variables que falten (se apuntan, como sin nadie al teclado), ni el selector de app ni `--pick`, que se rechazan diciéndolo. `deploy --all` no acepta `--env` y no lo necesita. Con 14 comprobaciones en `deploy_test`, una de ellas fingiendo un terminal para fijar que tampoco pregunta entonces.
+
+### Corregido — las tareas de `cron` no cargaban el `.env` que declara la app
+
+`_cron_sync` escribía `EnvironmentFile=-<shared>/.env` siempre, y una app puede declarar el suyo en `"env": {"file": "api/.env"}` —que es donde escriben la provisión y `orbit env`—. La documentación decía «con el `.env` de la app cargado», y no era verdad para esas apps: en una web real, la tarea del portal llamaba a su API sin el `IV_PORTAL_CRON_TOKEN` que vivía en `shared/api/.env`. Ahora hay una sola ruta (`_env_file`) y la usan todos: la tarea, la unidad de la app y su puente, `release`, `post_deploy` y `orbit exec` cargan `shared/.env` y **después** el declarado, que en systemd es el que gana. Una app sin declaración queda exactamente como estaba, y lo que fija Orbit (`_unit_pinned_env`, 1.4.2) sigue ganando a los dos. El build no cambia: carga el `.env` de la raíz de la release, como siempre.
+
+### Corregido — `"shared": ["vendor"]` en una app PHP servida desde la raíz rompía `nginx -t`
+
+`vendor/` pasaba a ser un enlace a `shared/`, y lo protegían dos bloques a la vez: `_php_writable_denies`, como carpeta de escritura, y `_php_root_denies`, que niega `vendor/` entero. Dos `location ^~ /vendor/` son un vhost que nginx rechaza —`duplicate location`, reproducido con el nginx de verdad— y el despliegue no pasaba. Ahora gana el que lo niega todo; lo mismo para `node_modules/`.
+
+### Corregido — `orbit cron run <app> <tarea>` no validaba la tarea
+
+Sólo se miraba que existiera un fichero con ese nombre en el directorio de unidades: un `.service` suelto —escrito a mano, o resto de una tarea retirada a medias— se arrancaba igual, con un nombre que ni siquiera podría declararse. Ahora la tarea tiene que cumplir la regla con la que se escribe (`[a-z0-9-]`, como en `_cron_sync`) y ser una de las que tienen temporizador.
+
+### Corregido — el despliegue que espera a otro ya no espera callado
+
+Un SIGKILL sólo a `orbit` deja el cerrojo por app en manos de sus hijos —el build hereda el descriptor— hasta que terminan, y el despliegue siguiente esperaba hasta `DEPLOY_LOCK_WAIT` (900 s) diciendo sólo «espero». Que los hijos lo mantengan es correcto —siguen escribiendo en la app, y una migración a medias no se pisa con otra—; lo que no lo era es el silencio. Ahora quien toma el cerrojo se apunta en `/var/lib/orbit/locks/<app>.owner` (PID, desde cuándo, qué orden; con `cat`), y quien espera dice de quién es y desde cuándo; si ese PID ya no existe, lista los procesos que lo retienen y la orden `kill` para cortarlos si sobran. No los mata él. Sin dependencias: `find -lname` sobre `/proc`.
+
+### Corregido — de la rama `fix/next-listen-localhost`, que nunca llegó a `main`
+
+Tres arreglos de Dave Abellan (commit `e9efe99` y su trabajo sin publicar), revisados contra el código de ahora y aplicados con sus pruebas:
+
+- **Las apps de Next escuchaban en todas las interfaces.** La unidad pasa `HOST=127.0.0.1`, y `next start` no lo lee —ni `HOSTNAME`, sólo `-H`—: con el `start` de serie la app escuchaba en `*:PORT` y sólo el cortafuegos tapaba el puerto (medido con Next 15.5). Si el `start` es un `next start` a secas, o no hay, Orbit llama a next con `-H 127.0.0.1` (con npm, `npm exec --`; con bun, `bun run`); si el script ya trae `-H` o hace otra cosa, no se toca. **Las apps ya creadas guardan su `A_START`** y no cambian solas: corrige esa línea en `/etc/orbit/apps/<app>.conf` y vuelve a desplegar.
+- **Una app con proceso no arrancaba sin php-fpm instalado**: `ReadWritePaths=… /run/php` en una máquina sin `/run/php` mata la unidad con `226/NAMESPACE` antes de ejecutar nada. Ahora es `-/run/php`, opcional, en la unidad, el puente y las tareas de cron.
+- **Recargar php-fpm tiraba el error de systemd** (`2>/dev/null`), y «la unidad no existe», «está parada» y «la configuración no vale» salían como el mismo aviso. `_php_fpm_reload` lo enseña, y lo usan ahora también el despliegue y los dos rollbacks.
+
+### Lo que salió auditando, además
+
+- **Nada más se carga con `.` desde una copia ni desde un usuario sin privilegios.** Revisados todos los `.`: `orbit.conf`, `notify.conf` y `apps/*.conf` son de root y sólo los escribe Orbit (ahora también al restaurar); el `.env` lo carga el usuario de la app, nunca root; el estado del vigilante, la congelación, el testigo `.partial` y las métricas se leen como texto; lo que viene del `orbit.json` ya se validaba al leerlo.
+- **`load_app` sigue con `.`**, a propósito: leer la configuración como datos también ahí costaba unos 4 ms por app sin un solo fork, y `orbit list` las carga todas. Con la restauración arreglada, lo único que escribe esos ficheros es `save_app`.
+
 ## [1.4.8] - 2026-11-05
 
 El certificado de origen de Cloudflare, pedido **de verdad**: lo único que la v1.4.7 había dejado sin medir, porque el token del servidor no tenía el permiso y sólo se habían hecho llamadas de lectura. Y de hacerlo salió un fallo que ninguna prueba podía ver.

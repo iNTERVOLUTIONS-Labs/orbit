@@ -65,6 +65,16 @@ USERS_LOG="$TMP/users.log"; : > "$USERS_LOG"
 useradd() { printf 'useradd %s\n' "$*" >> "$USERS_LOG"; }
 userdel() { printf 'userdel %s\n' "$*" >> "$USERS_LOG"; }
 
+# Y nadie se convierte en otro usuario de verdad. Lo que Orbit escribe en lo
+# que es de una app lo escribe como ese usuario (_as_user), y en las pruebas
+# esos usuarios —'orbit-otra', 'orbit-web'— no existen o, peor, en un servidor
+# de verdad sí: un sudo real los usaría. Se apunta QUIÉN lo habría hecho, que
+# es lo que las suites comprueban, y se ejecuta como quien corre la tanda. El
+# original se conserva como _as_user_real para la prueba que lo ejercita.
+eval "$(declare -f _as_user | sed '1s/^_as_user /_as_user_real /')"
+AS_USER_LOG="$TMP/as_user.log"; : > "$AS_USER_LOG"
+_as_user() { printf '%s %s\n' "$1" "${*:2}" >> "$AS_USER_LOG"; shift; "$@"; }
+
 # Y tampoco en /etc/php: un pool escrito ahí por una prueba se lo comería el
 # php-fpm de la máquina en su siguiente recarga.
 mkdir -p "$TMP/pool"

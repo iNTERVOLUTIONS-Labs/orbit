@@ -317,4 +317,28 @@ run cmd_maintenance off web >/dev/null 2>&1
 check "vuelve la web" "la web de verdad" "$(BODY /)"
 check "código 200"    "200"              "$(CODE /)"
 
+
+section "Las páginas de shared/ las escribe la app"
+# El motivo, el testigo y las dos páginas viven en shared/, que es de la app.
+# Se escribían con un '>' y un 'chown' de root: una app que cambiara
+# maintenance.reason por un enlace a /etc/passwd recibía /etc/passwd —vaciado
+# y con su usuario de dueño— la siguiente vez que alguien ponía el
+# mantenimiento. Ahora lo escribe ella (ver _as_user en orbit).
+mkapp ais static "" "ais.test"
+load_app ais; A_USER="orbit-ais"; A_OUTDIR="."; save_app
+mkdir -p "$TMP/apps/ais/shared"
+chown() { :; }
+printf 'no me toques\n' > "$TMP/victima"
+ln -s "$TMP/victima" "$(maint_reason ais)"
+: > "$AS_USER_LOG"
+run cmd_maintenance on ais "subo cosas" >/dev/null 2>&1; r=$?
+check "enciende"                   "0" "$r"
+check "el motivo, como la app"     "1" "$(grep -c "^orbit-ais tee -- $(maint_reason ais)\$" "$AS_USER_LOG")"
+check "la página, como la app"     "1" "$(grep -c "^orbit-ais tee -- $(maint_page ais)\$" "$AS_USER_LOG")"
+check "el testigo, como la app"    "1" "$(grep -c "^orbit-ais sh -c .* $(maint_flag ais)\$" "$AS_USER_LOG")"
+: > "$AS_USER_LOG"
+_errpage_ensure ais
+check "la de error, como la app"   "1" "$(grep -c "^orbit-ais tee -- $(err_page ais)\$" "$AS_USER_LOG")"
+unset -f chown
+
 report

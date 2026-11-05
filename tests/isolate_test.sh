@@ -60,7 +60,7 @@ check "A_USER guardado"   "orbit-vieja" \
       "$(sed -n "s/^A_USER='\(.*\)'\$/\1/p" "$TMP/etc/apps/vieja.conf")"
 check "usuario creado"    "1" "$(grep -c 'orbit-vieja$' "$USERS_LOG")"
 check "releases cambian de dueño" "1" "$(grep -c 'releases' "$TMP/chown.log")"
-check "shared también"    "1" "$(grep -c 'shared' "$TMP/chown.log")"
+check "shared también"    "1" "$(grep -c 'chown -R .*shared' "$TMP/chown.log")"
 # La caché de git es del fetcher: deploy la escribe en cada fetch, y un chown
 # aquí rompería el despliegue siguiente.
 check "la caché ni se mira" "0" "$(grep -c 'cache' "$TMP/chown.log")"
@@ -189,11 +189,14 @@ check "y sin A_USER, deploy"     "$(id -un)"  "$(app_user_of llana)"
 load_app vieja                     # los globales son de OTRA app a propósito
 mkdir -p "$TMP/apps/otra/shared"
 install() { printf 'install %s\n' "$*" >> "$TMP/chown.log"; }
-: > "$TMP/chown.log"
+: > "$TMP/chown.log"; : > "$AS_USER_LOG"
 _env_path otra >/dev/null 2>&1
 unset -f install
-check "el .env es del nombrado"  "2" "$(grep -c 'orbit-otra' "$TMP/chown.log")"
-check "no del cargado"           "0" "$(grep -c 'orbit-vieja' "$TMP/chown.log")"
+# Desde 1.4.9 el .env no lo crea root con dueño: lo crea el usuario de la app
+# (_as_user), así que «del nombrado» es quién lo escribe.
+check "el .env lo crea el nombrado" "1" "$(grep -c '^orbit-otra sh -c' "$AS_USER_LOG")"
+check "y shared/ es suyo"        "1" "$(grep -c 'chown -h orbit-otra:orbit-otra' "$TMP/chown.log")"
+check "no del cargado"           "0" "$(cat "$TMP/chown.log" "$AS_USER_LOG" | grep -c 'orbit-vieja')"
 
 section "remove sin --purge conserva al dueño de lo que se queda"
 # También de la revisión: sin --purge las releases y el .env se quedan, y
@@ -215,5 +218,17 @@ run cmd_remove comun --yes --purge >/dev/null 2>&1
 # Sin A_USER la app corre como deploy, y a deploy no lo borra nadie: es la
 # guarda que evita que una conf editada a mano tumbe al usuario del servidor.
 check "sin usuario propio, sin userdel" "0" "$(grep -c 'userdel' "$USERS_LOG")"
+
+
+section "FPM conserva el diagnóstico real de systemd"
+# Con '2>/dev/null' la unidad que no existe, la parada y la configuración rota
+# salían como el mismo aviso genérico. (De fix/next-listen-localhost.)
+systemctl() { printf '%s\n' 'Unit php8.3-fpm.service not found.' >&2; return 5; }
+out="$(run _php_fpm_reload 2>&1)"; r=$?
+check "la recarga falla" "1" "$r"
+check "explica que falta la unidad" "1" "$(grep -c 'Unit php8.3-fpm.service not found.' <<<"$out")"
+systemctl() { return 0; }
+run _php_fpm_reload; r=$?
+check "una recarga correcta sigue funcionando" "0" "$r"
 
 report

