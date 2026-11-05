@@ -1352,6 +1352,43 @@ Que salga en verde significa que el mensaje salió de tu servidor. Si no llega, 
 
 **No hay correo, y es deliberado.** Un VPS recién instalado no puede enviarlo: sin un relé SMTP configurado, el mensaje se queda en la cola o lo tira el destinatario por falta de SPF y DKIM, y **falla en silencio**. Un aviso que no llega es peor que no tener avisos, porque te hace creer que estás cubierto. Entrará cuando exista `orbit mail setup`.
 
+### Métricas para Prometheus
+
+Si ya tienes Prometheus y Grafana, Orbit les da sus datos **sin exportador**: no abre ningún puerto ni deja ningún proceso corriendo. Escribe un fichero de texto en la carpeta del colector de ficheros de `node_exporter` (el *textfile collector*), y `node_exporter` —que ya estará corriendo si tienes Prometheus— lo publica junto a todo lo demás.
+
+```bash
+sudo apt-get install prometheus-node-exporter   # si no lo tienes ya
+orbit metrics prom enable                       # /var/lib/prometheus/node-exporter/orbit.prom
+orbit metrics prom enable /otra/carpeta         # si tu node_exporter lee otra
+orbit metrics prom status
+orbit metrics prom disable                      # y borra el fichero
+orbit metrics --prom                            # las mismas métricas, por la salida estándar
+```
+
+La carpeta por defecto es la que trae compilada el paquete de Ubuntu (`--collector.textfile.directory`, con `ARGS=""` en `/etc/default/prometheus-node-exporter`). Orbit **no instala** `node_exporter`: si la carpeta no existe, `enable` se niega y te dice qué instalar. Y la carpeta tiene que ser de root y que no la pueda escribir nadie más (`root:root 0755`, como la deja el paquete): si es del usuario de `node_exporter`, ese usuario podría hacer que root sobrescribiera cualquier fichero del sistema, y `enable` se niega. `node_exporter` sólo necesita leerla.
+
+**Lo refresca la pasada de `orbit watch`, cada minuto**, que ya ha preguntado a cada app si contesta: `orbit_app_up` es exactamente el «arriba» del vigilante, no otra medida. Por eso, **sin vigilancia no hay fichero**: `orbit watch disable` lo retira, porque una foto vieja con `up 1` se leería en Grafana como el estado de ahora. Para detectar que ha dejado de refrescarse, node_exporter ya publica `node_textfile_mtime_seconds{file="…/orbit.prom"}`.
+
+| Métrica | Qué dice |
+|---|---|
+| `orbit_info{version}` | La versión de Orbit |
+| `orbit_watch_last_run_timestamp_seconds` | De qué pasada del vigilante sale `orbit_app_up` |
+| `orbit_timer_active{timer}` | Si `watch`, `autodeploy` y `queue` tienen el temporizador en marcha |
+| `orbit_app_info{app,type,domain}` | Una serie por app, para cruzar con las demás |
+| `orbit_app_up{app}` | 1 si contestó en la última pasada; sólo apps con proceso |
+| `orbit_app_restarts_total{app}` | Reinicios que ha hecho systemd por su cuenta (`NRestarts`) |
+| `orbit_app_maintenance{app}` · `orbit_app_locked{app}` · `orbit_app_autodeploy_enabled{app}` | 0 o 1 |
+| `orbit_app_current_release_timestamp_seconds{app}` | Cuándo se activó la release que se sirve |
+| `orbit_app_last_deploy_timestamp_seconds{app}` · `…_success` · `…_duration_seconds` | El último intento de despliegue |
+| `orbit_app_last_build_duration_seconds{app}` | Lo que tardó el último build que terminó |
+| `orbit_app_last_successful_deploy_timestamp_seconds{app}` | El último despliegue que salió bien |
+| `orbit_app_deploys{app,result}` | Despliegues en el histórico, `ok` y `failed` |
+| `orbit_cert_expiry_timestamp_seconds{app,domain}` | Cuándo caduca el certificado |
+
+Las fechas van como marcas de tiempo y no como edades, que es lo que espera Prometheus: la edad es `time() - …`. `orbit_app_deploys` es un *gauge* y no un contador, a propósito: el histórico guarda los últimos 2.000 despliegues, y al podarse el número baja — un contador que baja Prometheus lo toma por un reinicio, y `rate()` se inventaría un pico.
+
+**Lo que no sale:** nada del `.env`, ni la URL del repositorio —la de uno privado puede llevar un token—, ni la rama. Las etiquetas son el nombre de la app, su tipo y su dominio.
+
 ## Redirecciones
 
 Dos cosas distintas que conviene no mezclar: mover rutas **dentro** de una web, y mudar un **dominio entero** a otro.
@@ -1619,6 +1656,37 @@ orbit nginx-rebuild      # regenerar todos los vhosts
 ```
 
 `nginx-rebuild` es útil después de actualizar Orbit, para que todas las apps reciban las mejoras de las plantillas. Regenera además el **servidor por defecto** —el que contesta a los nombres que no sirve ninguna app—, que vive fuera de los vhosts: un nombre desconocido cierra la conexión en el 80 y rechaza el saludo TLS en el 443, en vez de acabar en la primera app de la lista. `orbit doctor` avisa si a tu servidor le falta.
+
+---
+
+## Usar orbit sin ser root
+
+```bash
+orbit admin add ana       # ana puede ejecutar 'orbit' sin entrar como root
+orbit admin list
+orbit admin remove ana
+```
+
+`add` crea el grupo `orbit-admin` y una regla de sudo de una línea en `/etc/sudoers.d/orbit-admin`:
+
+```
+%orbit-admin ALL=(root) NOPASSWD: /usr/local/bin/orbit
+```
+
+A partir de su próxima sesión, `ana` escribe `orbit deploy mi-web` y Orbit se eleva solo, sin contraseña. Cada orden queda a su nombre: en el registro (`[ana]` delante de cada línea), y en la congelación de `orbit lock`.
+
+**Es equivalente a darle root, y Orbit lo dice cada vez.** No porque la regla sea floja, sino porque Orbit hace como root lo que se le pide, y quien decide qué se le pide decide qué hace root: `orbit restore` de una copia preparada por él carga como root la configuración que traiga, por ejemplo. El grupo sirve para no repartir la contraseña de root y para saber quién hizo qué, **no para dar menos poder**. Dáselo a quien le darías la contraseña de root.
+
+Lo que sí se cuida:
+
+- **La regla se valida con `visudo` antes de existir**, en un temporal que sudo ignora, y se pone en su sitio con un `mv`. Un sudoers roto deja sin sudo a todo el servidor, incluido quien tendría que arreglarlo.
+- **No se admite a cualquiera:** ni a usuarios que no existen, ni a root, ni a cuentas de sistema (`www-data`, `postgres`…), ni al usuario que clona (`deploy`) ni a los de las apps. Esos son justo los que el aislamiento mantiene lejos de root.
+- **Sin contraseña, a propósito:** Orbit Desktop llama a `orbit … --json` por SSH sin terminal, y ahí sudo no tendría a quién pedírsela. La puerta de verdad es la clave SSH de cada uno.
+- **El entorno de quien llama no cuenta.** Elevado en nombre de otro, Orbit tira el entorno —salvo el idioma y las preferencias de color— y fija `PATH`, `HOME` y la umask: los ajustes salen de `/etc/orbit` y de ningún otro sitio. Ni las funciones exportadas: el intérprete es `bash -p`, que no las importa. Ver ARCHITECTURE §9.1.
+- **El registro dice quién.** Cada línea de `/var/log/orbit/orbit.log` pedida por sudo lleva `[ana]` delante.
+- **`orbit doctor` comprueba** que la regla sea de root con `0440`, que `visudo` la acepte, y que `/usr/local/bin/orbit`, sus carpetas, `/etc/orbit` y lo que hay dentro sólo los pueda cambiar root.
+
+Quitar a alguien no cierra la sesión que ya tenga abierta: sudo mira los grupos de la sesión. Si es urgente, `sudo loginctl terminate-user ana`. Para retirarlo todo: `sudo rm /etc/sudoers.d/orbit-admin && sudo groupdel orbit-admin`.
 
 ---
 
