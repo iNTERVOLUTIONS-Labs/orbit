@@ -87,6 +87,60 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.5.0] - 2026-11-05
+
+Una auditoría de lo añadido en 1.4.5–1.4.8 —los recursos de las apps con proceso, las métricas para Prometheus, `orbit admin`, los certificados de origen y los tokens de cuenta—, con el encargo explícito de romperlo y una lente por cada parte. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código: 27 mutaciones, 26 en rojo; la que no, se dice abajo). Ver ARCHITECTURE §4.1, §6.5, §9.1 y §18.10b.
+
+### Seguridad — nginx seguía los enlaces que el build deja en las carpetas de recursos
+
+Las locations de 1.4.5 (`/_nuxt/`, `/_astro/`, `/assets/`…) servían lo que hubiera al otro lado de un enlace dentro de la salida del build, que es del usuario de la app. Medido con nginx de verdad: un `_nuxt/logs` que apuntaba fuera daba 200 con `/_nuxt/logs/otra.access.log.1`, y `_nuxt/etc → /etc` el `passwd`. En un servidor, fuera es `/var/log/nginx`, con los logs de **todas** las apps: www-data es su dueño, y el snippet sólo niega `.log` a secas, no el `.log.1` rotado. Ahora llevan `disable_symlinks if_not_owner from=$document_root`, también la de la release anterior: los enlaces de la app hacia lo suyo siguen valiendo; hacia lo de otro dueño, es un «no está» que cae al proceso. Cuatro comprobaciones en `nginx_test`, con el destino de otro dueño también como root.
+
+### Seguridad — la carpeta de las métricas, por un enlace, se daba por buena
+
+La comprobación de 1.4.6 —sólo en una carpeta que nadie más que root pueda escribir— no seguía enlaces: una carpeta configurada que era un enlace a otra `0777` pasaba, y root escribía ahí, que es justo la carrera hasta `/etc/shadow` que la comprobación cerraba. Ahora se resuelve, se miran la de verdad **y todas las de encima** —su dueño puede cambiarle el nombre a la de abajo— y se escribe en la resuelta. Al encender, en cada pasada y en `doctor`. **Lo que puede notarse:** si alguna carpeta por encima de la del colector es de otro usuario, `enable` se niega y dice cuál dar a root.
+
+### Seguridad — la limpieza de `orbit` al elevarse se saltaba con `SUDO_UID=0`
+
+Se disparaba con `SUDO_UID` distinto de 0, y con un `SETENV` en la regla —una regla `ALL`, como la del grupo `sudo` de Ubuntu, lo lleva implícito— quien llama escribe `sudo SUDO_UID=0 BACKUP_HOOK=… orbit` y elige el valor. Ahora basta con que exista, que sudo la pone siempre. ARCHITECTURE §9.1 decía que esto no dependía del sudoers, y no era verdad del todo: una regla con `SETENV` o `!env_reset` deja pasar también `LD_PRELOAD` y compañía, que actúan antes de la primera línea de bash, y eso no lo puede defender el script. Ahora lo dice. Y dos de la misma limpieza: sin `/proc` el aviso llegaba tras dieciséis `grep` con el `PATH` de quien llama (ahora `PATH` y `HOME` se fijan igual y se tira el resto), y una entrada del entorno sin `=` se convertía en la orden que ejecutaba `env -i`.
+
+### Corregido — `--origin` borraba un Let's Encrypt que otro vhost seguía usando
+
+La guarda de 1.4.7 miraba que el vhost de la app ya no lo leyera, no que no lo leyera nadie: un vhost escrito a mano para otro servicio con el mismo certificado (principio 3) se quedaba apuntando a nada, y la siguiente recarga de nginx fallaba para todo el servidor. Ahora se busca en `sites-enabled/` y `conf.d/`; si alguien lo usa, no se borra, y se dice quién y con qué orden.
+
+### Corregido — pedir un certificado de origen borraba lo apartado de otra app
+
+La limpieza de los intentos cortados, `.<app>.nuevo.*`, casaba con lo de una app llamada `<app>.nuevo` —su `.…eliminada.XXXXXX`, la clave que `orbit remove` prometió guardar y que Cloudflare no vuelve a dar—. La misma clase de fallo que `tienda.anterior` en 1.4.7, en el único `rm` con comodín que quedaba: ahora son las seis letras de `mktemp`.
+
+### Corregido — lo que viene de la API de Cloudflare entraba tal cual en una URL
+
+El id de cuenta de `cf-token` (1.4.8) y el de zona van a la ruta de la siguiente llamada, y de ahí a la configuración de curl que lleva el token. Con `jq` pasaba cualquier cosa, y un salto de línea dentro era otra `url` que se llevaba la cabecera de autorización —comprobado con curl de verdad contra un servidor local—. Sólo puede explotarlo quien controle la respuesta, así que es defensa en profundidad, pero cuesta una línea: sólo 32 cifras hexadecimales, y `_curl_cfg` no escribe un valor con un salto de línea.
+
+### Corregido — `cf-token`: tres más alrededor
+
+Sin `jq`, el id de la cuenta sólo se encontraba si `id` era la primera clave de `account` y la respuesta venía en una línea; si no, un token bueno se rechazaba como «HTTP 401». Un token que Cloudflare acepta pero que no ve ninguna zona también salía como «HTTP 401», y ahora se dice qué le falta. Y un Ctrl-C a mitad de las llamadas —hasta 30 s cada una— dejaba para siempre en `/etc/orbit` una copia del token sin verificar: ahora la quita una trampa de salida, también con SIGTERM.
+
+### Corregido — un despliegue fallido dejaba escrita la configuración de la release rota
+
+Al apuntar `A_ASSETS` (1.4.5), el despliegue guardaba la configuración entera, y en memoria ya estaba lo que pedía el `orbit.json` de la candidata: el health check, los límites de memoria y CPU, el `.env` declarado. Si el despliegue fallaba después, la release buena se quedaba con todo eso escrito, y la siguiente unidad que se regenerara lo usaba. Ahora se guarda ese campo y sólo ése.
+
+### Corregido — `orbit admin` no veía a quien tiene el grupo como principal
+
+`%orbit-admin` en sudoers casa con el grupo principal, y la lista de `getent group` no lo trae: `admin list` decía «Nadie» y `doctor` «nadie en el grupo» de alguien que era root. Ahora cuentan, y `admin remove` no finge quitárselo —`gpasswd` no puede—: dice que se cambie con `usermod -g`. Y si el grupo ya existía antes de la primera regla, `admin add` nombra a quien ya estaba dentro, porque la regla los hace root a todos a la vez.
+
+### Corregido — lo escrito a mano en `A_ASSETS` podía romper el vhost o mezclar carpetas
+
+Un prefijo repetido, el del reto de ACME o el de las páginas internas `/__orbit_*` daban dos `location` iguales, que nginx rechaza. Y `/a-b/` y `/a_b/` daban el mismo nombre de location de la anterior, que nginx **sí** acepta —se queda con la primera—: la segunda caía a la carpeta de la otra sin aviso.
+
+### Y uno de la interfaz
+
+`COLUMNS=080` era un error por la salida de errores y `COLUMNS=070`, un 56 que se pintaba «070»: la aritmética de bash lee en octal lo que empieza por cero. En base 10 a la fuerza.
+
+### Lo que no se ha tocado, y por qué
+
+- **Los enlaces en las webs estáticas, en `public/` de PHP y en los estáticos de Django** tienen la misma exposición que las carpetas de recursos, desde antes de 1.4.5. El arreglo es el mismo, pero toca el `location /` de todas las webs y los enlaces que pone quien administra (un `uploads` en otro disco), y merece su propia medición.
+- **`_ensure_app_user` reutiliza cualquier cuenta que ya se llame `orbit-<app>`**, también una humana o del grupo `sudo`. Es de 1.0.3, no de esta tanda.
+- **El `mv` a la carpeta resuelta de las métricas** cierra una carrera entre la comprobación y la escritura; no tiene prueba que la ponga en rojo, porque la carrera no se puede reproducir de forma determinista.
+
 ## [1.4.9] - 2026-11-05
 
 Los fallos conocidos que quedaban, cada uno reproducido antes de arreglarlo y con una prueba que se pone en rojo sin el arreglo (comprobado mutando el código), más tres arreglos de una rama que nunca llegó a `main`. Y un cambio de comportamiento que conviene leer: **el autodespliegue de un repositorio de GitHub espera a la CI por defecto**.

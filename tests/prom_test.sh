@@ -350,7 +350,30 @@ check "ni temporales"             "0" "$(find "$TMP/ajena" -type f | wc -l)"
 chmod 1777 "$TMP/ajena"; _prom_refresh --fresh
 # Con el bit pegajoso nadie puede renombrar ni borrar lo que no es suyo.
 check "pegajosa sí"               "0" "$PROM_RC"
-rm -rf "$TMP/ajena"; METRICS_PROM_DIR=""
+chmod 0777 "$TMP/ajena"; rm -f "$TMP/ajena/"*
+# Y por un enlace, que es como se apunta a menudo a la carpeta del colector:
+# _paths_unsafe no sigue enlaces, y el enlace pasaba la comprobación con una
+# carpeta 0777 al otro lado.
+ln -s "$TMP/ajena" "$TMP/enlace-ajena"
+run _prom_enable "$TMP/enlace-ajena" >"$TMP/o" 2>&1; r=$?
+check "por un enlace, tampoco"    "1" "$r"
+check "y nombra la de verdad"     "1" "$(grep -q "$TMP/ajena " "$TMP/o" && echo 1)"
+METRICS_PROM_DIR="$TMP/enlace-ajena"; _prom_refresh --fresh
+check "ni la pasada por el enlace" "1" "$PROM_RC"
+check "ni deja nada al otro lado" "0" "$(find "$TMP/ajena" -type f | wc -l)"
+DOC_ID=(); DOC_LEVEL=(); _doctor_prom
+check "doctor lo ve por el enlace" "error" "$(for i in "${!DOC_ID[@]}"; do [[ "${DOC_ID[$i]}" == prom ]] && echo "${DOC_LEVEL[$i]}"; done)"
+# Ni con la de arriba en manos de otro: puede cambiarle el nombre a la de
+# abajo y poner la suya.
+mkdir -p "$TMP/ajena/hija"; chmod 0755 "$TMP/ajena/hija"
+METRICS_PROM_DIR="$TMP/ajena/hija"; _prom_refresh --fresh
+check "ni bajo una carpeta ajena" "1" "$PROM_RC"
+# Un enlace a una carpeta buena sigue valiendo, y escribe al otro lado.
+mkdir -m 0755 "$TMP/buena"; ln -s "$TMP/buena" "$TMP/enlace-buena"
+METRICS_PROM_DIR="$TMP/enlace-buena"; _prom_refresh --fresh
+check "un enlace a una buena, sí" "0" "$PROM_RC"
+check "y escribe en la de verdad" "1" "$([[ -f "$TMP/buena/orbit.prom" && ! -L "$TMP/buena/orbit.prom" ]] && echo 1 || echo 0)"
+rm -rf "$TMP/ajena" "$TMP/enlace-ajena" "$TMP/buena" "$TMP/enlace-buena"; METRICS_PROM_DIR=""
 
 run _prom_enable "$PROMDIR/" >"$TMP/o" 2>&1; r=$?
 check "enciende"                  "0" "$r"
