@@ -400,7 +400,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.5.0"
+ORBIT_VERSION="1.5.1"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -3957,6 +3957,28 @@ EOF
   done
 }
 
+# Markdown como texto, no como descarga. Sin tipo MIME para '.md', nginx lo
+# sirve como application/octet-stream y el navegador lo baja en vez de
+# mostrarlo. 'types {}' vacía la tabla de esta location y 'default_type' pone
+# el único que hace falta. Es una regex, y la de _php_root_denies que niega los
+# '.md' de una raíz con PHP tiene que ganar: por eso no se emite cuando esa
+# raíz es la del repositorio. Con 'try_files' acaba en el 404 de siempre, y
+# lleva _sec_headers y la guarda de mantenimiento como cualquier otra.
+_md_location() {
+  _php_root_served && return 0
+cat <<EOF
+
+    location ~* \\.md\$ {
+$(_maint_guard)
+        types { }
+        default_type "text/markdown; charset=utf-8";
+        add_header Cache-Control "no-cache";
+$(_sec_headers)
+        try_files \$uri =404;
+    }
+EOF
+}
+
 _body_static() {
   local root; root="$(app_current "$A_NAME")"
   [[ "$A_OUTDIR" != "." && -n "$A_OUTDIR" ]] && root="$root/$A_OUTDIR"
@@ -3971,7 +3993,14 @@ _body_static() {
   # Con una named location el fallback termina en =404: si falta index.html se sirve un 404
   # honesto y el resto del sitio sigue en pie. (recursive_error_pages está off por defecto, así
   # que el error_page de abajo tampoco puede realimentar el bucle.)
-  local fallback="=404"
+  #
+  # Sin '$uri/' en el try_files, y con motivo: con el formato de ficheros de Astro
+  # ('es.html' más una carpeta 'es/' sin index) '/es/' daba 403, porque nginx
+  # intentaba listar la carpeta, y '/components/button/' daba 404. Una petición
+  # con barra final que no es un fichero ni tiene su index.html se redirige a
+  # la misma ruta sin barra (@orbit_noslash), donde '$uri.html' la encuentra.
+  # Una SPA no redirige nada: la ruta es del router del cliente.
+  local fallback="@orbit_noslash"
   [[ "$A_SPA" == "yes" ]] && fallback="@spa"
 cat <<EOF
     root $root;
@@ -3980,15 +4009,35 @@ $(_php_root_denies)
 
     location / {
 $(_maint_guard)
-        try_files \$uri \$uri/index.html \$uri.html \$uri/ $fallback;
+        # El HTML se revalida siempre (con ETag, así que un 304 es barato): un
+        # despliegue se ve de inmediato y no cuando caduque la copia del navegador.
+        add_header Cache-Control "no-cache";
+$(_sec_headers)
+        try_files \$uri \$uri/index.html \$uri.html $fallback;
     }
-$( [[ "$A_SPA" == "yes" ]] && printf '
+$( if [[ "$A_SPA" == "yes" ]]; then printf '
     location @spa {
+        add_header Cache-Control "no-cache";
+%s
         try_files /index.html =404;
     }
-' )
-
-    location ~* \\.(?:css|js|mjs|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico|wasm|map)\$ {
+' "$(_sec_headers)"; else printf '
+    # Barra final sin página detrás: a la misma ruta sin barra, con la query. La
+    # raíz no entra (^/.+/$), y lo que no acaba en barra es un 404 de verdad,
+    # que sale por el error_page de _notfound_location.
+    location @orbit_noslash {
+        rewrite ^(/.+)/$ $1 permanent;
+        return 404;
+    }
+'; fi )
+$(_md_location)
+    # Con nombre de build (Astro 'Base.jLhV-p7P.css', Vite 'index-BqX9fK2a.js')
+    # el fichero nunca cambia de contenido: un año, inmutable. La regex pide un
+    # punto o guion, ocho o más caracteres de nombre de fichero y al menos una
+    # mayúscula o un dígito, justo antes de la extensión; va con '~' —distingue
+    # mayúsculas— y la extensión con '(?i:…)'. 'Outfit-latin-variable.woff2' no
+    # lo cumple: no lleva ni una mayúscula ni un dígito tras el guion.
+    location ~ "[.-](?=[A-Za-z0-9_-]*[A-Z0-9])[A-Za-z0-9_-]{8,}\\.(?i:css|js|mjs|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico|wasm|map)\$" {
         expires 1y;
         access_log off;
         add_header Cache-Control "public, immutable";
@@ -3996,6 +4045,18 @@ $(_sec_headers)
         try_files \$uri @orbit_prev_assets;
     }
 $(_prev_location assets "$A_OUTDIR" "" 1y "public, immutable")
+
+    # El resto de recursos —favicon, fuentes, '/pagefind/pagefind.js'— cambian
+    # entre releases sin cambiar de nombre: un día, y sin 'immutable'. Con un
+    # año, el visitante se quedaba con el favicon o el buscador viejos.
+    location ~* \\.(?:css|js|mjs|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico|wasm|map)\$ {
+        expires off;
+        access_log off;
+        add_header Cache-Control "public, max-age=86400";
+$(_sec_headers)
+        try_files \$uri @orbit_prev_assets_plain;
+    }
+$(_prev_location assets_plain "$A_OUTDIR" "" off "public, max-age=86400")
 
     location = /sw.js {
         expires off;
@@ -4282,6 +4343,64 @@ cat <<'EOF'
         add_header Cross-Origin-Opener-Policy "same-origin-allow-popups" always;
         add_header Strict-Transport-Security $orbit_hsts always;
 EOF
+  _csp_header 8
+}
+
+# ── Content-Security-Policy por app ──────────────────────────────────────
+# "csp": "default-src 'self'; …" en el orbit.json, y "csp_report_only": true
+# para mandarla como Content-Security-Policy-Report-Only. Una CSP es una
+# política por sitio —lo que carga cada web es suyo—, así que no puede vivir en
+# el snippet común; y como un add_header en una location anula los heredados,
+# sale en el server Y en cada sitio donde sale _sec_headers.
+#
+# El valor acaba entre comillas dobles dentro de un vhost, y el fichero se
+# enlaza en sites-enabled antes del 'nginx -t': uno mal escrito tumbaría la
+# configuración de TODAS las apps (§18.9b, las rutas del orbit.json). Por eso
+# se valida antes de escribir nada, y se rechaza en vez de «arreglar»: las
+# comillas dobles, la barra invertida, '$' (variable de nginx), llaves, un ';'
+# final, los saltos de línea y lo que no es texto.
+CSP_VALUE=""; CSP_RO=""; CSP_WHY=""
+_csp_check() { # _csp_check <valor>  -> 0 si vale; si no, 1 y el motivo en CSP_WHY
+  local v="$1"
+  CSP_WHY=""
+  if (( ${#v} > 4096 )); then CSP_WHY="$(t "pasa de 4096 caracteres")"; return 1; fi
+  if [[ "$v" == *[[:cntrl:]]* ]]; then CSP_WHY="$(t "lleva saltos de línea o caracteres de control")"; return 1; fi
+  if [[ "$v" == *[\"\\\$\{\}]* ]]; then CSP_WHY="$(t "no puede llevar comillas dobles, barras invertidas, «\$», «{» ni «}»")"; return 1; fi
+  v="${v%"${v##*[![:space:]]}"}"
+  if [[ "$v" == *";" ]]; then CSP_WHY="$(t "no puede acabar en «;»")"; return 1; fi
+  return 0
+}
+
+_csp_load() { # _csp_load <release>  -> CSP_VALUE y CSP_RO; 1 si la política no vale
+  local rel="$1" f v ty
+  CSP_VALUE=""; CSP_RO=""; CSP_WHY=""
+  f="$(_app_root "$rel")/orbit.json"
+  [[ -f "$f" ]] || f="$rel/orbit.json"
+  [[ -f "$f" ]] || return 0
+  # Sin jq no se aplica ningún descriptor (_read_descriptor ya lo avisa).
+  command -v jq >/dev/null || return 0
+  jq -e . "$f" >/dev/null 2>&1 || return 0
+  ty="$(jq -r 'if has("csp") then (.csp | type) else "absent" end' "$f" 2>/dev/null || true)"
+  case "$ty" in
+    absent|null) return 0 ;;
+    string) ;;
+    *) CSP_WHY="$(t "tiene que ser un texto")"; return 1 ;;
+  esac
+  v="$(jq -r '.csp' "$f" 2>/dev/null || true)"
+  # Los blancos de los extremos no cuentan: "  " es no haber puesto nada.
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  [[ -n "$v" ]] || return 0
+  _csp_check "$v" || return 1
+  CSP_VALUE="$v"
+  [[ "$(jq -r '.csp_report_only == true' "$f" 2>/dev/null || true)" == "true" ]] && CSP_RO="yes"
+  return 0
+}
+
+_csp_header() { # _csp_header [sangría]
+  [[ -n "${CSP_VALUE:-}" ]] || return 0
+  local name="Content-Security-Policy"
+  [[ "${CSP_RO:-}" == "yes" ]] && name="Content-Security-Policy-Report-Only"
+  printf '%*sadd_header %s "%s" always;\n' "${1:-8}" "" "$name" "$CSP_VALUE"
 }
 
 # El motivo se sirve aparte y la página lo incluye con SSI, de forma que
@@ -4971,6 +5090,16 @@ nginx_vhost() {
   # despliegue muerto a mitad no puede dejar el conf mintiendo sobre el puerto.
   [[ -n "${NGINX_PORT_OVERRIDE:-}" ]] && A_PORT="$NGINX_PORT_OVERRIDE"
   local names="$A_DOMAIN"; [[ -n "$A_ALIASES" ]] && names="$names $A_ALIASES"
+  # La CSP de la release que se sirve. Se valida en el despliegue, antes de
+  # activar nada; aquí es la red de seguridad para quien regenere el vhost con
+  # un orbit.json que no pasó por ahí (rollback, 'nginx-rebuild').
+  CSP_VALUE=""; CSP_RO=""
+  if [[ "$A_TYPE" != "redirect" && -L "$(app_current "$A_NAME")" ]]; then
+    _csp_load "$(app_current "$A_NAME")" \
+      || die "orbit.json: la política 'csp' no vale (%s). No toco el vhost de %s." "$CSP_WHY" "$A_NAME"
+  fi
+  local csp_srv=""
+  [[ -z "$CSP_VALUE" ]] || csp_srv=$'\n'"$(_csp_header 4)"
   local body
   case "$A_TYPE" in
     static) body="$(_body_static)" ;;
@@ -5028,7 +5157,7 @@ server {
     server_name $names;
 $absredir
     include /etc/nginx/snippets/orbit-acme.conf;
-    include /etc/nginx/snippets/orbit-security.conf;
+    include /etc/nginx/snippets/orbit-security.conf;$csp_srv
     access_log $(nginx_log_access "$A_NAME") orbit;
 
     # Dos excepciones a la redirección a HTTPS, y se resuelven con el patrón de
@@ -5071,7 +5200,7 @@ $absredir
     # El mismo valor, para las location que repiten las cabeceras: ver _sec_headers.
     set \$orbit_hsts "max-age=31536000; includeSubDomains";
 
-    include /etc/nginx/snippets/orbit-security.conf;
+    include /etc/nginx/snippets/orbit-security.conf;$csp_srv
     access_log $(nginx_log_access "$A_NAME") orbit;
     error_log  $(nginx_log_error "$A_NAME") warn;
     limit_conn orbit_conn 60;
@@ -5089,7 +5218,7 @@ $absredir
     set \$orbit_hsts "";
 
     include /etc/nginx/snippets/orbit-acme.conf;
-    include /etc/nginx/snippets/orbit-security.conf;
+    include /etc/nginx/snippets/orbit-security.conf;$csp_srv
     access_log $(nginx_log_access "$A_NAME") orbit;
     error_log  $(nginx_log_error "$A_NAME") warn;
     limit_conn orbit_conn 60;
@@ -7377,6 +7506,13 @@ cmd_deploy() {
     rm -rf "$rel"
     DEP_ERR="$(t "faltan variables obligatorias: %s" "$ENV_MISSING_REQ")"
     die "Faltan variables obligatorias (%s). Nada tocado: la versión anterior sigue en producción." "$ENV_MISSING_REQ"
+  fi
+  # La CSP del orbit.json, antes de tocar nada: una que no vale tumbaría el
+  # vhost, y con él la configuración de nginx de todas las apps.
+  if ! _csp_load "$rel"; then
+    rm -rf "$rel"
+    DEP_ERR="$(t "la política 'csp' del orbit.json no vale: %s" "$CSP_WHY")"
+    die "orbit.json: la política 'csp' no vale (%s). Nada tocado: la versión anterior sigue en producción." "$CSP_WHY"
   fi
   _read_repo_runtime "$rel"
   # render_nginx recarga la app desde disco y se llevaría por delante lo que se
@@ -9800,6 +9936,7 @@ cmd_init() { # orbit init [directorio] [--force]
   # release, y 'env' es lo que hace falta para arrancar. Ver ARCHITECTURE §22.
   info "Puedes añadirle a mano 'shared' (lo que la app escribe) y 'env' (sus variables)."
   info "Revísalo, súbelo al repositorio, y el despliegue lo leerá."
+  [[ "$A_TYPE" == "static" ]] && info "Y 'csp' (con 'csp_report_only': true para probarla) añade una Content-Security-Policy a la web."
   return 0
 }
 
@@ -17928,6 +18065,15 @@ _i18n_en() {
     ["El .env de '%s' (%s) pasa por un enlace simbólico. No lo toco: lo cambió alguien que no es Orbit."]="The .env of '%s' (%s) goes through a symlink. Not touching it: someone other than Orbit changed it."
     ["El valor de %s %s."]="The value of %s %s."
     ["El valor lleva saltos de línea, y en un .env cada variable es una línea. Un JSON se puede guardar compacto; una clave PEM, con los saltos escritos como \\n."]="The value contains line breaks, and in a .env each variable is one line. Store JSON compact; a PEM key with the breaks written as \\n."
+    ["Y 'csp' (con 'csp_report_only': true para probarla) añade una Content-Security-Policy a la web."]="And 'csp' (with 'csp_report_only': true to try it out) adds a Content-Security-Policy to the site."
+    ["orbit.json: la política 'csp' no vale (%s). Nada tocado: la versión anterior sigue en producción."]="orbit.json: the 'csp' policy is not valid (%s). Nothing touched: the previous version is still in production."
+    ["orbit.json: la política 'csp' no vale (%s). No toco el vhost de %s."]="orbit.json: the 'csp' policy is not valid (%s). I am not touching the vhost of %s."
+    ["la política 'csp' del orbit.json no vale: %s"]="the orbit.json 'csp' policy is not valid: %s"
+    ["pasa de 4096 caracteres"]="is longer than 4096 characters"
+    ["lleva saltos de línea o caracteres de control"]="contains line breaks or control characters"
+    ["no puede llevar comillas dobles, barras invertidas, «$», «{» ni «}»"]="cannot contain double quotes, backslashes, '$', '{' or '}'"
+    ["no puede acabar en «;»"]="cannot end in ';'"
+    ["tiene que ser un texto"]="must be a string"
     ["Faltan variables obligatorias (%s). Nada tocado: la versión anterior sigue en producción."]="Required variables are missing (%s). Nothing touched: the previous version is still live."
     ["orbit deploy: %s espera CLAVE=valor, y «%s» no lo es."]="orbit deploy: %s expects KEY=value, and «%s» isn't."
     ["orbit deploy: no puedo leer «%s»."]="orbit deploy: cannot read «%s»."

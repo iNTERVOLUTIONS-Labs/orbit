@@ -1576,12 +1576,57 @@ A_NAME="nginxtest"; A_PORT="3001"
 # entrar en location / y responde 500 en todo el sitio en vez de 404 en una ruta.
 A_TYPE="static"; A_OUTDIR="dist"; A_SPA="yes"; A_APPDIR="."
 body="$(_body_static)"
-grep -q 'try_files \$uri \$uri/index.html \$uri.html \$uri/ @spa;' <<<"$body" \
+grep -q 'try_files \$uri \$uri/index.html \$uri.html @spa;' <<<"$body" \
   && check "spa sin bucle" "si" "si" || check "spa sin bucle" "si" "no"
 grep -q 'location @spa' <<<"$body" && grep -q 'try_files /index.html =404;' <<<"$body" \
   && check "spa termina en 404" "si" "si" || check "spa termina en 404" "si" "no"
 
 # Un estático que no es SPA no debe ganar la named location.
+A_SPA="no"; body="$(_body_static)"
+# Sin '$uri/': un directorio sin index daba 403. La barra final va a su propia
+# named location, que redirige a la ruta sin barra.
+grep -q 'try_files \$uri \$uri/index.html \$uri.html @orbit_noslash;' <<<"$body" \
+  && check "sin \$uri/, a @orbit_noslash" "si" "si" || check "sin \$uri/, a @orbit_noslash" "si" "no"
+grep -q '\$uri/ ' <<<"$(grep 'try_files' <<<"$body")" \
+  && check "ningún try_files con \$uri/" "no" "si" || check "ningún try_files con \$uri/" "no" "no"
+grep -q 'rewrite ^(/.+)/\$ \$1 permanent;' <<<"$body" \
+  && check "301 a la ruta sin barra" "si" "si" || check "301 a la ruta sin barra" "si" "no"
+# En una SPA no hay redirección: la ruta es del router.
+A_SPA="yes"; body="$(_body_static)"
+grep -q 'orbit_noslash' <<<"$body" && check "spa: sin redirección" "no" "si" || check "spa: sin redirección" "no" "no"
+A_SPA="no"; A_PHP=""; body="$(_body_static)"
+grep -q 'default_type "text/markdown; charset=utf-8"' <<<"$body" \
+  && check "markdown con su tipo" "si" "si" || check "markdown con su tipo" "si" "no"
+# En una raíz con PHP, los .md se niegan (_php_root_denies) y no se publican.
+A_PHP="yes"; A_OUTDIR="."; body="$(_body_static)"
+grep -q 'text/markdown' <<<"$body" && check "php en la raíz: sin markdown" "no" "si" || check "php en la raíz: sin markdown" "no" "no"
+A_PHP=""; A_OUTDIR="dist"
+
+# La CSP del orbit.json: lo que vale y lo que se rechaza antes de escribir el vhost.
+_csp_ok()  { _csp_check "$1" && echo si || echo no; }
+check "csp: normal"                 "si" "$(_csp_ok "default-src 'self'; img-src 'self' data: https://x.test")"
+check "csp: comillas dobles"        "no" "$(_csp_ok 'default-src "self"')"
+check "csp: barra invertida"        "no" "$(_csp_ok 'default-src \\self')"
+check "csp: dólar"                  "no" "$(_csp_ok 'default-src $host')"
+check "csp: llave abierta"          "no" "$(_csp_ok "default-src 'self' {")"
+check "csp: llave cerrada"          "no" "$(_csp_ok "default-src 'self' }")"
+check "csp: punto y coma final"     "no" "$(_csp_ok "default-src 'self';")"
+check "csp: ';' final con blancos"  "no" "$(_csp_ok "default-src 'self';  ")"
+check "csp: salto de línea"         "no" "$(_csp_ok $'default-src \'self\'\nadd_header X y')"
+check "csp: tabulador"              "no" "$(_csp_ok $'default-src\t\'self\'')"
+check "csp: 4096 vale"              "si" "$(_csp_ok "$(printf 'a%.0s' $(seq 1 4096))")"
+check "csp: 4097 no"                "no" "$(_csp_ok "$(printf 'a%.0s' $(seq 1 4097))")"
+CSPD="$TMP/csprel"; mkdir -p "$CSPD"; A_APPDIR="."
+_csp_try() { printf '%s\n' "$1" > "$CSPD/orbit.json"; _csp_load "$CSPD" && echo "ok:$CSP_VALUE|$CSP_RO" || echo "no"; }
+if command -v jq >/dev/null; then
+  check "csp load: valor"           "ok:default-src 'self'|"     "$(_csp_try '{"type":"static","csp":"default-src '"'"'self'"'"'"}')"
+  check "csp load: informe"         "ok:default-src 'self'|yes"  "$(_csp_try '{"csp":"default-src '"'"'self'"'"'","csp_report_only":true}')"
+  check "csp load: informe solo"    "ok:|"                       "$(_csp_try '{"csp_report_only":true}')"
+  check "csp load: vacía"           "ok:|"                       "$(_csp_try '{"csp":"   "}')"
+  check "csp load: no es texto"     "no"                         "$(_csp_try '{"csp":["a"]}')"
+  check "csp load: comillas"        "no"                         "$(_csp_try '{"csp":"a \"b\""}')"
+  check "csp load: sin clave"       "ok:|"                       "$(_csp_try '{"type":"static"}')"
+fi
 A_SPA="no"; body="$(_body_static)"
 grep -q '@spa' <<<"$body" && check "sin spa, sin @spa" "no" "si" || check "sin spa, sin @spa" "no" "no"
 
