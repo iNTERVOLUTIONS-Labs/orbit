@@ -486,7 +486,7 @@ mkdir -p "$SKA/site/dist/_astro" "$SKB/site/dist/_astro" "$SKA/site/dist/vieja"
 printf 'portada A\n'                 > "$SKA/site/dist/index.html"
 printf 'portada B\n'                 > "$SKB/site/dist/index.html"
 printf 'B no existe\n'               > "$SKB/site/dist/404.html"
-printf 'chunk de A\n'                > "$SKA/site/dist/_astro/a.Ab12.js"
+printf 'chunk de A\n'                > "$SKA/site/dist/_astro/a.Ab12Cd34.js"
 printf 'chunk de B\n'                > "$SKB/site/dist/_astro/b.Cd34.js"
 printf 'estilo de A\n'               > "$SKA/site/dist/_astro/comun.css"
 printf 'estilo de B\n'               > "$SKB/site/dist/_astro/comun.css"
@@ -604,8 +604,44 @@ mkapp procqwik node 1 "procqwik.test"
 A_ASSETS='/build/:dist /assets/:dist'; save_app
 for app in procnuxt procqwik; do install_vhost "$app"; done
 
+# Web estática de las que dejan Astro con format "file" (es.html + es/), Vite…
+# Cubre la barra final, el markdown, la caché por nombre con hash y la CSP que
+# declara el orbit.json. Los ficheros de nombre «sin hash» son los que cambian
+# de contenido entre releases sin cambiar de nombre.
+PTR="$TMP/apps/astro/releases/r1"
+mkdir -p "$PTR/es" "$PTR/dir" "$PTR/_astro" "$PTR/fonts" "$PTR/pagefind"
+printf 'portada astro\n'      > "$PTR/index.html"
+printf 'astro no existe\n'    > "$PTR/404.html"
+printf 'pagina es\n'          > "$PTR/es.html"
+printf 'otra de es\n'         > "$PTR/es/other.html"
+printf 'pagina de dir\n'      > "$PTR/dir/index.html"
+printf '# hola\n'             > "$PTR/x.md"
+printf 'body{}\n'             > "$PTR/_astro/Base.jLhV-p7P.css"
+printf 'x\n'                  > "$PTR/_astro/Base.astro_astro_type_script_index_0_lang.BT5XGmD_.js"
+printf 'x\n'                  > "$PTR/_astro/index-BqX9fK2a.js"
+printf 'x\n'                  > "$PTR/fonts/Outfit-latin-variable.woff2"
+printf 'x\n'                  > "$PTR/pagefind/pagefind.js"
+printf '<svg/>\n'             > "$PTR/favicon.svg"
+printf '%s\n' "{\"type\":\"static\",\"csp\":\"default-src 'self'; img-src 'self' data:\"}" > "$PTR/orbit.json"
+ln -sfn "$PTR" "$TMP/apps/astro/current"
+mkapp astro static "" "astro.test"
+A_OUTDIR="."; A_SPA="no"; A_PHP=""; save_app
+issue_cert astro.test
+
+# El mismo sitio con la CSP en modo informe, y con una CSP que no vale.
+for extra in cspro cspmal; do
+  mkdir -p "$TMP/apps/$extra/releases/r1"
+  printf 'portada\n' > "$TMP/apps/$extra/releases/r1/index.html"
+  printf 'body{}\n'  > "$TMP/apps/$extra/releases/r1/a.css"
+  ln -sfn "$TMP/apps/$extra/releases/r1" "$TMP/apps/$extra/current"
+  mkapp "$extra" static "" "$extra.test"; A_OUTDIR="."; A_SPA="no"; A_PHP=""; save_app
+done
+printf '%s\n' '{"type":"static","csp":"default-src '"'"'none'"'"'","csp_report_only":true}' \
+  > "$TMP/apps/cspro/releases/r1/orbit.json"
+printf '%s\n' '{"type":"static","csp":"default-src \"self\""}' > "$TMP/apps/cspmal/releases/r1/orbit.json"
+
 for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp \
-           skew spaskew nextapp caida caidasin; do install_vhost "$app"; done
+           skew spaskew nextapp caida caidasin astro cspro; do install_vhost "$app"; done
 
 # El servidor por defecto, igual que lo escribe install.sh. Va en 000- para que
 # nginx lo vea antes que los vhosts de las apps, que es de donde salía el bug:
@@ -1165,7 +1201,7 @@ check "443: '/' trae las seis"      "6" "$(wc -w <<<"$RAIZ443" | tr -d ' ')"
 check "443: el .css, las mismas"    "$RAIZ443" \
   "$(cabeceras --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/a.css")"
 check "443: y su Cache-Control"     "1" \
-  "$(curl -skI --noproxy '*' -m 5 --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/a.css" | grep -ci '^cache-control: public, immutable')"
+  "$(curl -skI --noproxy '*' -m 5 --resolve "concert.test:$HTTPS_PORT:127.0.0.1" "https://concert.test:$HTTPS_PORT/a.css" | grep -ci '^cache-control: public, max-age=86400')"
 # Por el 80, '/' no lleva HSTS y el estático tampoco puede llevarlo: el cuerpo
 # del vhost es el mismo en los dos server, y lo que cambia es la variable.
 RAIZ80="$(cabeceras -H 'Host: sincert.test' "http://127.0.0.1:$HTTP_PORT/")"
@@ -1279,24 +1315,84 @@ else
     "$(BODY -H 'Host: aislada.test' "http://127.0.0.1:$HTTP_PORT/")"
 fi
 
+section "Rutas con barra final, markdown, caché por hash y CSP"
+SKU="http://127.0.0.1:$HTTP_PORT"
+# X-Forwarded-Proto: la web tiene certificado y el 80 redirige; así se llega al cuerpo.
+AS=(-H 'Host: astro.test' -H 'X-Forwarded-Proto: https')
+loc() { curl -s --noproxy '*' -o /dev/null -w '%{http_code} %{redirect_url}' -m 5 "$@" | sed 's/ $//'; }
+hdr() { curl -sI --noproxy '*' -m 5 "$@" | tr -d '\r'; }
+# El 403 de nginx: el directorio es/ existe sin index.html y '$uri/' lo listaba.
+check "es/ -> 301 a /es"            "301 /es"   "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code} %header{location}' -m 5 "${AS[@]}" "$SKU/es/")"
+check "es/ con query la conserva"   "/es?a=1&b=2" "$(curl -s --noproxy '*' -o /dev/null -w '%header{location}' -m 5 "${AS[@]}" "$SKU/es/?a=1&b=2")"
+check "es -> 200"                   "200"       "$(H "${AS[@]}" "$SKU/es")"
+check "es -> su página"             "pagina es" "$(BODY "${AS[@]}" "$SKU/es")"
+check "es/other -> 200"             "200"       "$(H "${AS[@]}" "$SKU/es/other")"
+check "dir/ sirve su index"         "200 pagina de dir" "$(H "${AS[@]}" "$SKU/dir/") $(BODY "${AS[@]}" "$SKU/dir/")"
+check "dir sin barra, también"      "200"       "$(H "${AS[@]}" "$SKU/dir")"
+# Un 404 de verdad con barra final da un salto a la ruta sin barra, y ahí sale su página.
+check "nope/ -> 301 a /nope"        "301 /nope" "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code} %header{location}' -m 5 "${AS[@]}" "$SKU/nope/")"
+check "nope/ -> 404 con su página"  "404 astro no existe" "$(H -L "${AS[@]}" "$SKU/nope/") $(BODY -L "${AS[@]}" "$SKU/nope/")"
+check "nope -> 404"                 "404"       "$(H "${AS[@]}" "$SKU/nope")"
+check "la raiz no redirige"         "200"       "$(H "${AS[@]}" "$SKU/")"
+check "ruta con espacio y barra"    "301 /a%20b" "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code} %header{location}' -m 5 "${AS[@]}" "$SKU/a%20b/")"
+# Una SPA no redirige nada: un directorio sin index cae en el shell, nunca 403.
+mkdir -p "$TMP/apps/spa/releases/r1/carpeta"; printf 'x\n' > "$TMP/apps/spa/releases/r1/carpeta/otra.html"
+chmod -R a+rX "$TMP/apps/spa"
+SPAH=(-H 'Host: spa.test' -H 'X-Forwarded-Proto: https')
+check "spa: dir sin index, shell"   "200 aplicacion de una pagina" \
+  "$(H "${SPAH[@]}" "$SKU/carpeta/") $(BODY "${SPAH[@]}" "$SKU/carpeta/")"
+# Markdown: se muestra, no se descarga.
+MDH="$(hdr "${AS[@]}" "$SKU/x.md")"
+check "md: tipo"                    "content-type: text/markdown; charset=utf-8" "$(grep -i '^content-type:' <<<"$MDH" | tr 'A-Z' 'a-z')"
+check "md: nosniff"                 "1" "$(grep -ci '^x-content-type-options: nosniff' <<<"$MDH")"
+check "md: un .md que falta"        "404" "$(H "${AS[@]}" "$SKU/falta.md")"
+# Caché: con hash, inmutable; sin hash, un día; HTML, no-cache.
+for f in /_astro/Base.jLhV-p7P.css /_astro/Base.astro_astro_type_script_index_0_lang.BT5XGmD_.js /_astro/index-BqX9fK2a.js; do
+  check "hash: $f" "1 1" \
+    "$(hdr "${AS[@]}" "$SKU$f" | grep -ci '^cache-control: public, immutable') $(hdr "${AS[@]}" "$SKU$f" | grep -ci '^cache-control: max-age=31536000')"
+done
+for f in /fonts/Outfit-latin-variable.woff2 /pagefind/pagefind.js /favicon.svg; do
+  check "sin hash: $f" "cache-control: public, max-age=86400" \
+    "$(hdr "${AS[@]}" "$SKU$f" | grep -i '^cache-control:' | tr 'A-Z' 'a-z')"
+done
+check "html: no-cache"              "cache-control: no-cache" "$(hdr "${AS[@]}" "$SKU/" | grep -i '^cache-control:' | tr 'A-Z' 'a-z')"
+check "html sin ext: no-cache"      "cache-control: no-cache" "$(hdr "${AS[@]}" "$SKU/es" | grep -i '^cache-control:' | tr 'A-Z' 'a-z')"
+# La anterior: con hash o sin él, la misma política.
+SKPREV="$(hdr -H 'Host: skew.test' "$SKU/_astro/a.Ab12Cd34.js")"
+check "anterior con hash, inmutable" "1" "$(grep -ci '^cache-control: public, immutable' <<<"$SKPREV")"
+# CSP del orbit.json: en el HTML, en los estáticos, en el .md y en el 404.
+CSP="content-security-policy: default-src 'self'; img-src 'self' data:"
+for f in / /es /_astro/Base.jLhV-p7P.css /fonts/Outfit-latin-variable.woff2 /x.md /favicon.svg; do
+  check "csp en $f" "$CSP" "$(hdr "${AS[@]}" "$SKU$f" | grep -i '^content-security-policy:' | tr 'A-Z' 'a-z')"
+done
+check "csp en el 404"               "1" "$(hdr "${AS[@]}" "$SKU/nope" | grep -ci '^content-security-policy:')"
+check "csp en la 301"               "1" "$(hdr "${AS[@]}" "$SKU/es/" | grep -ci '^content-security-policy:')"
+check "sin csp, sin cabecera"       "0" "$(hdr -H 'Host: sincert.test' "$SKU/" | grep -ci '^content-security-policy')"
+check "informe: la cabecera"        "1" "$(hdr -H 'Host: cspro.test' "$SKU/" | grep -ci '^content-security-policy-report-only: default-src .none.')"
+check "informe: no la de bloqueo"   "0" "$(hdr -H 'Host: cspro.test' "$SKU/" | grep -ci '^content-security-policy:')"
+check "informe: en el css"          "1" "$(hdr -H 'Host: cspro.test' "$SKU/a.css" | grep -ci '^content-security-policy-report-only:')"
+# Una CSP rechazada aborta antes de escribir el vhost.
+( nginx_vhost cspmal >/dev/null 2>&1 ); check "csp con comillas dobles: aborta" "1" "$?"
+
 section "Los recursos de la release anterior siguen sirviéndose"
 SK=(-H 'Host: skew.test')
 SKU="http://127.0.0.1:$HTTP_PORT"
-check "chunk de la anterior"         "200"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
-check "y es el de la anterior"       "chunk de A"   "$(BODY "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "chunk de la anterior"         "200"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12Cd34.js")"
+check "y es el de la anterior"       "chunk de A"   "$(BODY "${SK[@]}" "$SKU/_astro/a.Ab12Cd34.js")"
 check "el de la activa, igual"       "chunk de B"   "$(BODY "${SK[@]}" "$SKU/_astro/b.Cd34.js")"
 # Si los dos lo tienen, manda la activa: la anterior es un repuesto.
 check "si están los dos, la activa"  "estilo de B"  "$(BODY "${SK[@]}" "$SKU/_astro/comun.css")"
 # El de la anterior es tan inmutable como el de la activa —lleva hash—, y
 # lleva las mismas cabeceras de seguridad.
-SKH="$(curl -sI --noproxy '*' -m 5 "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+SKH="$(curl -sI --noproxy '*' -m 5 "${SK[@]}" "$SKU/_astro/a.Ab12Cd34.js")"
 check "con caché inmutable"          "1" "$(grep -ci '^cache-control: public, immutable' <<<"$SKH")"
 check "y con nosniff"                "1" "$(grep -ci '^x-content-type-options: nosniff' <<<"$SKH")"
 check "la portada es la activa"      "portada B"    "$(BODY "${SK[@]}" "$SKU/")"
 # Lo que no se puede servir de la anterior, aunque esté ahí.
-check "una ruta, nunca de la anterior" "404"        "$(H "${SK[@]}" "$SKU/vieja/")"
+# '/vieja/' redirige a '/vieja' (barra final) y ahí es un 404 de verdad: se sigue.
+check "una ruta, nunca de la anterior" "404"        "$(H -L "${SK[@]}" "$SKU/vieja/")"
 check "ni un .html"                  "404"          "$(H "${SK[@]}" "$SKU/suelta.html")"
-check "sale el 404.html de la activa" "B no existe" "$(BODY "${SK[@]}" "$SKU/vieja/")"
+check "sale el 404.html de la activa" "B no existe" "$(BODY -L "${SK[@]}" "$SKU/vieja/")"
 check "un recurso que no está en ninguna" "404"     "$(H "${SK[@]}" "$SKU/_astro/nada.js")"
 check "también con su 404.html"      "B no existe"  "$(BODY "${SK[@]}" "$SKU/_astro/nada.js")"
 check ".env de la anterior"          "403"          "$(H "${SK[@]}" "$SKU/.env")"
@@ -1379,7 +1475,7 @@ check "caída: y la portada, 502"     "502"      "$(H "${PQ[@]}" "$SKU/")"
 # Y cuando la poda se lleva la anterior, el enlace queda colgando y el recurso
 # es un 404 normal: nada que limpiar en nginx.
 rm -rf "$SKA"
-check "podada la anterior, 404"      "404"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12.js")"
+check "podada la anterior, 404"      "404"          "$(H "${SK[@]}" "$SKU/_astro/a.Ab12Cd34.js")"
 check "y la activa sigue igual"      "chunk de B"   "$(BODY "${SK[@]}" "$SKU/_astro/b.Cd34.js")"
 
 section "La página de 404 de la web"

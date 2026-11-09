@@ -276,6 +276,26 @@ run cmd_deploy web >/dev/null 2>&1
 check "carpetas distintas" "no" "$([[ "$(current_release)" == "$PREV" ]] && echo si || echo no)"
 check "la anterior sobrevive" "version seis" "$(cat "$BASE/releases/$PREV/index.html")"
 
+section "La CSP del orbit.json, validada antes de tocar producción"
+if command -v jq >/dev/null; then
+  git -C "$ORIGIN" config user.email orbit@test
+  printf '%s\n' '{"type":"static","csp":"default-src '"'"'self'"'"'; img-src data:"}' > "$ORIGIN/orbit.json"
+  publish "con csp"
+  run cmd_deploy web >"$TMP/csp1" 2>&1; r=$?
+  [[ "$r" == 0 ]] || sed 's/^/      /' "$TMP/csp1"
+  check "una CSP válida despliega"     "0" "$r"
+  check "y sale en el vhost"           "1" "$(grep -c "add_header Content-Security-Policy \"default-src 'self'; img-src data:\" always;" "$TMP/vhost-web.conf" | awk '$1>=1{print 1}')"
+  GOOD="$(current_release)"; NREL="$(count_releases)"
+  printf '%s\n' '{"type":"static","csp":"default-src \"self\""}' > "$ORIGIN/orbit.json"
+  publish "con csp rota"
+  run cmd_deploy web >"$TMP/csp2" 2>&1; r=$?
+  check "una CSP con comillas dobles aborta" "1" "$r"
+  check "con un mensaje que lo dice"   "1" "$(grep -c "csp" "$TMP/csp2" | awk '$1>=1{print 1}')"
+  check "la activa no se mueve"        "$GOOD" "$(current_release)"
+  check "y no deja la release a medias" "$NREL" "$(count_releases)"
+  git -C "$ORIGIN" rm -q orbit.json && publish "sin orbit.json"
+fi
+
 section "De clonar a servir, de una tirada"
 # El camino que recorre alguien que monta un staging: clonar, rellenar el
 # .env, desplegar y quitar el mantenimiento. Cada pieza tenía su prueba; lo

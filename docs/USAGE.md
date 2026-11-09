@@ -812,7 +812,20 @@ Si prefieres no dejarlo a la inferencia, pon un `orbit.json` en la raíz del rep
 }
 ```
 
-Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared`, `watch`, `env`, `release`, `post_deploy`, `health`, `limits` y `cron`. Los seis últimos —y `shared` y `watch`— se vuelven a leer en **cada despliegue**, así que cambiarlos en el repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
+Campos admitidos: `type`, `appdir`, `build`, `start`, `outdir`, `spa`, `docroot`, `php`, `shared`, `watch`, `env`, `release`, `post_deploy`, `health`, `limits`, `cron`, `csp` y `csp_report_only`. Los seis últimos —y `shared` y `watch`— se vuelven a leer en **cada despliegue**, así que cambiarlos en el repo surte efecto sin recrear la app; el resto se fija al crearla. Con `type` presente, Orbit no infiere nada. Viaja con tu código, así que se revisa en el mismo PR que lo cambia.
+
+### Webs estáticas: rutas, caché y `csp`
+
+- **Barra final.** `/es/` redirige (301) a `/es` si no hay un `es/index.html`; con él, se sirve directo. Es lo que necesita el formato de ficheros de Astro (`es.html` y `es/`). Una SPA no redirige nada.
+- **Markdown.** Los `.md` se muestran (`text/markdown; charset=utf-8`) en vez de descargarse.
+- **Caché.** Los recursos con hash de build (`Base.jLhV-p7P.css`, `index-BqX9fK2a.js`) llevan un año e `immutable`; el resto (favicon, fuentes sin hash, `pagefind.js`) un día. El HTML se revalida siempre.
+- **CSP.** Declárala en el `orbit.json`:
+
+```json
+{ "type": "static", "csp": "default-src 'self'; img-src 'self' data:", "csp_report_only": true }
+```
+
+`csp_report_only` es opcional: con `true` se manda `Content-Security-Policy-Report-Only` y no bloquea nada, que es como conviene estrenarla. La política se lee de la release en cada despliegue y se valida antes de tocar nada: no puede llevar comillas dobles, `\`, `$`, `{`, `}`, acabar en `;`, ocupar más de 4096 caracteres ni tener saltos de línea. Si no vale, el despliegue se aborta y sigue la versión anterior.
 
 ### `shared`: lo que tu app escribe y no puede vivir en una release
 
