@@ -1589,7 +1589,7 @@ grep -q 'try_files \$uri \$uri/index.html \$uri.html @orbit_noslash;' <<<"$body"
   && check "sin \$uri/, a @orbit_noslash" "si" "si" || check "sin \$uri/, a @orbit_noslash" "si" "no"
 grep -q '\$uri/ ' <<<"$(grep 'try_files' <<<"$body")" \
   && check "ningún try_files con \$uri/" "no" "si" || check "ningún try_files con \$uri/" "no" "no"
-grep -q 'rewrite ^(/.+)/\$ \$1 permanent;' <<<"$body" \
+grep -qF 'rewrite "^(/[^/\x5c].*)/$" $1 permanent;' <<<"$body" \
   && check "301 a la ruta sin barra" "si" "si" || check "301 a la ruta sin barra" "si" "no"
 # En una SPA no hay redirección: la ruta es del router.
 A_SPA="yes"; body="$(_body_static)"

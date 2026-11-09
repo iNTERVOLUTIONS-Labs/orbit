@@ -1335,6 +1335,20 @@ check "nope/ -> 404 con su página"  "404 astro no existe" "$(H -L "${AS[@]}" "$
 check "nope -> 404"                 "404"       "$(H "${AS[@]}" "$SKU/nope")"
 check "la raiz no redirige"         "200"       "$(H "${AS[@]}" "$SKU/")"
 check "ruta con espacio y barra"    "301 /a%20b" "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code} %header{location}' -m 5 "${AS[@]}" "$SKU/a%20b/")"
+# Redirección abierta: '/\evil.com/' saldría como 'Location: /\evil.com', que un
+# navegador lee como '//evil.com'. Ninguna variante puede dar un Location que
+# empiece por '//' ni por '/\'; esas peticiones son un 404 de verdad.
+for ruta in '/%5Cevil.com/' '/%5cevil.com/' '//evil.com/' '/%2F%2Fevil.com/' '/%2f/evil.com/' '/%5C%5Cevil.com/' '/\evil.com/' '/%5Cevil.com/x/'; do
+  LOCH="$(curl -s --globoff --noproxy '*' -o /dev/null -w '%{http_code} %header{location}' -m 5 "${AS[@]}" "$SKU$ruta")"
+  case "$LOCH" in
+    *' //'*|*' /\\'*|*' /\'*) r="ABIERTA: $LOCH" ;;
+    *) r="cerrada" ;;
+  esac
+  check "sin redirección abierta: $ruta" "cerrada" "$r"
+done
+check "'/%5Cevil.com/' es un 404"   "404" "$(H "${AS[@]}" "$SKU/%5Cevil.com/")"
+# Cualquier ruta que empiece por «/\» o «//» es un 404, a cualquier profundidad.
+check "'/%5Cevil.com/x/' tampoco"   "404" "$(H "${AS[@]}" "$SKU/%5Cevil.com/x/")"
 # Una SPA no redirige nada: un directorio sin index cae en el shell, nunca 403.
 mkdir -p "$TMP/apps/spa/releases/r1/carpeta"; printf 'x\n' > "$TMP/apps/spa/releases/r1/carpeta/otra.html"
 chmod -R a+rX "$TMP/apps/spa"
