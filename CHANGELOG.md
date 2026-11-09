@@ -99,7 +99,13 @@ intentaba listar la carpeta: `/es/` daba **403** (existe `es/` sin `index.html`)
 y `/components/button/` daba 404. Sin `$uri/`, una petición con barra final
 —que no sea la raíz— y sin `<ruta>/index.html` va a `@orbit_noslash`, que
 contesta **301 a la misma ruta sin barra**, con la query y con `Location`
-relativo (el servidor tiene `absolute_redirect off`). `/es` sirve `es.html`;
+relativo (el servidor tiene `absolute_redirect off`). La redirección tiene una
+guarda contra la **redirección abierta**: el primer carácter tras la `/` no
+puede ser otra `/` ni una barra invertida, porque `/\evil.com/` (o
+`/%5Cevil.com/`, que nginx decodifica antes) saldría como `Location: /\evil.com`
+y un navegador lo lee como `//evil.com`, otro origen. Esas rutas son un 404
+(`[^/\x5c]` entre comillas: el lector de nginx se come una barra invertida de
+cada par). `/es` sirve `es.html`;
 `/dir/` con su `index.html` se sirve directo, sin salto. Un 404 de verdad con
 barra final da un salto y luego su página de 404. En una SPA sólo se quita
 `$uri/`: el fallback a `@spa` sigue y un directorio nunca da 403.

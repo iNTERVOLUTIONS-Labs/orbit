@@ -3957,6 +3957,30 @@ EOF
   done
 }
 
+# La named location de la barra final (ver _body_static). Heredoc con comillas:
+# nada se expande ni se interpreta, y es lo que hace falta para escribir una
+# barra invertida (un printf se la comería).
+#
+# Barra final sin página detrás: a la misma ruta sin barra, con la query. La
+# raíz no entra, y lo que no acaba en barra es un 404 de verdad, que sale por
+# el error_page de _notfound_location.
+#
+# El primer carácter tras la «/» no puede ser otra «/» ni una barra invertida:
+# '/\evil.com/' (o '/%5Cevil.com/', que nginx decodifica antes) saldría como
+# 'Location: /\evil.com', y un navegador lo lee como '//evil.com', otro origen:
+# una redirección abierta. Va entre comillas y con \x5c porque el lector de
+# nginx se come una barra invertida de cada par: '[^/\\]' llegaría al motor como
+# '[^/\]', una clase sin cerrar.
+_noslash_location() {
+cat <<'EOF'
+
+    location @orbit_noslash {
+        rewrite "^(/[^/\x5c].*)/$" $1 permanent;
+        return 404;
+    }
+EOF
+}
+
 # Markdown como texto, no como descarga. Sin tipo MIME para '.md', nginx lo
 # sirve como application/octet-stream y el navegador lo baja en vez de
 # mostrarlo. 'types {}' vacía la tabla de esta location y 'default_type' pone
@@ -4021,15 +4045,7 @@ $( if [[ "$A_SPA" == "yes" ]]; then printf '
 %s
         try_files /index.html =404;
     }
-' "$(_sec_headers)"; else printf '
-    # Barra final sin página detrás: a la misma ruta sin barra, con la query. La
-    # raíz no entra (^/.+/$), y lo que no acaba en barra es un 404 de verdad,
-    # que sale por el error_page de _notfound_location.
-    location @orbit_noslash {
-        rewrite ^(/.+)/$ $1 permanent;
-        return 404;
-    }
-'; fi )
+' "$(_sec_headers)"; else _noslash_location; fi )
 $(_md_location)
     # Con nombre de build (Astro 'Base.jLhV-p7P.css', Vite 'index-BqX9fK2a.js')
     # el fichero nunca cambia de contenido: un año, inmutable. La regex pide un
