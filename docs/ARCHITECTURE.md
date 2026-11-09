@@ -142,7 +142,7 @@ Mover `current` es atómico para el servidor y no para el visitante. Quien carg�
 La respuesta es nginx plano. Junto a `current` hay un segundo enlace, **`previous`**, que apunta a la release que servía justo antes, y la location de los recursos termina en ella en vez de en un 404:
 
 ```nginx
-location ~* \.(?:css|js|mjs|woff2?|…|wasm|map)$ {
+location ~* \.(?:css|js|mjs|woff2?|…|wasm|map)$ {    # (desde 1.5.1, dos: con hash y sin él, §7.4b)
     …
     try_files $uri @orbit_prev_assets;
 }
@@ -790,6 +790,18 @@ Adivinar es lo que hay cuando no queda otra. Que el repo lo diga es mejor que cu
 `try_files … /index.html` es una **redirección interna**: si el fichero no está, nginx vuelve a entrar en `location /`, vuelve a no encontrarlo y a las diez vueltas responde `rewrite or internal redirection cycle` con un **500 para todas las rutas**, incluidas las que sí existen. El peor modo de fallo posible: la web entera caída porque falta un fichero.
 
 El fallback va a una named location que termina en `=404`, así que un `index.html` ausente da un 404 honesto en esa ruta y el resto del sitio sigue en pie.
+
+### 7.4b La barra final, el markdown, la caché por hash y la CSP (1.5.1)
+
+Salió de auditar un Astro con `format: "file"` (`es.html` más `es/`).
+
+**`$uri/` fuera del `try_files`.** Con él, un directorio sin `index.html` se intentaba listar: `/es/` daba 403. Ahora la cadena acaba en `@orbit_noslash`, que hace `rewrite ^(/.+)/$ $1 permanent; return 404;`: una ruta con barra final que no es la raíz salta a la misma sin barra (el `rewrite` conserva la query; `absolute_redirect off` deja el `Location` relativo) y lo demás es un 404 que pasa por `_notfound_location`. Un `dir/index.html` lo resuelve el segundo candidato, sin salto. Costó una decisión: un 404 de verdad con barra (`/nope/`) da **un salto y luego el 404**, porque la named location no sabe si `/nope.html` existe; decidirlo exigiría un `map` a nivel de `http`, que es del instalador y no del vhost. En una SPA sólo se quita `$uri/`.
+
+**Markdown.** Una location regex `\.md$` con `types { }` y `default_type`. No se emite si `_php_root_served`: en esa raíz otra regex, anterior, niega los `.md` y la nueva no debe ganarle.
+
+**Caché por nombre.** Dos locations de recursos: la de hash (`~`, que distingue mayúsculas: `[.-](?=[A-Za-z0-9_-]*[A-Z0-9])[A-Za-z0-9_-]{8,}\.(?i:ext)$`) y la general. El criterio de «lleva hash» es heurístico: `foo-2024-report.css` también cuenta. Con `expires off` y un solo `add_header` el general no duplica `Cache-Control`. `_prev_location` tiene una variante por política (`assets` y `assets_plain`).
+
+**CSP.** `_csp_load` lee `csp` y `csp_report_only` del `orbit.json` de la release **servida** (como `php_dirs`) y `_csp_header` la emite en cada sitio de `_sec_headers` y en el `server`, porque un `add_header` de location anula los heredados. Se valida en el despliegue (antes de activar) y otra vez en `nginx_vhost`, para `rollback`/`nginx-rebuild`. No se guarda en `app.conf`: se relee de la release, así que un despliegue fallido no deja una política a medias.
 
 ---
 

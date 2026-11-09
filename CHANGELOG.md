@@ -87,6 +87,69 @@ Escribirlo con una prueba es lo que hace que el día que cambie sea porque algui
 - **Dos fallos propios, los dos del mismo tipo y los dos ya arreglados:** una función que devolvía dos valores capturada con `$( )`, donde el segundo se perdía en el subshell; y un contador al final de una tubería, que hacía que el `end` de `logs` anunciara siempre cero líneas. Es la trampa que obliga a `_top_measure` a dejar su resultado en globales, encontrada dos veces en un día.
 - **Y una que `bash -n` dio por buena:** un comentario con apóstrofos escrito **dentro** del programa de `awk`, que va entre comillas simples de bash. Las comillas casaban por casualidad y el script arrancaba. Lo cazó `shellcheck` con SC1078, que es exactamente para lo que está en el `Makefile`.
 
+## [1.5.1] - 2026-11-09
+
+Salió de auditar una web de Astro con `format: "file"` (`es.html` más una carpeta
+`es/`) desplegada por Orbit. Cuatro arreglos en el vhost de las webs estáticas.
+
+### La barra final ya no da 403 ni 404
+
+`try_files $uri $uri/index.html $uri.html $uri/` terminaba en `$uri/`, y nginx
+intentaba listar la carpeta: `/es/` daba **403** (existe `es/` sin `index.html`)
+y `/components/button/` daba 404. Sin `$uri/`, una petición con barra final
+—que no sea la raíz— y sin `<ruta>/index.html` va a `@orbit_noslash`, que
+contesta **301 a la misma ruta sin barra**, con la query y con `Location`
+relativo (el servidor tiene `absolute_redirect off`). La redirección tiene una
+guarda contra la **redirección abierta**: el primer carácter tras la `/` no
+puede ser otra `/` ni una barra invertida, porque `/\evil.com/` (o
+`/%5Cevil.com/`, que nginx decodifica antes) saldría como `Location: /\evil.com`
+y un navegador lo lee como `//evil.com`, otro origen. Esas rutas son un 404
+(`[^/\x5c]` entre comillas: el lector de nginx se come una barra invertida de
+cada par). `/es` sirve `es.html`;
+`/dir/` con su `index.html` se sirve directo, sin salto. Un 404 de verdad con
+barra final da un salto y luego su página de 404. En una SPA sólo se quita
+`$uri/`: el fallback a `@spa` sigue y un directorio nunca da 403.
+
+### Markdown como texto
+
+Los `.md` salían como `application/octet-stream` y el navegador los
+descargaba. Ahora `text/markdown; charset=utf-8`, con las cabeceras de
+seguridad y la guarda de mantenimiento. No se emite cuando la raíz del
+repositorio se sirve con PHP: ahí `_php_root_denies` los niega.
+
+### Caché por nombre, no por extensión
+
+Todo css/js/fuente/imagen salía `public, immutable` a un año, también
+`/favicon.svg`, `/fonts/Outfit-latin-variable.woff2` o `/pagefind/pagefind.js`,
+que cambian entre releases sin cambiar de nombre. Ahora sólo lo hace lo que
+lleva hash de build (`.` o `-` más 8 o más caracteres con al menos una
+mayúscula o un dígito, justo antes de la extensión: `Base.jLhV-p7P.css`,
+`index-BqX9fK2a.js`). El resto, `public, max-age=86400`. La release anterior
+tiene las dos variantes de respaldo. El HTML sale con `Cache-Control:
+no-cache`: se revalida siempre (el ETag hace barato el 304) y un despliegue se
+ve al instante.
+
+### `csp` en el `orbit.json`
+
+`"csp": "default-src 'self'; …"` añade `Content-Security-Policy` a la web, y
+`"csp_report_only": true` la manda como `Content-Security-Policy-Report-Only`.
+Sale en el `server` y en cada sitio donde ya salen las cabeceras de seguridad
+(un `add_header` en una location anula los heredados). Se valida **antes de
+tocar producción**: se rechazan comillas dobles, barra invertida, `$`, `{`, `}`,
+un `;` final, saltos de línea y caracteres de control, más de 4096 caracteres y
+cualquier valor que no sea texto. Un valor rechazado aborta el despliegue con la
+versión anterior intacta; no se «arregla» en silencio porque acaba dentro de un
+vhost que se enlaza antes del `nginx -t`.
+
+### Pruebas
+
+`nginx_test` (nginx de verdad: las rutas, el tipo del `.md`, la caché y la CSP
+en HTML, recursos, 404 y 301), `detect_test` (el cuerpo generado y la
+validación) y `deploy_test` (un despliegue con una CSP rota se aborta sin
+mover `current`). Dos pruebas existentes cambian de expectativa a propósito:
+los recursos de nombre corto ya no son inmutables, y un 404 con barra final
+pasa por el 301.
+
 ## [1.5.0] - 2026-11-05
 
 Una auditoría de lo añadido en 1.4.5–1.4.8 —los recursos de las apps con proceso, las métricas para Prometheus, `orbit admin`, los certificados de origen y los tokens de cuenta—, con el encargo explícito de romperlo y una lente por cada parte. Cada hallazgo se reprodujo antes de arreglarlo, y cada arreglo lleva una prueba que se pone en rojo sin él (comprobado mutando el código: 27 mutaciones, 26 en rojo; la que no, se dice abajo). Ver ARCHITECTURE §4.1, §6.5, §9.1 y §18.10b.

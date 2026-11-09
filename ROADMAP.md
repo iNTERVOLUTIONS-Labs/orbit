@@ -22,6 +22,7 @@ La versión que existe hoy.
 - ✅ UFW, fail2ban, systemd endurecido
 - ✅ Restauración de IPs reales de Cloudflare
 - ✅ Protección contra el bucle de redirecciones
+- ✅ Webs estáticas: barra final sin 403, markdown, caché por hash de build y `csp` por app en el `orbit.json` (1.5.1). Ver ARCHITECTURE §7.4b
 
 ---
 
