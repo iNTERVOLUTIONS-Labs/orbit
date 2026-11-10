@@ -284,8 +284,10 @@ ufw() { printf 'Status: inactive\n'; }
 check "y si ufw dice que no, es que no"       "1" "$(_service_activo ufw; echo $?)"
 # La comparación es contra el texto de ufw, que ufw traduce. Sin fijar el
 # idioma, un servidor en otra lengua diría que el cortafuegos está apagado.
+# Dentro de la función que lo decide: el firewall también lee 'ufw status', y
+# contar en todo el script confundía una cosa con la otra.
 check "se le pregunta en C"                   "1" \
-  "$(grep -c 'LC_ALL=C ufw status' "$ORBIT_ROOT/orbit")"
+  "$(declare -f _service_activo | grep -c 'LC_ALL=C ufw status')"
 # Y sin ufw instalado no se inventa nada.
 ufw() { return 127; }
 check "sin ufw, no está activo"               "1" "$(_service_activo ufw; echo $?)"

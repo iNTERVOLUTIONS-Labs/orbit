@@ -100,6 +100,12 @@ php_sock_path() { echo "$TMP/pool/orbit-$1.sock"; }
 # funciones, y una función mira la variable cuando la llaman.
 NGINX_AVAILABLE="$TMP/nginx/sites-available"
 NGINX_ENABLED="$TMP/nginx/sites-enabled"
+# Y conf.d, que se compone en el source a partir de NGINX_ENABLED, así que sin
+# esto apuntaba al /etc/nginx/conf.d de la máquina: los maps de las cabeceras
+# los escribe render_nginx, y una tanda lanzada como root los habría puesto en
+# el nginx de verdad.
+# shellcheck disable=SC2034  # la lee el orbit cargado
+NGINX_CONFD="$TMP/nginx/conf.d"
 # shellcheck disable=SC2034  # lo leen 'nginx_default_write' y doctor, en el orbit cargado arriba
 NGINX_DEFAULT_CONF="$NGINX_AVAILABLE/000-orbit-default"
 mkdir -p "$NGINX_AVAILABLE" "$NGINX_ENABLED"

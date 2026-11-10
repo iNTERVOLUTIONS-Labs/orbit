@@ -1703,7 +1703,10 @@ orbit firewall unlock    # abrir a todo el mundo
 ```
 
 ```bash
-orbit cf-update          # refrescar los rangos de IP de Cloudflare
+orbit cf-update          # refrescar los rangos de IP de Cloudflare (y los de ufw, si está bloqueado)
+orbit cf-purge on        # vaciar la caché de Cloudflare de la app tras cada despliegue
+orbit cf-purge token     # token propio con sólo «Zone → Cache Purge»
+orbit cf-purge now web   # vaciarla ya, sin desplegar
 orbit nginx-rebuild      # regenerar todos los vhosts
 ```
 

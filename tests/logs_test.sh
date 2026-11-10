@@ -123,6 +123,9 @@ cert_file() { echo "$NG/certs/$1.crt"; }
 # nginx es exactamente lo que el filtro sabe leer.
 FMT="$(grep -A1 "^log_format orbit" "$ORBIT_ROOT/install.sh" | tr -d '\n')"
 MIME=""; [[ -f /etc/nginx/mime.types ]] && MIME="    include /etc/nginx/mime.types;"
+# Los maps de las cabeceras de las apps con proceso: los escribe render_nginx
+# en conf.d, y sin ellos un vhost con proxy no pasa nginx -t.
+_nginx_headers_maps > "$NG/orbit-headers.conf"
 cat > "$NG/nginx.conf" <<EOF
 worker_processes 1;
 error_log $NG/logs/error.log warn;
@@ -140,6 +143,7 @@ $MIME
     limit_req_zone \$binary_remote_addr zone=orbit_general:1m rate=40r/s;
     limit_conn_zone \$binary_remote_addr zone=orbit_conn:1m;
     $FMT
+    include $NG/orbit-headers.conf;
     include $NG/vhosts/*.conf;
 }
 EOF

@@ -400,7 +400,7 @@ APP_ISOLATION="${APP_ISOLATION:-yes}"
 # después de cargar el conf y sin ':-'. install.sh la extrae de esta línea.
 # Cada PR la sube un parche —1.0.1 → 1.0.2, y de .9 se pasa al minor: 1.0.9 →
 # 1.1.0— ver el apartado «Versionado» de docs/DEVELOPMENT.md y CONTRIBUTING.md.
-ORBIT_VERSION="1.5.1"
+ORBIT_VERSION="1.5.2"
 # El puerto donde escucha nginx, para poder preguntarle a una app por HTTP
 # desde el propio servidor. Es 80 siempre —los vhosts que escribe Orbit no
 # escuchan en otro sitio— y está aquí para que las pruebas puedan levantar su
@@ -427,6 +427,7 @@ ORBIT_BIN="${ORBIT_BIN:-/usr/local/bin/orbit}"
 SUDOERS_ADMIN="${SUDOERS_ADMIN:-/etc/sudoers.d/orbit-admin}"
 TOP_INTERVAL="${TOP_INTERVAL:-2}"         # segundos entre refrescos de 'orbit top'
 BUILD_RECOVERY="${BUILD_RECOVERY:-yes}"   # reintentar un build fallido si se sabe arreglarlo
+CF_PURGE="${CF_PURGE:-no}"   # vaciar la caché de Cloudflare de la app tras desplegar (orbit cf-purge on)
 BUILD_UNFREEZE="no"                       # sólo durante un reintento; nunca se guarda
 # Un cerrojo por app para desplegar y revertir. Sin él, un 'orbit deploy' a mano
 # y la pasada del autodespliegue podían correr a la vez sobre la misma caché de
@@ -3782,6 +3783,65 @@ _cert_end_load() { # _cert_end_load <dominio> [fresh]
   CERT_END[$1]="$end"
 }
 
+# ── las cabeceras de seguridad delante de una app con proceso ─────────────
+# Una app con proceso suele traer sus propias cabeceras de seguridad —Next.js
+# con 'headers()', Django con SecurityMiddleware, Laravel con su middleware— y
+# nginx le añadía las suyas encima: dos X-Frame-Options, dos Referrer-Policy y
+# dos HSTS con valores distintos. Medido en un servidor de verdad: la app pedía
+# HSTS de dos años con 'preload' y Orbit uno sin él, y cada navegador se quedaba
+# con uno. Ahora **manda la de la app**: Orbit pone la suya sólo si la app no
+# trae ninguna. Es el mismo reparto que con la CSP: quien conoce la app decide,
+# y el que no ha decidido nada sigue protegido por defecto.
+#
+# Un map por cabecera: con la de la app vacía, el valor de Orbit; con valor,
+# vacío, y nginx no emite un 'add_header' cuyo valor es vacío. El HSTS va
+# además por '$https', igual que el resto del vhost: sólo por el 443.
+#
+# Viven en su propio fichero de conf.d, que escribe Orbit y no install.sh: así
+# llega a los servidores ya instalados con el siguiente despliegue, sin pasos
+# a mano. Las webs que sirve nginx directamente no lo usan: ahí no hay nadie
+# más que pueda poner una cabecera.
+_nginx_headers_conf() { echo "$NGINX_CONFD/02-orbit-headers.conf"; }
+
+_nginx_headers_maps() {
+cat <<'EOF'
+# Generado por Orbit: las cabeceras de seguridad delante de una app con
+# proceso. Si la app trae la suya manda la suya; si no, la de Orbit.
+map $upstream_http_x_content_type_options $orbit_h_xcto { "" "nosniff"; default ""; }
+map $upstream_http_x_frame_options $orbit_h_xfo { "" "SAMEORIGIN"; default ""; }
+map $upstream_http_referrer_policy $orbit_h_refpol { "" "strict-origin-when-cross-origin"; default ""; }
+map $upstream_http_permissions_policy $orbit_h_permpol { "" "geolocation=(), microphone=(), camera=(), interest-cohort=()"; default ""; }
+map $upstream_http_cross_origin_opener_policy $orbit_h_coop { "" "same-origin-allow-popups"; default ""; }
+map "$upstream_http_strict_transport_security|$https" $orbit_h_hsts { "|on" "max-age=31536000; includeSubDomains"; default ""; }
+EOF
+}
+
+# Escribe el fichero de los maps si falta o ha cambiado. Devuelve 1 si no ha
+# podido: entonces el vhost que los usa no pasará 'nginx -t', y render_nginx
+# deja el que había.
+_nginx_headers_ensure() {
+  local f; f="$(_nginx_headers_conf)"
+  [[ -f "$f" ]] && [[ "$(cat "$f")" == "$(_nginx_headers_maps)" ]] && return 0
+  mkdir -p "${f%/*}" 2>/dev/null || return 1
+  _nginx_headers_maps > "$f.new" 2>/dev/null || { rm -f "$f.new"; return 1; }
+  mv -f "$f.new" "$f"
+}
+
+# Las mismas seis que '_sec_headers', pero cediendo ante las de la app. Van en
+# cada location que hace proxy: un 'add_header' ahí anula los heredados del
+# server, así que tienen que estar todas, y la CSP de la app también.
+_proxy_sec_headers() {
+cat <<'EOF'
+        add_header X-Content-Type-Options    $orbit_h_xcto always;
+        add_header X-Frame-Options           $orbit_h_xfo always;
+        add_header Referrer-Policy           $orbit_h_refpol always;
+        add_header Permissions-Policy        $orbit_h_permpol always;
+        add_header Cross-Origin-Opener-Policy $orbit_h_coop always;
+        add_header Strict-Transport-Security $orbit_h_hsts always;
+EOF
+  _csp_header 8
+}
+
 _proxy_block() {
 cat <<EOF
         proxy_pass http://127.0.0.1:$A_PORT;
@@ -3798,6 +3858,7 @@ cat <<EOF
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
 EOF
+  _proxy_sec_headers
 }
 
 # ── la release anterior, para los recursos ──────────────────────────────
@@ -5265,6 +5326,9 @@ render_nginx() {
   # A un fichero aparte y luego en su sitio: si nginx_vhost muere a mitad, el
   # vhost que había sigue entero. Redirigido y no capturado con $(…), porque
   # nginx_vhost tiene que correr en esta shell —deja cargada la app—.
+  # Los maps de las cabeceras van antes que el vhost que los usa. Si no se
+  # pueden escribir, el 'nginx -t' de abajo lo para y se queda el anterior.
+  _nginx_headers_ensure || true
   nginx_vhost "$name" > "$f.new"
   mv -f "$f.new" "$f"
   # La página de «la app no contesta» tiene que existir antes de que nginx la
@@ -7892,6 +7956,7 @@ cmd_deploy() {
   A_HEALTH_PATH="$rt_hp"; A_HEALTH_TIMEOUT="$rt_ht"; A_LIMIT_MEM="$rt_lm"; A_LIMIT_CPU="$rt_lc"
   A_LASTDEPLOY="$(date -Iseconds) $sha"; save_app
   logline "deploy $name $stamp $sha"
+  _cf_purge_after "$name"
 
   # Nunca se aplican solas: una migración destructiva en un despliegue
   # automático es la forma más rápida de perder datos. Pero avisar es gratis.
@@ -9797,6 +9862,7 @@ cmd_rollback() {
   _app_unlock
   ok "Revertido a %s" "$target"
   logline "rollback $name $target"
+  _cf_purge_after "$name"
 }
 
 # ═══════════════════════════════════════════════════════ new app ══════════
@@ -10849,6 +10915,70 @@ _cf_zone_id() { # _cf_zone_id <nombre> -> id, o nada
     c="${c#*.}"
   done
   rm -f "$out"
+  return 0
+}
+
+# ── vaciar la caché de Cloudflare tras desplegar (§6.6) ────────────────────
+# Orbit sirve el HTML con 'no-cache' y un despliegue se ve al instante... salvo
+# que una regla de caché de Cloudflare guarde ese HTML en el borde, que es lo
+# que se hace para que una web estática no llegue al servidor en cada visita.
+# Entonces el despliegue tarda en verse lo que dure esa regla. Con CF_PURGE
+# encendido, después de cada despliegue y de cada vuelta atrás se vacía la
+# caché **de los dominios de la app y nada más** (purga por host: vale en el
+# plan gratuito, comprobado contra la API).
+#
+# El token: el de 'orbit cf-purge token' si lo hay —uno con sólo «Cache Purge»,
+# que es lo que se recomienda—, y si no, el de 'orbit cf-token' con ese permiso
+# añadido. Nunca tumba un despliegue: la web ya está publicada, y lo peor que
+# pasa sin purga es que tarde unos minutos en verse.
+CF_PURGE_INI="${CF_PURGE_INI:-}"
+_cf_purge_ini() {
+  if [[ -n "$CF_PURGE_INI" ]]; then printf '%s' "$CF_PURGE_INI"
+  elif [[ -r "$ETC_DIR/cloudflare-purge.ini" ]]; then printf '%s' "$ETC_DIR/cloudflare-purge.ini"
+  else printf '%s' "$ETC_DIR/cloudflare.ini"; fi
+}
+
+_cf_purge_enabled() { [[ "${CF_PURGE:-no}" == yes ]]; }
+
+# Vacía la caché de los dominios de una app (cargada). 0 si se vació todo, 1 si
+# algo falló; dice qué en ambos casos.
+_cf_purge_app() { # _cf_purge_app <app>
+  local ini d zid code out body rc=0
+  ini="$(_cf_purge_ini)"
+  [[ -r "$ini" ]] || { warn "No hay token de Cloudflare para vaciar la caché: 'orbit cf-purge token'."; return 1; }
+  local -A byzone=()
+  for d in $A_DOMAIN $A_ALIASES; do
+    [[ -n "$d" && "$d" != \** ]] || continue
+    zid="$(CF_INI="$ini" _cf_zone_id "$d")"
+    if [[ -z "$zid" ]]; then
+      warn "El token no ve la zona de %s en Cloudflare: su caché no se ha vaciado." "$d"; rc=1; continue
+    fi
+    byzone[$zid]+="$d "
+  done
+  out="$(mktemp)"; body="$(mktemp)"
+  for zid in "${!byzone[@]}"; do
+    # Los nombres ya pasaron por la validación de dominios al registrar la app:
+    # letras, dígitos, puntos y guiones. Nada que escapar en el JSON.
+    printf '{"hosts":[%s]}' "$(printf '"%s",' ${byzone[$zid]} | sed 's/,$//')" > "$body"
+    code="$(CF_INI="$ini" _cf_api POST "/zones/$zid/purge_cache" "$out" "$body")"
+    if [[ "$code" == 200 ]]; then
+      ok "Caché de Cloudflare vaciada: %s" "${byzone[$zid]% }"
+    elif [[ "$code" == 401 || "$code" == 403 ]]; then
+      warn "El token de Cloudflare no puede vaciar la caché de %s: dale «Zone → Cache Purge → Purge»." "${byzone[$zid]% }"; rc=1
+    else
+      warn "Cloudflare no ha vaciado la caché de %s (HTTP %s)." "${byzone[$zid]% }" "$code"; rc=1
+    fi
+  done
+  rm -f "$out" "$body"
+  logline "cf-purge $1 rc=$rc"
+  return "$rc"
+}
+
+# Lo que llaman el despliegue y la vuelta atrás: sólo si está encendido, y su
+# fallo no sale de aquí.
+_cf_purge_after() { # _cf_purge_after <app>
+  _cf_purge_enabled || return 0
+  _cf_purge_app "$1" || true
   return 0
 }
 
@@ -12970,7 +13100,8 @@ _top_leave() { printf '\e[?25h\e[?1049l'; }
 # sustituyen para no necesitar /var/log/nginx.
 nginx_log_access() { echo "/var/log/nginx/$1.access.log"; }
 nginx_log_error()  { echo "/var/log/nginx/$1.error.log"; }
-NGINX_BASE_CONF="/etc/nginx/conf.d/00-orbit-base.conf"
+NGINX_BASE_CONF="${NGINX_BASE_CONF:-/etc/nginx/conf.d/00-orbit-base.conf}"
+NGINX_SNIPPETS="${NGINX_SNIPPETS:-/etc/nginx/snippets}"
 
 # «hace una hora» se escribe de muchas maneras y ninguna es la de journalctl.
 # Se traducen las formas cortas y lo demás se le pasa tal cual a date, que
@@ -16736,6 +16867,11 @@ _doctor_prom() {
   return 0
 }
 
+# Las unidades en 'failed', una por línea. Aparte para poder doblarla.
+_failed_units() {
+  systemctl list-units --state=failed --plain --no-legend 2>/dev/null | awk '{print $1}' || true
+}
+
 _doctor_collect() {
   DOC_LEVEL=(); DOC_ID=(); DOC_MSG=(); DOC_FIX=(); DOC_ACT=()
 
@@ -16763,6 +16899,11 @@ _doctor_collect() {
   # emitido el certificado— acabe en el primer vhost con certificado, que le
   # enseña a un desconocido la web de otro. Los servidores instalados antes de
   # que existiera ese bloque siguen así hasta que se regeneran.
+  if grep -qs '^[[:space:]]*ssl_stapling' "$NGINX_SNIPPETS/orbit-ssl.conf"; then
+    _doc warn ssl-stapling "$(t "El TLS compartido pide OCSP stapling, que los certificados de hoy no traen: nginx lo avisa en cada recarga")" \
+      "$(t "quítalo con:  sudo orbit nginx-rebuild")" "_nginx_ssl_upgrade"
+  fi
+
   if [[ ! -f "$NGINX_DEFAULT_CONF" ]]; then
     _doc error default-server "$(t "No hay servidor por defecto: un nombre desconocido lo atiende cualquier app")" \
       "$(t "créalo con:  sudo orbit nginx-rebuild")" "_fix_default_server"
@@ -16894,6 +17035,15 @@ _doctor_collect() {
     if [[ ! -f "$(nginx_file "$n")" || ! -L "$(nginx_link "$n")" ]]; then
       _doc error "vhost-$n" \
         "$(t "'%s' está registrada pero nginx no la sirve: le falta el vhost" "$n")" \
+        "$(t "regenéralo con:  sudo orbit doctor --fix")" \
+        "_fix_vhost $(printf '%q' "$n")"
+    # Un vhost escrito con un nginx anterior a 1.25.1 lleva 'listen … http2',
+    # que el de ahora acepta avisando en cada recarga. El generador ya elige la
+    # forma según la versión; lo que faltaba era volver a pasar por él después
+    # de actualizar nginx, que es justo cuando nadie se acuerda.
+    elif _http2_supports_directive && grep -qE '^[[:space:]]*listen[^;]*[[:space:]]http2;' "$(nginx_file "$n")"; then
+      _doc warn "vhost-http2-$n" \
+        "$(t "El vhost de '%s' usa la forma antigua de http2 y nginx lo avisa en cada recarga" "$n")" \
         "$(t "regenéralo con:  sudo orbit doctor --fix")" \
         "_fix_vhost $(printf '%q' "$n")"
     fi
@@ -17061,6 +17211,20 @@ _doctor_collect() {
     _doc warn queue "$(t "La cola falló en su último ciclo y la unidad sigue en rojo")" \
       "$(t "mira qué pasó:  journalctl -u orbit-queue -n 30")"
   fi
+  # Y las que no son de Orbit. Basta una unidad en 'failed' —la que sea— para
+  # que 'systemctl is-system-running' diga «degraded», y doctor salía en verde
+  # entero: en un servidor de verdad, logrotate llevaba doce días fallando cada
+  # noche por un fichero duplicado de cloud-init y nadie lo había contado. Las
+  # dos de arriba ya tienen su línea y no se repiten. Sin acción, por lo mismo
+  # que ellas: el arreglo depende de qué haya fallado, y un 'reset-failed'
+  # sólo esconde la señal.
+  local u
+  while IFS= read -r u; do
+    [[ -z "$u" || "$u" == orbit-autodeploy.service || "$u" == orbit-queue.service ]] && continue
+    _doc warn "failed-$u" "$(t "La unidad %s está en rojo: el sistema sale como «degraded»" "$u")" \
+      "$(t "mira qué pasó:  systemctl status %s   ·   ya resuelto:  systemctl reset-failed %s" "$u" "$u")"
+  done < <(_failed_units)
+
   # Y el caso contrario: apps que lo tienen puesto y un temporizador parado.
   # Se lee peor que un fallo, porque no hay nada rojo en ninguna parte.
   if [[ -n "$(_queue_enabled_apps)" ]] \
@@ -17515,29 +17679,171 @@ cmd_doctor() {
   return 0
 }
 
+# Los rangos de Cloudflare, descargados y validados, uno por línea. Falla si la
+# lista no parece una lista: una descarga cortada, una página de error o un
+# portal cautivo no pueden acabar convertidos en reglas de firewall.
+_cf_ranges() {
+  local v4 v6 l n4=0 n6=0 out=""
+  v4="$(curl -fsS -m 20 https://www.cloudflare.com/ips-v4 2>/dev/null || true)"
+  v6="$(curl -fsS -m 20 https://www.cloudflare.com/ips-v6 2>/dev/null || true)"
+  while IFS= read -r l; do
+    l="${l%$'\r'}"; [[ -z "$l" ]] && continue
+    [[ "$l" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || return 1
+    out+="$l"$'\n'; n4=$((n4 + 1))
+  done <<<"$v4"
+  while IFS= read -r l; do
+    l="${l%$'\r'}"; [[ -z "$l" ]] && continue
+    [[ "$l" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || return 1
+    out+="$l"$'\n'; n6=$((n6 + 1))
+  done <<<"$v6"
+  # Cloudflare publica 15 y 7. Menos de la mitad es una lista que no es la suya.
+  (( n4 >= 8 && n6 >= 3 )) || return 1
+  printf '%s' "$out"
+}
+
+# Los números de las reglas de Cloudflare, de mayor a menor: borrar por número
+# corre los de detrás, así que se empieza por el final.
+#
+# Sólo las que pone Orbit: 80,443/tcp con el comentario exacto. Con un 'grep -i
+# Cloudflare' a secas entraba cualquier regla tuya que lo nombrara —un 22 para
+# Cloudflare Access, un túnel—, y como su origen no está en la lista, cada
+# 'lock' y cada 'cf-update' la borraban: podía dejar el servidor sin SSH.
+_fw_cf_rule_nums() {
+  local st
+  st="$(LC_ALL=C ufw status numbered 2>/dev/null || true)"
+  grep -E '^\[ *[0-9]+\] +80,443/tcp( \(v6\))? .*# Cloudflare[[:space:]]*$' <<<"$st" \
+    | grep -oP '^\[\s*\K[0-9]+' | sort -rn || true
+}
+
+_fw_locked() { [[ -n "$(_fw_cf_rule_nums)" ]]; }
+
+# Con ufw apagado, 'ufw status' no enseña ninguna regla aunque las haya: un
+# 'lock' anunciaba «Sólo Cloudflare puede llegar» sin filtrar nada, y después ni
+# cf-update ni unlock las encontraban. Se mira antes, y a una variable: con
+# '| grep -q' bajo pipefail la condición no sería cierta nunca.
+_fw_active() {
+  local st
+  st="$(LC_ALL=C ufw status 2>/dev/null || true)"
+  [[ "$st" == "Status: active"* ]]
+}
+
+# Con IPV6=no en ufw, una regla con origen IPv6 falla, y bajo errexit dejaba el
+# 'lock' a medias. Esos rangos no hacen falta: sin IPv6 no llega nadie por ahí.
+UFW_DEFAULTS="${UFW_DEFAULTS:-/etc/default/ufw}"
+_fw_v6() { ! grep -qsE '^[[:space:]]*IPV6=["'\'']?no' "$UFW_DEFAULTS"; }
+
+# Deja en ufw exactamente estos rangos para 80/443: añade los que faltan y
+# quita los que ya no están. Se añade antes de quitar, así que en ningún
+# momento queda fuera un rango que siga en la lista.
+_fw_apply_ranges() { # _fw_apply_ranges <rangos>
+  local want="$1" ip st have i
+  _fw_v6 || want="$(grep -v ':' <<<"$want" || true)"
+  for ip in $want; do
+    ufw allow proto tcp from "$ip" to any port 80,443 comment 'Cloudflare' >/dev/null
+  done
+  st="$(LC_ALL=C ufw status numbered 2>/dev/null || true)"
+  while IFS= read -r i; do
+    [[ -z "$i" ]] && continue
+    have="$(grep -E "^\[ *$i\]" <<<"$st" | grep -oE '[0-9a-fA-F.:]+/[0-9]+' | head -1 || true)"
+    if [[ -n "$have" ]] && ! grep -qxF "$have" <<<"$want"; then
+      ufw --force delete "$i" >/dev/null 2>&1 || true
+    fi
+  done < <(_fw_cf_rule_nums)
+  return 0
+}
+
 cmd_firewall() {
   need_root firewall
   _subcmd firewall status noapp "lock unlock status" "$@"
   local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  local ranges i
   case "$sub" in
     lock)
+      # El orden es lo que importa. Antes se borraban las reglas abiertas y
+      # después se descargaba la lista: si la descarga fallaba, 80 y 443
+      # quedaban cerrados para todo el mundo, Cloudflare incluido, y todas las
+      # webs caídas con un «Sólo Cloudflare puede llegar» en verde. Ahora se
+      # descarga y se valida primero, se abre a Cloudflare después, y sólo al
+      # final se cierra lo abierto a todos.
+      _fw_active || die "ufw no está activo: cerrar 80/443 a Cloudflare no filtraría nada. Actívalo con 'ufw enable' y repite."
       info "Restringiendo 80/443 sólo a las IPs de Cloudflare…"
-      ufw delete allow 80/tcp >/dev/null 2>&1 || true
-      ufw delete allow 443/tcp >/dev/null 2>&1 || true
-      local ip
-      for ip in $(curl -fsS https://www.cloudflare.com/ips-v4) $(curl -fsS https://www.cloudflare.com/ips-v6); do
-        ufw allow from "$ip" to any port 80,443 proto tcp comment 'Cloudflare' >/dev/null
-      done
+      ranges="$(_cf_ranges)" \
+        || die "No he podido descargar una lista válida de rangos de Cloudflare. No he tocado el firewall."
+      _fw_apply_ranges "$ranges"
+      ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+      ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
       ufw reload >/dev/null
-      ok "Sólo Cloudflare puede llegar a los puertos web (más seguro)"
-      warn "Si algún dominio está en 'DNS only' dejará de funcionar: usa 'orbit firewall unlock'." ;;
+      ok "Sólo Cloudflare puede llegar a los puertos web (%s rangos)" "$(grep -c . <<<"$ranges")"
+      warn "Si algún dominio está en 'DNS only' dejará de funcionar: usa 'orbit firewall unlock'."
+      info "Cloudflare cambia sus rangos muy de vez en cuando: 'orbit cf-update' los pone al día." ;;
     unlock)
-      ufw status numbered | grep -i cloudflare | grep -oP '^\[\s*\K[0-9]+' | sort -rn | while read -r i; do
-        yes | ufw delete "$i" >/dev/null 2>&1 || true
-      done
-      ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; ufw reload >/dev/null
+      # Al revés: primero se abre a todos y luego se quitan las de Cloudflare,
+      # para que en ningún momento haya un hueco sin ninguna de las dos.
+      _fw_active || die "ufw no está activo: no hay nada que abrir."
+      ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
+      while IFS= read -r i; do
+        if [[ -n "$i" ]]; then ufw --force delete "$i" >/dev/null 2>&1 || true; fi
+      done < <(_fw_cf_rule_nums)
+      ufw reload >/dev/null
       ok "Puertos 80/443 abiertos al mundo" ;;
     status) ufw status verbose | sed 's/^/  /' ;;
+  esac
+}
+
+cmd_cf_purge() {
+  need_root cf-purge
+  _subcmd cf-purge status noapp "on off status token now" "$@"
+  local sub="$SUBCMD"; set -- "${SUBCMD_ARGS[@]}"
+  case "$sub" in
+    on)
+      [[ -r "$(_cf_purge_ini)" ]] \
+        || die "Antes hace falta un token: 'orbit cf-purge token' (o 'orbit cf-token' con «Cache Purge»)."
+      _conf_set CF_PURGE yes
+      ok "Tras cada despliegue y cada vuelta atrás se vaciará la caché de Cloudflare de los dominios de la app"
+      info "Pruébalo sin desplegar:  orbit cf-purge now <app>" ;;
+    off)
+      _conf_set CF_PURGE no
+      ok "Ya no se vacía la caché de Cloudflare al desplegar" ;;
+    status)
+      if _cf_purge_enabled; then ok "Activado: se vacía la caché de los dominios de la app tras desplegar"
+      else info "Desactivado. Actívalo con:  orbit cf-purge on"; fi
+      if [[ -r "$ETC_DIR/cloudflare-purge.ini" ]]; then info "Token: %s" "$ETC_DIR/cloudflare-purge.ini"
+      elif [[ -r "$ETC_DIR/cloudflare.ini" ]]; then info "Token: el de 'orbit cf-token' (necesita «Cache Purge»)"
+      else warn "Sin token: 'orbit cf-purge token'"; fi ;;
+    now)
+      local name="${1:-}"
+      [[ -n "$name" ]] || name="$(pick_app 'App cuya caché vaciar')" || return 0
+      app_exists "$name" || die "La app '%s' no existe." "$name"
+      load_app "$name"
+      _cf_purge_app "$name" ;;
+    token)
+      info "Crea un token en https://dash.cloudflare.com/profile/api-tokens con:"
+      info "  Zone → Cache Purge → Purge   en las zonas de este servidor. Nada más."
+      local tok; ask tok "Pega el token" ""
+      [[ -n "$tok" ]] || { warn "Cancelado"; return 0; }
+      [[ "$tok" =~ ^[A-Za-z0-9_-]+$ ]] \
+        || die "Eso no parece un token de Cloudflare: sólo lleva letras, números, '-' y '_'."
+      local f="$ETC_DIR/cloudflare-purge.ini" new out code
+      # Igual que 'cf-token': a un fichero nuevo, sin un instante legible por
+      # otros, y se prueba antes de ponerlo en su sitio.
+      new="$(umask 077; mktemp "$ETC_DIR/.cloudflare-purge.ini.XXXXXX")"
+      trap 'rm -f -- "$new"' EXIT
+      printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$new"
+      chmod 0600 "$new"
+      out="$(mktemp)"
+      code="$(CF_INI="$new" _cf_api GET '/zones?per_page=1' "$out")"
+      if [[ "$code" == 200 && -n "$(_cf_first_account "$out")" ]]; then
+        rm -f "$out"
+        mv -f "$new" "$f"; trap - EXIT
+        ok "Token guardado en %s (sólo root puede leerlo)" "$f"
+        _cf_purge_enabled || info "Actívalo con:  orbit cf-purge on"
+      elif [[ "$code" == 000 ]]; then
+        rm -f "$out" "$new"; trap - EXIT
+        die "No he podido hablar con la API de Cloudflare. No lo he guardado."
+      else
+        rm -f "$out" "$new"; trap - EXIT
+        die "Cloudflare no deja a ese token ver ninguna zona (HTTP %s). No lo he guardado." "$code"
+      fi ;;
   esac
 }
 
@@ -17552,13 +17858,24 @@ cmd_cf_update() {
     echo "real_ip_recursive on;"
   } > "$f.new"
   if grep -qc set_real_ip_from "$f.new"; then mv "$f.new" "$f"; nginx -t >/dev/null && systemctl reload nginx; ok "Rangos de Cloudflare actualizados"; else rm -f "$f.new"; err "No pude descargarlos"; fi
+  # Con el firewall cerrado a Cloudflare, un rango nuevo suyo sin regla es
+  # tráfico legítimo rechazado: la lista de nginx y la de ufw van juntas.
+  if command -v ufw >/dev/null 2>&1 && _fw_active && _fw_locked; then
+    local ranges
+    if ranges="$(_cf_ranges)"; then
+      _fw_apply_ranges "$ranges"; ufw reload >/dev/null
+      ok "Firewall al día con los rangos de Cloudflare"
+    else
+      warn "No he podido validar los rangos de Cloudflare: el firewall sigue como estaba."
+    fi
+  fi
 }
 
 # El formato de log vive en la configuración base, que escribe el instalador y
 # no se regenera junto a los vhosts. Un servidor instalado antes de que llevara
 # la marca de tiempo se queda sin poder filtrar por fecha, así que se corrige
 # aquí —una línea, con copia y validación— en vez de pedir una reinstalación.
-_nginx_base_upgrade() {
+_nginx_log_upgrade() {
   [[ -w "$NGINX_BASE_CONF" ]] || return 0
   grep -q "log_format orbit" "$NGINX_BASE_CONF" || return 0
   grep -q 'log_format orbit .*\$time_local' "$NGINX_BASE_CONF" && return 0
@@ -17571,6 +17888,33 @@ _nginx_base_upgrade() {
     mv "$NGINX_BASE_CONF.bak" "$NGINX_BASE_CONF"
     warn "No he podido añadir la fecha al formato de log; lo he dejado como estaba."
   fi
+}
+
+# El OCSP stapling no sirve con los certificados que emite hoy Orbit: Let's
+# Encrypt dejó de publicar OCSP en 2025 y los certificados de origen de
+# Cloudflare no lo han llevado nunca. nginx lo ignora, pero lo dice en cada
+# 'nginx -t' —una línea por certificado— y esas líneas tapaban los avisos que sí
+# importan. install.sh ya no lo escribe; esto lo quita de lo instalado antes.
+_nginx_ssl_upgrade() {
+  local f="$NGINX_SNIPPETS/orbit-ssl.conf"
+  [[ -w "$f" ]] || return 0
+  grep -q '^[[:space:]]*ssl_stapling' "$f" || return 0
+  cp "$f" "$f.bak"
+  sed -i '/^[[:space:]]*ssl_stapling/d' "$f"
+  if nginx -t >/dev/null 2>&1; then
+    rm -f "$f.bak"
+    systemctl reload nginx 2>/dev/null || true
+    ok "Quitado el OCSP stapling: los certificados de hoy no lo traen y nginx lo avisaba en cada recarga"
+  else
+    mv "$f.bak" "$f"
+    warn "No he podido quitar el OCSP stapling; lo he dejado como estaba."
+    return 1
+  fi
+}
+
+_nginx_base_upgrade() {
+  _nginx_log_upgrade || true
+  _nginx_ssl_upgrade || true
 }
 
 cmd_self_update() {
@@ -17846,6 +18190,8 @@ cat <<EOF
     github                  Connect the GitHub account
     cf-token                Store the Cloudflare token
     cf-update               Refresh Cloudflare's IP ranges
+    cf-purge on|off|status|token|now
+                            Empty the Cloudflare cache of an app after deploying
     firewall status|lock|unlock
     watch enable|disable|status|history|once
                             Watching by way of a systemd timer
@@ -17953,6 +18299,8 @@ cat <<EOF
     github                  Conectar la cuenta de GitHub
     cf-token                Guardar el token de Cloudflare
     cf-update               Refrescar rangos de IP de Cloudflare
+    cf-purge on|off|status|token|now
+                            Vaciar la caché de Cloudflare de la app al desplegar
     firewall status|lock|unlock
     watch enable|disable|status|history|once
                             Vigilancia por temporizador de systemd
@@ -19199,7 +19547,42 @@ _i18n_en() {
     ["No he tocado nada."]="I touched nothing."
     ["Cómo queda"]="How it stands now"
     ["Restringiendo 80/443 sólo a las IPs de Cloudflare…"]="Restricting 80/443 to Cloudflare's IPs only…"
-    ["Sólo Cloudflare puede llegar a los puertos web (más seguro)"]="Only Cloudflare can reach the web ports (safer)"
+    ["No hay token de Cloudflare para vaciar la caché: 'orbit cf-purge token'."]="There is no Cloudflare token to empty the cache: 'orbit cf-purge token'."
+    ["El token no ve la zona de %s en Cloudflare: su caché no se ha vaciado."]="The token cannot see the Cloudflare zone of %s: its cache was not emptied."
+    ["Caché de Cloudflare vaciada: %s"]="Cloudflare cache emptied: %s"
+    ["El token de Cloudflare no puede vaciar la caché de %s: dale «Zone → Cache Purge → Purge»."]="The Cloudflare token cannot empty the cache of %s: give it \"Zone → Cache Purge → Purge\"."
+    ["Cloudflare no ha vaciado la caché de %s (HTTP %s)."]="Cloudflare did not empty the cache of %s (HTTP %s)."
+    ["El TLS compartido pide OCSP stapling, que los certificados de hoy no traen: nginx lo avisa en cada recarga"]="The shared TLS settings ask for OCSP stapling, which today's certificates don't have: nginx warns about it on every reload"
+    ["quítalo con:  sudo orbit nginx-rebuild"]="remove it with:  sudo orbit nginx-rebuild"
+    ["El vhost de '%s' usa la forma antigua de http2 y nginx lo avisa en cada recarga"]="The vhost of '%s' uses the old http2 syntax and nginx warns about it on every reload"
+    ["La unidad %s está en rojo: el sistema sale como «degraded»"]="The unit %s has failed: the system shows as \"degraded\""
+    ["mira qué pasó:  systemctl status %s   ·   ya resuelto:  systemctl reset-failed %s"]="see what happened:  systemctl status %s   ·   once solved:  systemctl reset-failed %s"
+    ["No he podido descargar una lista válida de rangos de Cloudflare. No he tocado el firewall."]="I could not download a valid list of Cloudflare ranges. The firewall was not touched."
+    ["Sólo Cloudflare puede llegar a los puertos web (%s rangos)"]="Only Cloudflare can reach the web ports (%s ranges)"
+    ["Cloudflare cambia sus rangos muy de vez en cuando: 'orbit cf-update' los pone al día."]="Cloudflare changes its ranges once in a while: 'orbit cf-update' brings them up to date."
+    ["Antes hace falta un token: 'orbit cf-purge token' (o 'orbit cf-token' con «Cache Purge»)."]="A token is needed first: 'orbit cf-purge token' (or 'orbit cf-token' with \"Cache Purge\")."
+    ["Tras cada despliegue y cada vuelta atrás se vaciará la caché de Cloudflare de los dominios de la app"]="After every deploy and every rollback, the Cloudflare cache of the app's domains will be emptied"
+    ["Pruébalo sin desplegar:  orbit cf-purge now <app>"]="Try it without deploying:  orbit cf-purge now <app>"
+    ["Ya no se vacía la caché de Cloudflare al desplegar"]="The Cloudflare cache is no longer emptied on deploy"
+    ["Activado: se vacía la caché de los dominios de la app tras desplegar"]="On: the cache of the app's domains is emptied after deploying"
+    ["Desactivado. Actívalo con:  orbit cf-purge on"]="Off. Turn it on with:  orbit cf-purge on"
+    ["Token: %s"]="Token: %s"
+    ["Token: el de 'orbit cf-token' (necesita «Cache Purge»)"]="Token: the one from 'orbit cf-token' (it needs \"Cache Purge\")"
+    ["Sin token: 'orbit cf-purge token'"]="No token: 'orbit cf-purge token'"
+    ["App cuya caché vaciar"]="App whose cache to empty"
+    ["La app '%s' no existe."]="The app '%s' does not exist."
+    ["Crea un token en https://dash.cloudflare.com/profile/api-tokens con:"]="Create a token at https://dash.cloudflare.com/profile/api-tokens with:"
+    ["  Zone → Cache Purge → Purge   en las zonas de este servidor. Nada más."]="  Zone → Cache Purge → Purge   on this server's zones. Nothing else."
+    ["Token guardado en %s (sólo root puede leerlo)"]="Token saved in %s (only root can read it)"
+    ["Actívalo con:  orbit cf-purge on"]="Turn it on with:  orbit cf-purge on"
+    ["No he podido hablar con la API de Cloudflare. No lo he guardado."]="I could not talk to the Cloudflare API. It was not saved."
+    ["Cloudflare no deja a ese token ver ninguna zona (HTTP %s). No lo he guardado."]="Cloudflare does not let that token see any zone (HTTP %s). It was not saved."
+    ["ufw no está activo: cerrar 80/443 a Cloudflare no filtraría nada. Actívalo con 'ufw enable' y repite."]="ufw is not active: restricting 80/443 to Cloudflare would filter nothing. Turn it on with 'ufw enable' and try again."
+    ["ufw no está activo: no hay nada que abrir."]="ufw is not active: there is nothing to open."
+    ["Firewall al día con los rangos de Cloudflare"]="Firewall up to date with Cloudflare's ranges"
+    ["No he podido validar los rangos de Cloudflare: el firewall sigue como estaba."]="I could not validate Cloudflare's ranges: the firewall is unchanged."
+    ["Quitado el OCSP stapling: los certificados de hoy no lo traen y nginx lo avisaba en cada recarga"]="OCSP stapling removed: today's certificates don't have it and nginx warned about it on every reload"
+    ["No he podido quitar el OCSP stapling; lo he dejado como estaba."]="I could not remove OCSP stapling; it was left as it was."
     ["Si algún dominio está en 'DNS only' dejará de funcionar: usa 'orbit firewall unlock'."]="Any domain on 'DNS only' will stop working: use 'orbit firewall unlock'."
     ["Puertos 80/443 abiertos al mundo"]="Ports 80/443 open to the world"
     ["Rangos de Cloudflare actualizados"]="Cloudflare ranges updated"
@@ -19482,6 +19865,7 @@ main() {
     github|gh)      cmd_github ;;
     cf-token)       cmd_cf_token ;;
     cf-update)      cmd_cf_update ;;
+    cf-purge)       cmd_cf_purge "$@" ;;
     firewall|fw)    cmd_firewall "$@" ;;
     nginx-rebuild)  cmd_self_update ;;
     status)         cmd_status ;;

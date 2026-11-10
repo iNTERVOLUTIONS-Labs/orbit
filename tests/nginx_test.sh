@@ -56,6 +56,10 @@ ssl_protocols TLSv1.2 TLSv1.3;
 ssl_prefer_server_ciphers off;
 EOF
 
+# Los maps de las cabeceras salen de la misma función que los escribe en
+# conf.d: una copia aquí probaría algo que no está en ningún servidor.
+_nginx_headers_maps > "$NG/orbit-headers.conf"
+
 # --- nginx.conf de pruebas: reproduce las zonas de conf.d/00-orbit-base.conf
 MIME=""
 [[ -f /etc/nginx/mime.types ]] && MIME="    include /etc/nginx/mime.types;"
@@ -78,6 +82,7 @@ $MIME
     limit_req_zone \$binary_remote_addr zone=orbit_general:1m rate=40r/s;
     limit_conn_zone \$binary_remote_addr zone=orbit_conn:1m;
     log_format orbit '\$remote_addr \$host "\$request" \$status';
+    include $NG/orbit-headers.conf;
 
     include $NG/vhosts/*.conf;
 }
@@ -121,6 +126,28 @@ python3 -m http.server "$BACKPORT" --bind 127.0.0.1 --directory "$TMP/back" >/de
 BACKPID=$!
 mkapp proxyapp node "$BACKPORT" "proxy.test"
 issue_cert proxy.test
+
+# Y otra que trae sus propias cabeceras de seguridad, como Next.js con
+# 'headers()': la suya tiene que mandar y no salir repetida con la de Orbit.
+CABPORT=$((18098 + ${ORBIT_TEST_PORT_OFFSET:-0}))
+cat > "$TMP/cabback.py" <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"app con cabeceras\n")
+    do_HEAD = do_GET
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+python3 "$TMP/cabback.py" "$CABPORT" >/dev/null 2>&1 &
+CABPID=$!
+mkapp cabapp node "$CABPORT" "cab.test"
+issue_cert cab.test
 
 # App Python con estáticos: nginx debe servir /static/ y /media/ desde disco.
 # Con DEBUG=False Django no los sirve, así que si esto no funciona el sitio
@@ -641,7 +668,7 @@ printf '%s\n' '{"type":"static","csp":"default-src '"'"'none'"'"'","csp_report_o
 printf '%s\n' '{"type":"static","csp":"default-src \"self\""}' > "$TMP/apps/cspmal/releases/r1/orbit.json"
 
 for app in sincert concert spa proxyapp pyapp hibrida plano monoplano tienda aislada denoapp lara monolara monoweb apiweb monophp \
-           skew spaskew nextapp caida caidasin astro cspro; do install_vhost "$app"; done
+           skew spaskew nextapp caida caidasin astro cspro cabapp; do install_vhost "$app"; done
 
 # El servidor por defecto, igual que lo escribe install.sh. Va en 000- para que
 # nginx lo vea antes que los vhosts de las apps, que es de donde salía el bug:
@@ -682,7 +709,7 @@ started=$?
 # La limpieza pasa por 'priv' porque el php-fpm de la sección de aislamiento
 # lo arranca root: su pid y sus logs son suyos, y ni el kill ni el rm saldrían
 # de otra forma.
-trap 'nginx -c "$NG/nginx.conf" -p "$NG" -s quit 2>/dev/null; kill $BACKPID 2>/dev/null; [[ -f "$NG/php.pid" ]] && priv kill "$(cat "$NG/php.pid")" 2>/dev/null; priv rm -rf "$TMP"' EXIT
+trap 'nginx -c "$NG/nginx.conf" -p "$NG" -s quit 2>/dev/null; kill $BACKPID $CABPID 2>/dev/null; [[ -f "$NG/php.pid" ]] && priv kill "$(cat "$NG/php.pid")" 2>/dev/null; priv rm -rf "$TMP"' EXIT
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   curl -s -o /dev/null -m 1 "http://127.0.0.1:$HTTP_PORT/" && break
   sleep 0.3
@@ -1220,6 +1247,32 @@ fi
 check "misma lista que install.sh" \
   "$(grep -oE '^add_header +[A-Za-z-]+ +"[^"]*"' "$NG/snippets/orbit-security.conf" | sed -E 's/ +/ /g' | sort | tr '\n' '|')" \
   "$(_sec_headers | grep -v Strict-Transport | grep -oE 'add_header +[A-Za-z-]+ +"[^"]*"' | sed -E 's/ +/ /g' | sort | tr '\n' '|')"
+
+section "Delante de una app con proceso, sus cabeceras mandan y no se repiten"
+# nginx añadía las suyas encima de las de la app: en un servidor de verdad,
+# dos X-Frame-Options y dos HSTS distintos, uno con 'preload' y otro sin él.
+hdrs() { curl -skI --noproxy '*' -m 5 "$@" | tr -d '\r'; }
+CABH="$(hdrs --resolve "cab.test:$HTTPS_PORT:127.0.0.1" "https://cab.test:$HTTPS_PORT/")"
+check "app: un solo X-Frame-Options" "1" "$(grep -ci '^x-frame-options:' <<<"$CABH")"
+check "y es el de la app"            "1" "$(grep -ci '^x-frame-options: DENY$' <<<"$CABH")"
+check "app: un solo HSTS"            "1" "$(grep -ci '^strict-transport-security:' <<<"$CABH")"
+check "y es el de la app"            "1" "$(grep -c 'preload' <<<"$CABH")"
+check "lo que no trae, de Orbit"     "1" "$(grep -ci '^x-content-type-options: nosniff$' <<<"$CABH")"
+PRXH="$(hdrs --resolve "proxy.test:$HTTPS_PORT:127.0.0.1" "https://proxy.test:$HTTPS_PORT/")"
+check "sin cabeceras propias: las seis" "6" \
+  "$(grep -ciE '^(x-content-type-options|x-frame-options|referrer-policy|permissions-policy|cross-origin-opener-policy|strict-transport-security):' <<<"$PRXH")"
+check "con los valores de Orbit"     "1" "$(grep -ci '^x-frame-options: SAMEORIGIN$' <<<"$PRXH")"
+check "por el 80, sin HSTS"          "0" \
+  "$(hdrs -H 'Host: proxy.test' "http://127.0.0.1:$HTTP_PORT/" | grep -ci '^strict-transport-security:')"
+# Los valores por defecto son los mismos que pone el snippet en las webs que
+# sirve nginx: si una lista cambia y la otra no, aquí.
+check "mismos valores que install.sh" \
+  "$(grep -oE '^add_header +[A-Za-z-]+ +"[^"]*"' "$NG/snippets/orbit-security.conf" | sed -E 's/^add_header +([A-Za-z-]+) +"([^"]*)"/\L\1\E=\2/' | sort | tr '\n' '|')" \
+  "$(_nginx_headers_maps | sed -nE 's/^map \$upstream_http_([a-z_]+) \$[a-z_]+ \{ "" "([^"]*)";.*/\1=\2/p' | tr '_' '-' | sort | tr '\n' '|')"
+# Y render_nginx deja el fichero de los maps donde nginx lo lee.
+NGINX_CONFD="$TMP/confd-prueba"
+_nginx_headers_ensure; check "lo escribe en conf.d" "1" "$([[ -f "$NGINX_CONFD/02-orbit-headers.conf" ]] && echo 1 || echo 0)"
+check "igual que la función" "yes" "$([[ "$(cat "$NGINX_CONFD/02-orbit-headers.conf")" == "$(_nginx_headers_maps)" ]] && echo yes || echo no)"
 
 section "El código de Deno y Bun no se sirve desde disco"
 # En Deno y en Bun no hay carpeta compilada: la release *es* el código. Si el

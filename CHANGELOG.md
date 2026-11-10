@@ -5,6 +5,99 @@ Este proyecto sigue [versionado semántico](https://semver.org/lang/es/).
 
 ## [No publicado]
 
+## [1.5.2] - 2026-11-10
+
+Salió de auditar un servidor de verdad con nueve webs, con el encargo de dejarlo
+más rápido y más seguro. Cinco cosas que ninguna suite veía, cada una
+reproducida antes de arreglarla y con una prueba que se pone en rojo sin el
+arreglo (comprobado mutando el código). Y lo que ya estaba en `main` sin
+publicar: `orbit github status|repos|branches` y el contrato terminado, más abajo.
+
+### Seguridad — `orbit firewall lock` podía dejar todas las webs fuera
+
+Borraba las reglas de 80 y 443 abiertas a todos y **después** descargaba la
+lista de Cloudflare dentro de un `for ip in $(curl …)`. Con la descarga caída,
+el bucle no daba ni una vuelta, los puertos quedaban cerrados para todo el
+mundo —Cloudflare incluido— y el comando terminaba en verde: «Sólo Cloudflare
+puede llegar a los puertos web». Ahora se descarga y **se valida** primero (cada
+línea tiene que ser un rango, y tienen que ser al menos la mitad de los que
+publica Cloudflare: una página de error o un portal cautivo no se convierten en
+reglas), se abre a Cloudflare después, y sólo al final se cierra lo abierto a
+todos. `unlock`, al revés: abre antes de quitar. En ningún momento queda un
+hueco sin ninguna de las dos.
+
+Y `orbit cf-update`, que ya ponía al día los rangos de nginx, pone al día
+también los de ufw cuando el firewall está cerrado a Cloudflare: añade los
+nuevos antes de quitar los retirados. Sin eso, un rango nuevo de Cloudflare era
+tráfico legítimo rechazado sin que nada lo dijera.
+
+Y tres más que encontró una revisión adversarial del propio arreglo:
+**sólo se tocan las reglas que pone Orbit** (80,443/tcp con el comentario
+exacto) —con un `grep Cloudflare` a secas, una regla tuya de SSH para
+Cloudflare Access se borraba en cada `lock` y cada `cf-update`—; con **ufw
+apagado** `lock` se niega en vez de anunciar un filtro que no existe; y con
+`IPV6=no` en ufw sólo se ponen los rangos IPv4, en vez de quedarse a medias.
+
+`tests/firewall_test.sh`, 35 comprobaciones, con un ufw de mentira que guarda
+sus reglas y apunta cada instante en que 80/443 no los alcanza nadie.
+
+### Corregido — delante de una app con proceso, cada cabecera de seguridad salía dos veces
+
+Next.js, Django o Laravel suelen poner sus propias cabeceras de seguridad, y
+nginx añadía las suyas encima. Medido en producción: dos `X-Frame-Options`, dos
+`Referrer-Policy` y **dos HSTS con valores distintos** —la app pedía dos años
+con `preload`, Orbit uno sin él—. Ahora **manda la de la app**, y Orbit pone la
+suya sólo cuando la app no trae ninguna: un `map` por cabecera sobre
+`$upstream_http_*`, en `conf.d/02-orbit-headers.conf`, que escribe Orbit al
+generar cualquier vhost (así llega a los servidores instalados con el siguiente
+despliegue). Las webs que sirve nginx directamente no cambian. Probado con nginx
+de verdad y un backend que manda las suyas; quitar el arreglo vuelve a dar dos.
+
+Y de paso: en las pruebas, `NGINX_CONFD` apuntaba al `/etc/nginx/conf.d` de la
+máquina, porque se compone al cargar el script. Ahora va al directorio temporal,
+como el resto de rutas de nginx.
+
+### Corregido — `doctor` salía en verde con el sistema «degraded»
+
+Basta una unidad en `failed` —la que sea— para que `systemctl
+is-system-running` diga «degraded», y doctor sólo miraba las suyas. En el
+servidor auditado, logrotate llevaba doce días fallando cada noche por un
+fichero duplicado de cloud-init. Ahora cada unidad en rojo sale como aviso, con
+dónde mirar y cómo limpiarla cuando esté resuelta; **sin arreglo automático**,
+porque un `reset-failed` sólo esconde la señal.
+
+### Corregido — nginx avisaba en cada recarga, y los avisos tapaban los que importan
+
+- **OCSP stapling.** Let's Encrypt dejó de publicar OCSP en 2025 y los
+  certificados de origen de Cloudflare no lo han llevado nunca: `ssl_stapling
+  on` no hacía nada salvo escribir una línea por certificado en cada `nginx -t`.
+  `install.sh` ya no lo pone; `orbit nginx-rebuild` lo quita de lo instalado,
+  con `nginx -t` antes y marcha atrás si falla, y `doctor` lo cuenta con arreglo.
+- **`listen … http2`.** El generador ya elige `http2 on;` con nginx ≥ 1.25.1,
+  pero un vhost escrito con el nginx de Ubuntu 24.04 se quedaba con la forma
+  antigua después de actualizar el sistema. `doctor` lo detecta y lo regenera.
+
+### Añadido — `orbit cf-purge`: vaciar la caché de Cloudflare tras desplegar
+
+Con una regla de caché de HTML en Cloudflare —lo que se hace para que una web
+estática no llegue al servidor en cada visita—, un despliegue tardaba en verse
+lo que durara la regla. `orbit cf-purge on` hace que después de cada despliegue
+y de cada vuelta atrás se vacíe la caché **sólo de los dominios de la app**:
+purga por host, agrupada por zona, que vale en el plan gratuito (comprobado
+contra la API). Nunca tumba un despliegue: la web ya está publicada, y lo peor
+que pasa sin purga es que tarde unos minutos en verse.
+
+```
+orbit cf-purge token        guardar un token con sólo «Zone → Cache Purge»
+orbit cf-purge on|off       encenderlo o apagarlo (CF_PURGE en orbit.conf)
+orbit cf-purge now <app>    vaciar ya, sin desplegar
+orbit cf-purge status
+```
+
+Si no hay token propio usa el de `orbit cf-token`, con ese permiso añadido. El
+token de purga va en `/etc/orbit/cloudflare-purge.ini` (0600) y, como el de DNS,
+no entra en las copias. `tests/cfpurge_test.sh`, 34 comprobaciones.
+
 ### `orbit github status|repos|branches`: la lista de repositorios, ya con contrato
 
 Escribiendo el cliente de escritorio contra el contrato apareció un hueco que no

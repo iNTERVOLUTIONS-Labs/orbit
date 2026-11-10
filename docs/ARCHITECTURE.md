@@ -679,6 +679,16 @@ Para un origen que sólo se sirve a través del proxy, Cloudflare firma un certi
 
 **La limpieza de los intentos cortados va con las seis letras de `mktemp`** (`.<app>.nuevo.XXXXXX`) y no con un `*`: los puntos valen en un nombre de app, y `.tienda.nuevo.*` se llevaba lo que `orbit remove` le había apartado a una app llamada `tienda.nuevo` —una clave que Cloudflare no vuelve a dar—. Es la misma clase de fallo que la de `tienda.anterior`, en el único `rm` con comodín que quedaba.
 
+### 6.6 Vaciar la caché de Cloudflare tras desplegar (1.5.2)
+
+Orbit sirve el HTML con `Cache-Control: no-cache` (§7.4b), así que un despliegue se ve al instante… salvo que una regla de caché de Cloudflare guarde ese HTML en el borde, que es lo que se hace para que una web estática no llegue al servidor en cada visita. Con la regla puesta, cada despliegue tardaba en verse lo que durara la regla. `orbit cf-purge on` (`CF_PURGE="yes"` en `orbit.conf`) vacía la caché después de cada despliegue y de cada vuelta atrás.
+
+**Sólo lo de la app.** Purga por host (`{"hosts": [...]}`), con el dominio y los alias, agrupados por zona: una llamada por zona. Vale en el plan gratuito —comprobado contra la API—, y `purge_everything` habría vaciado también las otras webs de la misma zona. Un alias comodín no se purga: no es un host.
+
+**El token.** Uno con sólo `Zone → Cache Purge → Purge` (`orbit cf-purge token`, en `/etc/orbit/cloudflare-purge.ini`, 0600), y si no lo hay, el de `orbit cf-token` con ese permiso añadido. Se prueba antes de guardarlo —que vea al menos una zona— y, como el de DNS, no entra en las copias (§17.1).
+
+**Nunca tumba un despliegue.** Cuando se llama, la release ya está publicada; lo peor que pasa sin purga es que tarde unos minutos en verse. Un token sin permiso o una zona que no ve se dicen —con el permiso que falta— y el despliegue sale con 0.
+
 ---
 
 ## 7. Detección de stack
@@ -1235,6 +1245,14 @@ Que `/usr/local/bin/orbit`, cada carpeta por encima de él (y las del fichero re
 - TLS 1.2 y 1.3 solamente, con suites modernas
 
 ---
+
+### 9.2 El firewall, cerrado a Cloudflare sin hueco (1.5.2)
+
+`orbit firewall lock` deja 80 y 443 sólo para los rangos de Cloudflare. **El orden es el arreglo**: antes se borraban las reglas abiertas y después se descargaba la lista dentro de un `for ip in $(curl …)`; con la descarga caída, el bucle no daba ni una vuelta y el servidor entero quedaba fuera, con el comando en verde. Ahora: descargar y validar (cada línea un rango, y al menos la mitad de los que publica Cloudflare: una página de error no se convierte en reglas), abrir a Cloudflare, y sólo entonces cerrar lo abierto. `unlock` abre antes de quitar. `orbit cf-update` mantiene las dos listas —la de `set_real_ip_from` y la de ufw— a la vez, añadiendo antes de quitar.
+
+### 9.3 Las cabeceras de seguridad delante de una app con proceso (1.5.2)
+
+Las webs que sirve nginx llevan las seis cabeceras del snippet (§7.4b). Delante de una app con proceso, en cambio, **manda la de la app**: Next, Django o Laravel suelen traer las suyas, y nginx añadía las de Orbit encima —dos `X-Frame-Options`, dos HSTS con valores distintos, uno con `preload` y otro sin él—. Cada `location` que hace `proxy_pass` emite las seis con un valor que sale de un `map` sobre `$upstream_http_<cabecera>`: vacía en la respuesta de la app, el valor de Orbit; con valor, vacío, y nginx no emite un `add_header` vacío. El HSTS va además por `$https`, como en el resto del vhost. Los maps viven en `conf.d/02-orbit-headers.conf`, que escribe `render_nginx` —no `install.sh`— para que lleguen a los servidores instalados con el siguiente despliegue. La CSP del `orbit.json` se sigue emitiendo siempre: es configuración explícita de quien despliega, y dos CSP se aplican las dos.
 
 ## 10. Estructura del código
 
