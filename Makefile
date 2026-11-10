@@ -73,6 +73,8 @@ test: check lint
 	bash tests/autodeploy_test.sh
 	bash tests/gates_test.sh
 	bash tests/queue_test.sh
+	bash tests/firewall_test.sh
+	bash tests/cfpurge_test.sh
 	bash tests/deploy_test.sh
 	bash tests/clone_test.sh
 	bash tests/i18n_test.sh

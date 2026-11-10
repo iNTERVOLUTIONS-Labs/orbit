@@ -642,9 +642,10 @@ cat > /etc/nginx/snippets/orbit-ssl.conf <<'EOF'
 ssl_protocols TLSv1.2 TLSv1.3;
 ssl_prefer_server_ciphers off;
 ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-ssl_stapling on;
-ssl_stapling_verify on;
 EOF
+# Sin OCSP stapling: Let's Encrypt dejó de publicar OCSP en 2025 y los
+# certificados de origen de Cloudflare no lo traen. nginx lo ignoraba avisando
+# una vez por certificado en cada 'nginx -t'.
 
 cat > /etc/nginx/snippets/orbit-acme.conf <<EOF
 location ^~ /.well-known/acme-challenge/ {

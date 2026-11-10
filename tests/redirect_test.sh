@@ -150,6 +150,9 @@ mkdir -p "$NG"/{snippets,vhosts,logs,tmp}
 : > "$NG/snippets/orbit-acme.conf"
 : > "$NG/snippets/orbit-security.conf"
 : > "$NG/snippets/orbit-ssl.conf"
+# Los maps de las cabeceras de las apps con proceso: los escribe render_nginx
+# en conf.d, y sin ellos un vhost con proxy no pasa nginx -t.
+_nginx_headers_maps > "$NG/orbit-headers.conf"
 cat > "$NG/nginx.conf" <<EOF
 worker_processes 1;
 error_log $NG/logs/error.log warn;
@@ -163,6 +166,7 @@ http {
     limit_req_zone \$binary_remote_addr zone=orbit_general:1m rate=40r/s;
     limit_conn_zone \$binary_remote_addr zone=orbit_conn:1m;
     log_format orbit '\$remote_addr \$host "\$request" \$status';
+    include $NG/orbit-headers.conf;
     include $NG/vhosts/*.conf;
 }
 EOF

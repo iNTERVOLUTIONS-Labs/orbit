@@ -23,6 +23,7 @@ La versión que existe hoy.
 - ✅ Restauración de IPs reales de Cloudflare
 - ✅ Protección contra el bucle de redirecciones
 - ✅ Webs estáticas: barra final sin 403, markdown, caché por hash de build y `csp` por app en el `orbit.json` (1.5.1). Ver ARCHITECTURE §7.4b
+- ✅ Auditoría de un servidor de verdad (1.5.2): `firewall lock` sin hueco, cabeceras de la app sin duplicar, `doctor` cuenta las unidades ajenas en rojo, nginx sin avisos de OCSP ni de `listen … http2`, y `orbit cf-purge` para vaciar la caché de Cloudflare tras desplegar. Ver ARCHITECTURE §6.6, §9.2 y §9.3
 
 ---
 

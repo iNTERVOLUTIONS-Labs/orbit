@@ -365,6 +365,75 @@ check "y lo explica"      "1" "$(grep -c 'necesita también --yes' "$TMP/err")"
 check "stdout limpio"     "0" "$(printf '%s' "$SALIDA" | wc -c)"
 JSON="no"; ASSUME_YES="no"
 
+section "Una unidad ajena en rojo también se dice"
+# logrotate llevaba doce días fallando en un servidor de verdad —un fichero
+# duplicado de cloud-init—, el sistema salía «degraded» y doctor, en verde.
+_failed_units() { printf '%s\n' logrotate.service orbit-autodeploy.service; }
+_doctor_collect
+_idx_de() { local i; for i in "${!DOC_ID[@]}"; do [[ "${DOC_ID[$i]}" == "$1" ]] && { echo "$i"; return; }; done; }
+I="$(_idx_de failed-logrotate.service)"
+check "lo ve"                "1" "$([[ -n "$I" ]] && echo 1 || echo 0)"
+check "como aviso"           "warn" "${DOC_LEVEL[${I:-0}]:-}"
+check "nombra la unidad"     "1" "$(grep -c 'systemctl status logrotate.service' <<<"${DOC_FIX[${I:-0}]:-}")"
+check "sin arreglo solo"     "" "${DOC_ACT[${I:-0}]:-}"
+# La del autodespliegue ya tiene su propia línea: no se cuenta dos veces.
+check "no repite autodeploy" "" "$(_idx_de failed-orbit-autodeploy.service)"
+_failed_units() { :; }
+_doctor_collect
+check "sin rojas, nada"      "0" "$(printf '%s\n' "${DOC_ID[@]}" | grep -c '^failed-')"
+unset -f _idx_de
+
+section "Un vhost con la forma antigua de http2 se dice y se regenera"
+# Escrito con el nginx de Ubuntu 24.04 (1.24) y servido después por uno 1.28:
+# funciona, pero nginx avisa en cada recarga, y esos avisos tapan los que
+# importan. Visto en un servidor de verdad tras actualizar el sistema.
+_have_dig() { return 1; }
+cert_days_left() { echo ""; }
+nginx() { return 0; }
+_idx_de() { local i; for i in "${!DOC_ID[@]}"; do [[ "${DOC_ID[$i]}" == "$1" ]] && { echo "$i"; return; }; done; }
+mkapp vieja static 0 vieja.test
+run _fix_vhost vieja >/dev/null 2>&1
+printf '    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n' >> "$(nginx_file vieja)"
+_http2_supports_directive() { return 0; }
+_doctor_collect
+I="$(_idx_de vhost-http2-vieja)"
+check "lo ve"                  "1"    "$([[ -n "$I" ]] && echo 1 || echo 0)"
+check "como aviso"             "warn" "${DOC_LEVEL[${I:-0}]:-}"
+check "con arreglo"            "1"    "$([[ "${DOC_ACT[${I:-0}]:-}" == _fix_vhost* ]] && echo 1 || echo 0)"
+# Con un nginx que aún no conoce 'http2 on;' la forma antigua es la correcta.
+_http2_supports_directive() { return 1; }
+_doctor_collect
+check "nginx viejo: nada"      ""     "$(_idx_de vhost-http2-vieja)"
+# Y regenerado con el nginx nuevo, la forma antigua desaparece.
+_http2_supports_directive() { return 0; }
+run _fix_vhost vieja >/dev/null 2>&1
+check "regenerado sin ella"    "0"    "$(grep -cE 'listen[^;]* http2;' "$(nginx_file vieja)")"
+_doctor_collect
+check "y ya no se dice"        ""     "$(_idx_de vhost-http2-vieja)"
+unset -f _http2_supports_directive
+
+section "El OCSP stapling se dice y se quita, con marcha atrás"
+NGINX_SNIPPETS="$TMP/snippets"; mkdir -p "$NGINX_SNIPPETS"
+SSLS="$NGINX_SNIPPETS/orbit-ssl.conf"
+printf 'ssl_protocols TLSv1.2 TLSv1.3;\nssl_stapling on;\nssl_stapling_verify on;\n' > "$SSLS"
+_doctor_collect
+I="$(_idx_de ssl-stapling)"
+check "lo ve"                  "1"    "$([[ -n "$I" ]] && echo 1 || echo 0)"
+check "con arreglo"            "_nginx_ssl_upgrade" "${DOC_ACT[${I:-0}]:-}"
+# Si nginx no acepta el resultado, el fichero vuelve a como estaba.
+nginx() { return 1; }
+run _nginx_ssl_upgrade >/dev/null 2>&1; check "nginx -t falla: rc 1" "1" "$?"
+check "y lo deja como estaba"  "2"    "$(grep -c ssl_stapling "$SSLS")"
+check "sin copia suelta"       "0"    "$(find "$NGINX_SNIPPETS" -name '*.bak' | wc -l)"
+nginx() { return 0; }
+run _nginx_ssl_upgrade >/dev/null 2>&1; check "con nginx -t bueno"   "0" "$?"
+check "fuera el stapling"      "0"    "$(grep -c ssl_stapling "$SSLS")"
+check "el resto, intacto"      "1"    "$(grep -c '^ssl_protocols' "$SSLS")"
+_doctor_collect
+check "y ya no se dice"        ""     "$(_idx_de ssl-stapling)"
+check "install.sh no lo pone"  "0"    "$(grep -c '^ssl_stapling' "$ORBIT_ROOT/install.sh")"
+unset -f _idx_de
+
 section "Una opción que no existe no se ignora"
 run cmd_doctor --arregla-todo >/dev/null 2>&1; check "aborta" "1" "$?"
 
